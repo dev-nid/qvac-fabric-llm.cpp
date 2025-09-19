@@ -1043,8 +1043,7 @@ static struct llama_model * llama_model_load_from_file_impl(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
         void * set_tensor_data_ud,
-        // const std::string & path_model,
-        // std::vector<std::string> & splits,
+        bool has_load_input,
         llama_model_loader & ml,
         FILE * file,
         struct llama_model_params params) {
@@ -1053,16 +1052,14 @@ static struct llama_model * llama_model_load_from_file_impl(
         if (metadata != nullptr) {
             n_sources_defined++;
         }
-        // TODO: path_model is not used anymore
-        if (true) {
-        // if (!path_model.empty()) {
+        if (has_load_input) {
             n_sources_defined++;
         }
         if (file != nullptr) {
             n_sources_defined++;
         }
         if (n_sources_defined != 1) {
-            LLAMA_LOG_ERROR("%s: exactly one out metadata, path_model, and file must be defined\n", __func__);
+            LLAMA_LOG_ERROR("%s: exactly one out metadata, load input, and file must be defined\n", __func__);
             return nullptr;
         }
     }
@@ -1128,7 +1125,7 @@ struct llama_model * llama_model_init_from_user(
     llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, loader_input, /*file*/ nullptr,
                           params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc,
                           params.kv_overrides, params.tensor_buft_overrides);
-    return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, ml, /*file*/ nullptr, params);
+    return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, /*has_load_input*/ false, ml, /*file*/ nullptr, params);
 }
 // deprecated
 struct llama_model * llama_load_model_from_file(
@@ -1142,7 +1139,7 @@ struct llama_model * llama_model_load_from_file(
         struct llama_model_params params) {
     std::vector<std::string> splits = {};
     llama_model_loader ml = create_disk_fileloader(path_model, splits, params);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, ml, /*file*/ nullptr, params);
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, /*file*/ nullptr, params);
 }
 
 static void override_and_disable_mmap(struct llama_model_params & params) {
@@ -1153,11 +1150,11 @@ static void override_and_disable_mmap(struct llama_model_params & params) {
 }
 
 struct llama_model * llama_model_load_from_buffer(std::vector<uint8_t> && data, struct llama_model_params params) {
-    std::unique_ptr<std::basic_streambuf<uint8_t>> streambuf = std::make_unique<Uint8BufferStreamBuf>(std::move(data));
+    std::unique_ptr<std::basic_streambuf<char>> streambuf = std::make_unique<Uint8BufferStreamBuf>(std::move(data));
     override_and_disable_mmap(params);
     llama_model_loader ml(nullptr, nullptr, nullptr, load_input_variant::buffer_load_input{ streambuf }, nullptr, params.use_mmap, params.use_direct_io,
                           params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, ml, nullptr, params);
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, nullptr, params);
 }
 
 static std::vector<std::string> splits_from_c_paths(const char ** paths, size_t n_paths) {
@@ -1182,7 +1179,7 @@ struct llama_model * llama_model_load_from_splits(
         return nullptr;
     }
     llama_model_loader ml = create_disk_fileloader(splits.front().c_str(), splits, params);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, ml, /*file*/ nullptr, params);
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, /*file*/ nullptr, params);
 }
 
 struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_model_params params) {
@@ -1196,7 +1193,7 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
                           loader_input, file,
                           params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc,
                           params.kv_overrides, params.tensor_buft_overrides);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, ml, file, params);
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ false, ml, file, params);
 }
 
 struct llama_model * llama_model_load_from_split_futures(const char ** paths, size_t n_paths, const char * context,
@@ -1212,11 +1209,11 @@ struct llama_model * llama_model_load_from_split_futures(const char ** paths, si
     override_and_disable_mmap(params);
     llama_model_loader ml(nullptr, nullptr, nullptr, loader_input, nullptr, params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc,
                           params.kv_overrides, params.tensor_buft_overrides);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, ml, nullptr, params);
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, nullptr, params);
 }
 
 bool llama_model_load_fulfill_split_future(const char * path, const char * context,
-                                           std::unique_ptr<std::basic_streambuf<uint8_t>> && streambuf) {
+                                           std::unique_ptr<std::basic_streambuf<char>> && streambuf) {
     return llama_future_file_buffer_ro::fulfill_promise(path, context,
                                                         std::make_unique<llama_file_buffer_ro>(std::move(streambuf)));
 }
