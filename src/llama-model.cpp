@@ -1497,7 +1497,7 @@ bool llama_model::create_split_backend_buffers(
     constexpr bool do_print_backend_buffers_info = false;
     const bool     creation_success = create_backend_buffers(split_data_size, ml, use_mmap_buffer, use_mlock,
                                                              n_gpu_layers, do_print_backend_buffers_info);
-    
+
     // Note: create_backend_buffers moves the contexts into ctxs_bufs, taking ownership
     // The contexts in ctx_map are now empty after the move, which is expected
 
