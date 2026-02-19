@@ -7619,7 +7619,7 @@ static bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, siz
     subctx->s->buffer->buf.copyBuffer((VkBuffer)staging_buffer->buffer, (VkBuffer)dst->buffer, slices);
 
     if (width == spitch) {
-        deferred_memcpy((uint8_t *)staging_buffer->ptr, src, staging_size, &subctx->in_memcpys);
+        deferred_memcpy((uint8_t *)staging_buffer->info.pMappedData, src, staging_size, &subctx->in_memcpys);
     } else {
         for (size_t i = 0; i < height; i++) {
             deferred_memcpy((uint8_t *)staging_buffer->info.pMappedData + i * width, (const uint8_t *) src + i * spitch, width, &subctx->in_memcpys);
@@ -7640,7 +7640,7 @@ static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * 
         GGML_ASSERT(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
         for (size_t i = 0; i < height; i++) {
-            memcpy((uint8_t *)dst->ptr + offset + i * dpitch, (const uint8_t *) src + i * spitch, width);
+            memcpy((uint8_t *)dst->info.pMappedData + offset + i * dpitch, (const uint8_t *) src + i * spitch, width);
         }
     } else {
         std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
@@ -7737,10 +7737,10 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
     subctx->s->buffer->buf.copyBuffer(src->buffer, staging_buffer->buffer, staging_slices);
 
     if (width == dpitch) {
-        deferred_memcpy(dst, staging_buffer->ptr, staging_size, &subctx->out_memcpys);
+        deferred_memcpy(dst, staging_buffer->info.pMappedData, staging_size, &subctx->out_memcpys);
     } else {
         for (size_t i = 0; i < height; i++) {
-            deferred_memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) staging_buffer->ptr + i * width, width, &subctx->out_memcpys);
+            deferred_memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) staging_buffer->info.pMappedData + i * width, width, &subctx->out_memcpys);
         }
     }
     return true;
@@ -7760,7 +7760,7 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
         GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
         for (size_t i = 0; i < height; i++) {
-            memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) src->ptr + offset + i * spitch, width);
+            memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) src->info.pMappedData + offset + i * spitch, width);
         }
     } else {
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
@@ -7819,7 +7819,7 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
         ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset, size);
 
         // Copy to dst buffer
-        ggml_vk_buffer_write(dst, dst_offset, src->device->sync_staging->ptr, size);
+        ggml_vk_buffer_write(dst, dst_offset, src->device->sync_staging->info.pMappedData, size);
     }
 }
 
@@ -14847,10 +14847,10 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
         cpy_ctx->s->buffer->buf.copyBuffer(ctx->sync_staging->buffer, buf->buffer, slices);
 
         if (size == stride_data) {
-            deferred_memcpy(ctx->sync_staging->ptr, data, staging_size, &cpy_ctx->in_memcpys);
+            deferred_memcpy(ctx->sync_staging->info.pMappedData, data, staging_size, &cpy_ctx->in_memcpys);
         } else {
             for (size_t i = 0; i < n_copies; i++) {
-                deferred_memcpy((uint8_t *)ctx->sync_staging->ptr + i * size, (const uint8_t *)data + i * stride_data, size, &cpy_ctx->in_memcpys);
+                deferred_memcpy((uint8_t *)ctx->sync_staging->info.pMappedData + i * size, (const uint8_t *)data + i * stride_data, size, &cpy_ctx->in_memcpys);
             }
         }
         ggml_vk_synchronize(ctx);
@@ -14903,10 +14903,10 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
         compute_ctx->s->buffer->buf.copyBuffer(buf->buffer, ctx->sync_staging->buffer, slices);
 
         if (size == stride_data) {
-            deferred_memcpy(data, ctx->sync_staging->ptr, staging_size, &compute_ctx->out_memcpys);
+            deferred_memcpy(data, ctx->sync_staging->info.pMappedData, staging_size, &compute_ctx->out_memcpys);
         } else {
             for (size_t i = 0; i < n_copies; i++) {
-                deferred_memcpy((uint8_t *)data + i * stride_data, (const uint8_t *)ctx->sync_staging->ptr + i * size, size, &compute_ctx->out_memcpys);
+                deferred_memcpy((uint8_t *)data + i * stride_data, (const uint8_t *)ctx->sync_staging->info.pMappedData + i * size, size, &compute_ctx->out_memcpys);
             }
         }
         ggml_vk_synchronize(ctx);
