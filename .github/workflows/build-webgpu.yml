@@ -78,7 +78,7 @@ jobs:
           ctest -L main --verbose --timeout 900
 
   ubuntu-24-webgpu:
-    runs-on: ubuntu-24.04
+    runs-on: ai-run-linux-gpu
 
     steps:
       - name: Clone
