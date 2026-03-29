@@ -3413,6 +3413,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
 
         vk_pipeline *ptr = &base_pipeline;
+        std::string effective_name = name;
 
         // if a variant shader exists for this SPIR-V symbol base, use it instead.
         if (device->architecture == vk_device_architecture::QUALCOMM_ADRENO) {
@@ -3421,8 +3422,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
             if (ggml_vk_get_adreno_variant(spv_data, &adreno_len, &adreno_data)) {
                 spv_size = (size_t) adreno_len;
                 spv_data = adreno_data;
-                // update pipeline name to reflect that we are using the Adreno variant
-                pipeline->name = "adreno_" + std::string(name);
+                effective_name = "adreno_" + std::string(name);
                 VK_LOG_DEBUG("ggml_vk_create_pipeline(): using Adreno variant for shader " << name);
             } else {
                 VK_LOG_DEBUG("ggml_vk_create_pipeline(): no Adreno variant found for shader " << name);
@@ -3441,7 +3441,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
                 pipeline = std::make_shared<vk_pipeline_struct>();
             }
             if (!pipeline->initialized) {
-                pipeline->name = name;
+                pipeline->name = effective_name;
                 pipeline->parameter_count = parameter_count;
                 pipeline->push_constant_size = push_constant_size;
                 pipeline->wg_denoms = wg_denoms;
@@ -14207,7 +14207,7 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
         buffer_cpy.size = size;
 
         cpy_ctx->s->buffer.copyBuffer(ctx->sync_staging->buffer, buf->buffer, { buffer_cpy });
-        deferred_memcpy(ctx->sync_staging->ptr, data, size, &cpy_ctx->in_memcpys);
+        deferred_memcpy(ctx->sync_staging->info.pMappedData, data, size, &cpy_ctx->in_memcpys);
         ggml_vk_synchronize(ctx);
     }
 }
@@ -14236,8 +14236,8 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
         buffer_cpy.dstOffset = 0;
         buffer_cpy.size = size;
 
-        transfer_ctx->s->buffer.copyBuffer(buf->buffer, ctx->sync_staging->buffer, { buffer_cpy });
-        deferred_memcpy(data, ctx->sync_staging->info.pMappedData, size, &transfer_ctx->out_memcpys);
+        compute_ctx->s->buffer.copyBuffer(buf->buffer, ctx->sync_staging->buffer, { buffer_cpy });
+        deferred_memcpy(data, ctx->sync_staging->info.pMappedData, size, &compute_ctx->out_memcpys);
         ggml_vk_synchronize(ctx);
     }
 }

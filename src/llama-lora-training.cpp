@@ -260,9 +260,8 @@ struct llama_adapter_lora * llama_lora_training_init(
         return nullptr;
     }
 
-    llama_clear_adapter_lora(ctx);
-    
-    if (llama_set_adapter_lora(ctx, adapter, 1.0f) < 0) {
+    float scale = 1.0f;
+    if (llama_set_adapters_lora(ctx, &adapter, 1, &scale) < 0) {
         LLAMA_LOG_ERROR("Failed to apply LoRA adapter to context\n");
         delete adapter;
         return nullptr;

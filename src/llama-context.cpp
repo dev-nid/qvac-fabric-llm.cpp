@@ -2616,7 +2616,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     }
 
     // Set LoRA params as trainable if any?
-    for (const auto & adapter_pair : loras) {
+    for (const auto & adapter_pair : *loras) {
         llama_adapter_lora * adapter = adapter_pair.first;
         if (adapter) {
             // Register lora tensors as params for training
