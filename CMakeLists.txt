@@ -210,43 +210,43 @@ endif()
 #
 
 if (BUILD_LLAMA)
-    add_subdirectory(src)
+add_subdirectory(src)
 
-    #
-    # utils, programs, examples and tests
-    #
+#
+# utils, programs, examples and tests
+#
 
-    if (NOT LLAMA_BUILD_COMMON)
-        message(STATUS "LLAMA_BUILD_COMMON is OFF, disabling LLAMA_CURL")
-        set(LLAMA_CURL OFF)
+if (NOT LLAMA_BUILD_COMMON)
+    message(STATUS "LLAMA_BUILD_COMMON is OFF, disabling LLAMA_CURL")
+    set(LLAMA_CURL OFF)
+endif()
+
+if (LLAMA_BUILD_COMMON)
+    add_subdirectory(common)
+    if (LLAMA_HTTPLIB)
+        add_subdirectory(vendor/cpp-httplib)
     endif()
+endif()
 
-    if (LLAMA_BUILD_COMMON)
-        add_subdirectory(common)
-        if (LLAMA_HTTPLIB)
-            add_subdirectory(vendor/cpp-httplib)
-        endif()
-    endif()
+if(LLAMA_BUILD_EXAMPLES OR LLAMA_BUILD_TESTS)
+    add_subdirectory(common_test)
+endif()
 
-    if(LLAMA_BUILD_EXAMPLES OR LLAMA_BUILD_TESTS)
-        add_subdirectory(common_test)
-    endif()
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
+    include(CTest)
+    add_subdirectory(tests)
+endif()
 
-    if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
-        include(CTest)
-        add_subdirectory(tests)
-    endif()
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+    add_subdirectory(pocs)
+endif()
 
-    if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES)
-        add_subdirectory(examples)
-        add_subdirectory(pocs)
-    endif()
-
-    if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
-        add_subdirectory(tools)
-    elseif (LLAMA_MTMD)
-        add_subdirectory(tools/mtmd)
-    endif()
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
+    add_subdirectory(tools)
+elseif (LLAMA_MTMD)
+    add_subdirectory(tools/mtmd)
+endif()
 else()
     message(STATUS "EXPORT_ONLY_GGML is ON: skipping qvac-fabric targets")
 endif()
@@ -259,94 +259,94 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 if (BUILD_LLAMA)
-    set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header  files")
-    set(LLAMA_LIB_INSTALL_DIR     ${CMAKE_INSTALL_LIBDIR}     CACHE PATH "Location of library files")
-    set(LLAMA_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location of binary  files")
+set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header  files")
+set(LLAMA_LIB_INSTALL_DIR     ${CMAKE_INSTALL_LIBDIR}     CACHE PATH "Location of library files")
+set(LLAMA_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location of binary  files")
 
-    set(LLAMA_PUBLIC_HEADERS
-        ${CMAKE_CURRENT_SOURCE_DIR}/include/llama.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-cpp.h)
+set(LLAMA_PUBLIC_HEADERS
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/llama.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/llama-cpp.h)
 
-    set_target_properties(llama
-        PROPERTIES
-            PUBLIC_HEADER "${LLAMA_PUBLIC_HEADERS}")
+set_target_properties(llama
+    PROPERTIES
+        PUBLIC_HEADER "${LLAMA_PUBLIC_HEADERS}")
 
+install(
+    TARGETS llama
+    EXPORT llama-targets
+    PUBLIC_HEADER
+    DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR})
+
+if (LLAMA_BUILD_COMMON)
+
+    if (NOT LLAMA_CURL AND LLAMA_HTTPLIB)
     install(
-      TARGETS llama
-      EXPORT llama-targets
-      PUBLIC_HEADER
-        DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR})
-
-    if (LLAMA_BUILD_COMMON)
-
-      if (NOT LLAMA_CURL AND LLAMA_HTTPLIB)
-        install(
-          TARGETS cpp-httplib
-          EXPORT llama-targets)
-      endif()
-
-      install(
-        TARGETS common build_info
-        EXPORT llama-targets
-        PUBLIC_HEADER
-          DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/common)
-
-    endif()
-
-    if (LLAMA_MTMD AND TARGET mtmd)
-
-      install(
-        TARGETS mtmd
-        EXPORT llama-targets
-        PUBLIC_HEADER
-          DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/mtmd)
-
+        TARGETS cpp-httplib
+        EXPORT llama-targets)
     endif()
 
     install(
-      EXPORT llama-targets
-      FILE llama-targets.cmake
-      NAMESPACE llama::
-      DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
+    TARGETS common build_info
+    EXPORT llama-targets
+    PUBLIC_HEADER
+        DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/common)
+
+endif()
+
+if (LLAMA_MTMD AND TARGET mtmd)
 
     install(
-      FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
-      DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
+    TARGETS mtmd
+    EXPORT llama-targets
+    PUBLIC_HEADER
+        DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/mtmd)
 
-    configure_package_config_file(
-      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
-      ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
-      INSTALL_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
+endif()
 
-    write_basic_package_version_file(
-            ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
-        VERSION ${LLAMA_INSTALL_VERSION}
-        COMPATIBILITY SameMajorVersion)
+install(
+    EXPORT llama-targets
+    FILE llama-targets.cmake
+    NAMESPACE llama::
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
-    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
-                  ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
-            DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
+install(
+    FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
-    install(
-        FILES convert_hf_to_gguf.py
-        PERMISSIONS
-            OWNER_READ
-            OWNER_WRITE
-            OWNER_EXECUTE
-            GROUP_READ
-            GROUP_EXECUTE
-            WORLD_READ
-            WORLD_EXECUTE
-        DESTINATION ${CMAKE_INSTALL_BINDIR})
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
-    install(
-        PROGRAMS vulkan_profiling_analyzer.py
-        DESTINATION ${CMAKE_INSTALL_BINDIR})
+write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
+    VERSION ${LLAMA_INSTALL_VERSION}
+    COMPATIBILITY SameMajorVersion)
 
-    configure_file(cmake/llama.pc.in
-            "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
-            @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
+                ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
-    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
-            DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+install(
+    FILES convert_hf_to_gguf.py
+    PERMISSIONS
+        OWNER_READ
+        OWNER_WRITE
+        OWNER_EXECUTE
+        GROUP_READ
+        GROUP_EXECUTE
+        WORLD_READ
+        WORLD_EXECUTE
+    DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+install(
+    PROGRAMS vulkan_profiling_analyzer.py
+    DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+configure_file(cmake/llama.pc.in
+        "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
+        @ONLY)
+
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 endif()
