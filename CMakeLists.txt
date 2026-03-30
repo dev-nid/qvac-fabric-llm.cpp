@@ -272,24 +272,24 @@ set_target_properties(llama
         PUBLIC_HEADER "${LLAMA_PUBLIC_HEADERS}")
 
 install(
-    TARGETS llama
-    EXPORT llama-targets
-    PUBLIC_HEADER
+  TARGETS llama
+  EXPORT llama-targets
+  PUBLIC_HEADER
     DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR})
 
 if (LLAMA_BUILD_COMMON)
 
-    if (NOT LLAMA_CURL AND LLAMA_HTTPLIB)
+  if (NOT LLAMA_CURL AND LLAMA_HTTPLIB)
     install(
-        TARGETS cpp-httplib
-        EXPORT llama-targets)
-    endif()
+      TARGETS cpp-httplib
+      EXPORT llama-targets)
+  endif()
 
-    install(
+  install(
     TARGETS common build_info
     EXPORT llama-targets
     PUBLIC_HEADER
-        DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/common)
+      DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/common)
 
 endif()
 
@@ -304,19 +304,19 @@ if (LLAMA_MTMD AND TARGET mtmd)
 endif()
 
 install(
-    EXPORT llama-targets
-    FILE llama-targets.cmake
-    NAMESPACE llama::
-    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
+  EXPORT llama-targets
+  FILE llama-targets.cmake
+  NAMESPACE llama::
+  DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 install(
-    FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
-    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
+  FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
+  DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 configure_package_config_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 write_basic_package_version_file(
         ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
@@ -324,7 +324,7 @@ write_basic_package_version_file(
     COMPATIBILITY SameMajorVersion)
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
-                ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 install(
