@@ -209,7 +209,9 @@ endif()
 # build the library
 #
 
-if (BUILD_LLAMA)
+if (NOT BUILD_LLAMA)
+    message(STATUS "BUILD_LLAMA is OFF: skipping LLAMA targets.")
+else()
 add_subdirectory(src)
 
 #
@@ -247,8 +249,7 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
 elseif (LLAMA_MTMD)
     add_subdirectory(tools/mtmd)
 endif()
-else()
-    message(STATUS "EXPORT_ONLY_GGML is ON: skipping qvac-fabric targets")
+
 endif()
 
 #
