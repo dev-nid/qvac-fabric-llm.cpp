@@ -32,6 +32,7 @@ else()
 endif()
 
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
+option(BUILD_LLAMA "Build, install LLAMA package artifacts as well." ON)
 
 option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)
 
@@ -208,6 +209,9 @@ endif()
 # build the library
 #
 
+if (NOT BUILD_LLAMA)
+    message(STATUS "BUILD_LLAMA is OFF: skipping LLAMA targets.")
+else()
 add_subdirectory(src)
 
 #
@@ -246,6 +250,8 @@ elseif (LLAMA_MTMD)
     add_subdirectory(tools/mtmd)
 endif()
 
+endif()
+
 #
 # install
 #
@@ -253,6 +259,7 @@ endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
+if (BUILD_LLAMA)
 set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header  files")
 set(LLAMA_LIB_INSTALL_DIR     ${CMAKE_INSTALL_LIBDIR}     CACHE PATH "Location of library files")
 set(LLAMA_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location of binary  files")
@@ -343,3 +350,4 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+endif()
