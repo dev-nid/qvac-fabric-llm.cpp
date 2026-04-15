@@ -130,6 +130,40 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
+        // TurboQuant: auto-select block=64 variant when head_dim=64.
+        // User specifies tbq3_0/tbq4_0 on the CLI; we swap to the _64 internal type if needed.
+        auto resolve_tq_type = [&](ggml_type & type, const char * kv_label, uint32_t head_dim, uint32_t n_embd_gqa) {
+            if (type != GGML_TYPE_TBQ3_0 && type != GGML_TYPE_TBQ4_0 &&
+                type != GGML_TYPE_TBQ3_0_64 && type != GGML_TYPE_TBQ4_0_64 &&
+                type != GGML_TYPE_PQ3_0 && type != GGML_TYPE_PQ3_0_64 &&
+                type != GGML_TYPE_PQ4_0 && type != GGML_TYPE_PQ4_0_64) {
+                return;
+            }
+            if (head_dim == 64) {
+                if (type == GGML_TYPE_TBQ3_0) type = GGML_TYPE_TBQ3_0_64;
+                if (type == GGML_TYPE_TBQ4_0) type = GGML_TYPE_TBQ4_0_64;
+                if (type == GGML_TYPE_PQ3_0) type = GGML_TYPE_PQ3_0_64;
+                if (type == GGML_TYPE_PQ4_0) type = GGML_TYPE_PQ4_0_64;
+            } else if (head_dim != 128) {
+                throw std::runtime_error(
+                    std::string("KV cache type ") + ggml_type_name(type) +
+                    " requires head_dim=64 or 128, but this model uses head_dim=" +
+                    std::to_string(head_dim) +
+                    " for " + kv_label + ". Use a different --cache-type-" + kv_label + " (e.g. q8_0, q4_0).");
+            }
+            uint32_t blk = (type == GGML_TYPE_TBQ3_0_64 || type == GGML_TYPE_TBQ4_0_64 || type == GGML_TYPE_PQ3_0_64 || type == GGML_TYPE_PQ4_0_64) ? 64 : 128;
+            if (n_embd_gqa % blk != 0) {
+                throw std::runtime_error(
+                    std::string("KV cache type ") + ggml_type_name(type) +
+                    " requires n_embd_" + kv_label + "_gqa to be a multiple of " +
+                    std::to_string(blk) + ", but got " +
+                    std::to_string(n_embd_gqa) + " at layer " + std::to_string(il));
+            }
+        };
+
+        resolve_tq_type(type_k, "k", hparams.n_embd_head_k, n_embd_k_gqa);
+        resolve_tq_type(type_v, "v", hparams.n_embd_head_v, n_embd_v_gqa);
+
         ggml_tensor * k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
         ggml_tensor * v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
 
@@ -970,6 +1004,14 @@ bool llama_kv_cache::get_has_shift() const {
     }
 
     return result;
+}
+
+ggml_type llama_kv_cache::type_k() const {
+    return layers[0].k->type;
+}
+
+ggml_type llama_kv_cache::type_v() const {
+    return layers[0].v->type;
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -2032,6 +2074,14 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+ggml_type llama_kv_cache_context::type_k() const {
+    return kv->type_k();
+}
+
+ggml_type llama_kv_cache_context::type_v() const {
+    return kv->type_v();
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
