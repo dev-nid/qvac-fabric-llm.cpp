@@ -232,6 +232,242 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+#if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ4_0) || defined(DATA_A_PQ3_0) || defined(DATA_A_PQ4_0) || \
+    defined(DATA_A_TBQ3_0_64) || defined(DATA_A_TBQ4_0_64) || defined(DATA_A_PQ3_0_64) || defined(DATA_A_PQ4_0_64)
+#include "tq_utils.comp"
+#endif
+
+#if defined(DATA_A_TBQ3_0) || defined(DATA_A_PQ3_0) || defined(DATA_A_TBQ3_0_64) || defined(DATA_A_PQ3_0_64)
+const float TBQ3_B[7] = float[7](
+    -0.15326847648335928, -0.09236268752201893, -0.04409495934473917,
+     0.0,
+     0.04409495934473917,  0.09236268752201893,  0.15326847648335928
+);
+
+uint tbq3_quantize_val(float val) {
+    if (val < TBQ3_B[3]) {
+        if (val < TBQ3_B[1]) { return val < TBQ3_B[0] ? 0u : 1u; }
+        else                { return val < TBQ3_B[2] ? 2u : 3u; }
+    } else {
+        if (val < TBQ3_B[5]) { return val < TBQ3_B[4] ? 4u : 5u; }
+        else                { return val < TBQ3_B[6] ? 6u : 7u; }
+    }
+}
+
+void quantize(uint dst_idx, uint src_idx)
+{
+    const uint BK = QUANT_K;
+    const uint QS_BYTES = (BK * 3u + 7u) / 8u;
+    const uint QJL_BYTES = BK / 8u;
+    const uint NUM_GROUPS = BK / 8u;
+
+    float norm = 0.0;
+    for (uint j = 0u; j < BK; j++) {
+        float v = data_s[src_idx + j];
+        norm += v * v;
+    }
+    norm = sqrt(norm);
+    data_q[dst_idx].d = float16_t(norm);
+
+    if (norm < 1e-15) {
+        for (uint j = 0u; j < QS_BYTES; j++) data_q[dst_idx].qs[j] = uint8_t(0);
+#if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ3_0_64)
+        for (uint j = 0u; j < QJL_BYTES; j++) data_q[dst_idx].qjl[j] = uint8_t(0);
+        data_q[dst_idx].d_r = float16_t(0.0);
+#endif
+        return;
+    }
+
+    float inv_norm = 1.0 / norm;
+
+    uint indices[QUANT_K];
+    for (uint j = 0u; j < BK; j++) {
+        indices[j] = tbq3_quantize_val(data_s[src_idx + j] * inv_norm);
+    }
+
+    for (uint g = 0u; g < NUM_GROUPS; g++) {
+        uint accum = 0u;
+        for (uint i = 0u; i < 8u; i++) {
+            accum |= indices[g * 8u + i] << (i * 3u);
+        }
+        uint base = g * 3u;
+        data_q[dst_idx].qs[base + 0u] = uint8_t(accum & 0xFFu);
+        data_q[dst_idx].qs[base + 1u] = uint8_t((accum >> 8u) & 0xFFu);
+        data_q[dst_idx].qs[base + 2u] = uint8_t((accum >> 16u) & 0xFFu);
+    }
+
+#if defined(TQ_NORM_CORRECTION)
+    float dot_xc = 0.0;
+    float dot_cc = 0.0;
+    for (uint j = 0u; j < BK; j++) {
+        float cv = TBQ3_CB[indices[j]];
+        dot_xc += data_s[src_idx + j] * cv;
+        dot_cc += cv * cv;
+    }
+    if (dot_cc > 1e-15) {
+        norm = dot_xc / dot_cc;
+    }
+    data_q[dst_idx].d = float16_t(norm);
+#endif
+
+#if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ3_0_64)
+    float residual[QUANT_K];
+    float r_norm_sq = 0.0;
+    for (uint j = 0u; j < BK; j++) {
+        float reconstructed = TBQ3_CB[indices[j]] * norm;
+        residual[j] = data_s[src_idx + j] - reconstructed;
+        r_norm_sq += residual[j] * residual[j];
+    }
+    float r_norm = sqrt(r_norm_sq);
+    data_q[dst_idx].d_r = float16_t(r_norm);
+
+    if (r_norm < 1e-15) {
+        for (uint j = 0u; j < QJL_BYTES; j++) data_q[dst_idx].qjl[j] = uint8_t(0);
+        return;
+    }
+
+    float proj[QUANT_K];
+    for (uint j = 0u; j < BK; j++) {
+        proj[j] = residual[j] * qjl_get_sign(j);
+    }
+    for (uint h = 1u; h < BK; h <<= 1u) {
+        for (uint i = 0u; i < BK; i += h << 1u) {
+            for (uint j = i; j < i + h; j++) {
+                float a = proj[j];
+                float b = proj[j + h];
+                proj[j]     = a + b;
+                proj[j + h] = a - b;
+            }
+        }
+    }
+    for (uint j = 0u; j < QJL_BYTES; j++) data_q[dst_idx].qjl[j] = uint8_t(0);
+    for (uint j = 0u; j < BK; j++) {
+        if (proj[j] > 0.0) {
+            data_q[dst_idx].qjl[j / 8u] |= uint8_t(1u << (j % 8u));
+        }
+    }
+#endif
+}
+#endif
+
+#if defined(DATA_A_TBQ4_0) || defined(DATA_A_PQ4_0) || defined(DATA_A_TBQ4_0_64) || defined(DATA_A_PQ4_0_64)
+const float TBQ4_B[15] = float[15](
+    -0.20921017409079767, -0.16127738300848593, -0.12600405430352871,
+    -0.09651953803632701, -0.07026832190197044, -0.04593911875417284,
+    -0.02271517840509901,  0.0,
+     0.02271517840509901,  0.04593911875417284,  0.07026832190197044,
+     0.09651953803632701,  0.12600405430352871,  0.16127738300848593,
+     0.20921017409079767
+);
+
+uint tbq4_quantize_val(float val) {
+    if (val < TBQ4_B[7]) {
+        if (val < TBQ4_B[3]) {
+            if (val < TBQ4_B[1]) { return val < TBQ4_B[0] ? 0u : 1u; }
+            else                { return val < TBQ4_B[2] ? 2u : 3u; }
+        } else {
+            if (val < TBQ4_B[5]) { return val < TBQ4_B[4] ? 4u : 5u; }
+            else                { return val < TBQ4_B[6] ? 6u : 7u; }
+        }
+    } else {
+        if (val < TBQ4_B[11]) {
+            if (val < TBQ4_B[9])  { return val < TBQ4_B[8]  ? 8u  : 9u;  }
+            else                 { return val < TBQ4_B[10] ? 10u : 11u; }
+        } else {
+            if (val < TBQ4_B[13]) { return val < TBQ4_B[12] ? 12u : 13u; }
+            else                 { return val < TBQ4_B[14] ? 14u : 15u; }
+        }
+    }
+}
+
+void quantize(uint dst_idx, uint src_idx)
+{
+    const uint BK = QUANT_K;
+    const uint QS_BYTES = BK / 2u;
+    const uint QJL_BYTES = BK / 8u;
+
+    float norm = 0.0;
+    for (uint j = 0u; j < BK; j++) {
+        float v = data_s[src_idx + j];
+        norm += v * v;
+    }
+    norm = sqrt(norm);
+    data_q[dst_idx].d = float16_t(norm);
+
+    if (norm < 1e-15) {
+        for (uint j = 0u; j < QS_BYTES; j++) data_q[dst_idx].qs[j] = uint8_t(0);
+#if defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
+        for (uint j = 0u; j < QJL_BYTES; j++) data_q[dst_idx].qjl[j] = uint8_t(0);
+        data_q[dst_idx].d_r = float16_t(0.0);
+#endif
+        return;
+    }
+
+    float inv_norm = 1.0 / norm;
+
+    uint indices[QUANT_K];
+    for (uint j = 0u; j < BK; j++) {
+        indices[j] = tbq4_quantize_val(data_s[src_idx + j] * inv_norm);
+    }
+
+    for (uint r = 0u; r < BK; r += 2u) {
+        data_q[dst_idx].qs[r / 2u] = uint8_t(indices[r] | (indices[r + 1u] << 4u));
+    }
+
+#if defined(TQ_NORM_CORRECTION)
+    float dot_xc = 0.0;
+    float dot_cc = 0.0;
+    for (uint j = 0u; j < BK; j++) {
+        float cv = TBQ4_CB[indices[j]];
+        dot_xc += data_s[src_idx + j] * cv;
+        dot_cc += cv * cv;
+    }
+    if (dot_cc > 1e-15) {
+        norm = dot_xc / dot_cc;
+    }
+    data_q[dst_idx].d = float16_t(norm);
+#endif
+
+#if defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
+    float residual[QUANT_K];
+    float r_norm_sq = 0.0;
+    for (uint j = 0u; j < BK; j++) {
+        float reconstructed = TBQ4_CB[indices[j]] * norm;
+        residual[j] = data_s[src_idx + j] - reconstructed;
+        r_norm_sq += residual[j] * residual[j];
+    }
+    float r_norm = sqrt(r_norm_sq);
+    data_q[dst_idx].d_r = float16_t(r_norm);
+
+    if (r_norm < 1e-15) {
+        for (uint j = 0u; j < QJL_BYTES; j++) data_q[dst_idx].qjl[j] = uint8_t(0);
+        return;
+    }
+
+    float proj[QUANT_K];
+    for (uint j = 0u; j < BK; j++) {
+        proj[j] = residual[j] * qjl_get_sign(j);
+    }
+    for (uint h = 1u; h < BK; h <<= 1u) {
+        for (uint i = 0u; i < BK; i += h << 1u) {
+            for (uint j = i; j < i + h; j++) {
+                float a = proj[j];
+                float b = proj[j + h];
+                proj[j]     = a + b;
+                proj[j + h] = a - b;
+            }
+        }
+    }
+    for (uint j = 0u; j < QJL_BYTES; j++) data_q[dst_idx].qjl[j] = uint8_t(0);
+    for (uint j = 0u; j < BK; j++) {
+        if (proj[j] > 0.0) {
+            data_q[dst_idx].qjl[j / 8u] |= uint8_t(1u << (j % 8u));
+        }
+    }
+#endif
+}
+#endif
+
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 void quantize(uint dst_idx, uint src_idx)
 {

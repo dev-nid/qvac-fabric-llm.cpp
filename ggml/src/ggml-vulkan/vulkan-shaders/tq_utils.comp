@@ -21,4 +21,64 @@ int tq2_dequantize(uint ib, uint iqs) {
 }
 #endif
 
+// TurboQuant (TBQ3_0, TBQ4_0) shared constants for inverse Hadamard transform.
+// Signs generated from seed 42 via xoshiro256**, packed as bitmasks.
+#if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ4_0) || defined(DATA_A_PQ3_0) || defined(DATA_A_PQ4_0) || \
+    defined(DATA_K_TBQ3_0) || defined(DATA_K_TBQ4_0) || defined(DATA_K_PQ3_0) || defined(DATA_K_PQ4_0) || \
+    defined(DATA_V_TBQ3_0) || defined(DATA_V_TBQ4_0) || defined(DATA_V_PQ3_0) || defined(DATA_V_PQ4_0) || \
+    defined(DATA_A_TBQ3_0_64) || defined(DATA_A_TBQ4_0_64) || defined(DATA_A_PQ3_0_64) || defined(DATA_A_PQ4_0_64) || \
+    defined(DATA_K_TBQ3_0_64) || defined(DATA_K_TBQ4_0_64) || defined(DATA_K_PQ3_0_64) || defined(DATA_K_PQ4_0_64) || \
+    defined(DATA_V_TBQ3_0_64) || defined(DATA_V_TBQ4_0_64) || defined(DATA_V_PQ3_0_64) || defined(DATA_V_PQ4_0_64)
+
+// Stage 1 sign diagonal D (seed 42), packed as bitmasks
+const uint TQ_SIGN_BITS[4] = uint[4](
+    0x40f54e8cu, 0x6587b7b0u, 0xc31220eau, 0x32f6449bu
+);
+
+// QJL Stage 2 sign diagonal (seed 137), independent from Stage 1
+const uint QJL_SIGN_BITS[4] = uint[4](
+    0x4a492032u, 0x1adafe4bu, 0xac005e9bu, 0x0808dc78u
+);
+
+const float TBQ3_CB[8] = float[8](
+    -0.18839718597003241, -0.11813976699668613,
+    -0.06658560804735174, -0.02160431064212660,
+     0.02160431064212660,  0.06658560804735174,
+     0.11813976699668613,  0.18839718597003241
+);
+
+const float TBQ4_CB[16] = float[16](
+    -0.23762692286887249, -0.18079342531272283,
+    -0.14176134070424901, -0.11024676790280842,
+    -0.08279230816984559, -0.05774433563409530,
+    -0.03413390187425037, -0.01129645493594766,
+     0.01129645493594766,  0.03413390187425037,
+     0.05774433563409530,  0.08279230816984559,
+     0.11024676790280842,  0.14176134070424901,
+     0.18079342531272283,  0.23762692286887249
+);
+
+float tq_get_sign(uint tid) {
+    return ((TQ_SIGN_BITS[tid / 32] >> (tid % 32)) & 1u) != 0u ? 1.0 : -1.0;
+}
+
+float qjl_get_sign(uint tid) {
+    return ((QJL_SIGN_BITS[tid / 32] >> (tid % 32)) & 1u) != 0u ? 1.0 : -1.0;
+}
+
+// Shared codebook lookup helpers.
+// Callers read raw bytes from their own data source, then call these.
+
+// 3-bit: caller passes the 1-2 raw bytes spanning the 3-bit field and the bit offset.
+float tbq3_dequant_raw(uint raw_bytes, uint bit_off) {
+    return TBQ3_CB[(raw_bytes >> bit_off) & 0x7u];
+}
+
+// 4-bit: caller passes the raw byte containing the nibble pair.
+float tbq4_dequant_raw(uint raw_byte, uint idx) {
+    return TBQ4_CB[(idx & 1u) != 0u ? (raw_byte >> 4u) : (raw_byte & 0xFu)];
+}
+
+#endif
+
 #endif
