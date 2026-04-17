@@ -122,31 +122,30 @@ void ggml_vec_dot_tbq3_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     assert(nrc == 1);
     UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
 
+    const block_tbq3_0 * GGML_RESTRICT x = (const block_tbq3_0 *)vx;
+    const block_q8_0   * GGML_RESTRICT y = (const block_q8_0 *)vy;
+    const int nb_tq = n / QK_TQ;
+    const int M     = QK_TQ / QK8_0;
     float tmp_x[QK_TQ];
     float tmp_y_full[QK_TQ];
-    float tmp_y[QK8_0];
     float sumf = 0.0f;
-    int pos = 0;
-
-    const block_tbq3_0 * GGML_RESTRICT x = (const block_tbq3_0 *)vx;
-    const block_q8_0  * GGML_RESTRICT y = (const block_q8_0 *)vy;
-
-    const int nb_tq = n / QK_TQ;
-
     for (int i = 0; i < nb_tq; i++) {
+        GGML_CPU_PREFETCH(&x[i + 1], 0, 0);
+        GGML_CPU_PREFETCH(&y[(i + 1) * M], 0, 0);
         dequantize_row_tbq3_0(x + i, tmp_x, QK_TQ);
-
-        for (int j = 0; j < QK_TQ / QK8_0; j++) {
-            dequantize_row_q8_0(y + pos, tmp_y, QK8_0);
+        float base = 0.0f;
+        for (int j = 0; j < M; j++) {
+            float       * GGML_RESTRICT yb = &tmp_y_full[j * QK8_0];
+            const float * GGML_RESTRICT xb = &tmp_x[j * QK8_0];
+            dequantize_row_q8_0(&y[i * M + j], yb, QK8_0);
+            float acc = 0.0f;
             for (int k = 0; k < QK8_0; k++) {
-                tmp_y_full[j * QK8_0 + k] = tmp_y[k];
-                sumf += tmp_x[j * QK8_0 + k] * tmp_y[k];
+                acc += xb[k] * yb[k];
             }
-            pos++;
+            base += acc;
         }
-
-        float d_r = GGML_FP16_TO_FP32(x[i].d_r);
-        sumf += qjl_dot_correction(x[i].qjl, d_r, tmp_y_full, QK_TQ);
+        const float d_r = GGML_FP16_TO_FP32(x[i].d_r);
+        sumf += base + qjl_dot_correction(x[i].qjl, d_r, tmp_y_full, QK_TQ);
     }
     *s = sumf;
 }
@@ -160,31 +159,30 @@ void ggml_vec_dot_tbq4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     assert(nrc == 1);
     UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
 
+    const block_tbq4_0 * GGML_RESTRICT x = (const block_tbq4_0 *)vx;
+    const block_q8_0   * GGML_RESTRICT y = (const block_q8_0 *)vy;
+    const int nb_tq = n / QK_TQ;
+    const int M     = QK_TQ / QK8_0;
     float tmp_x[QK_TQ];
     float tmp_y_full[QK_TQ];
-    float tmp_y[QK8_0];
     float sumf = 0.0f;
-    int pos = 0;
-
-    const block_tbq4_0 * GGML_RESTRICT x = (const block_tbq4_0 *)vx;
-    const block_q8_0  * GGML_RESTRICT y = (const block_q8_0 *)vy;
-
-    const int nb_tq = n / QK_TQ;
-
     for (int i = 0; i < nb_tq; i++) {
+        GGML_CPU_PREFETCH(&x[i + 1], 0, 0);
+        GGML_CPU_PREFETCH(&y[(i + 1) * M], 0, 0);
         dequantize_row_tbq4_0(x + i, tmp_x, QK_TQ);
-
-        for (int j = 0; j < QK_TQ / QK8_0; j++) {
-            dequantize_row_q8_0(y + pos, tmp_y, QK8_0);
+        float base = 0.0f;
+        for (int j = 0; j < M; j++) {
+            float       * GGML_RESTRICT yb = &tmp_y_full[j * QK8_0];
+            const float * GGML_RESTRICT xb = &tmp_x[j * QK8_0];
+            dequantize_row_q8_0(&y[i * M + j], yb, QK8_0);
+            float acc = 0.0f;
             for (int k = 0; k < QK8_0; k++) {
-                tmp_y_full[j * QK8_0 + k] = tmp_y[k];
-                sumf += tmp_x[j * QK8_0 + k] * tmp_y[k];
+                acc += xb[k] * yb[k];
             }
-            pos++;
+            base += acc;
         }
-
-        float d_r = GGML_FP16_TO_FP32(x[i].d_r);
-        sumf += qjl_dot_correction(x[i].qjl, d_r, tmp_y_full, QK_TQ);
+        const float d_r = GGML_FP16_TO_FP32(x[i].d_r);
+        sumf += base + qjl_dot_correction(x[i].qjl, d_r, tmp_y_full, QK_TQ);
     }
     *s = sumf;
 }
@@ -303,25 +301,28 @@ void ggml_vec_dot_pq3_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     assert(nrc == 1);
     UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
 
+    const block_pq3_0 * GGML_RESTRICT x = (const block_pq3_0 *)vx;
+    const block_q8_0  * GGML_RESTRICT y = (const block_q8_0 *)vy;
+    const int nb = n / QK_TQ;
+    const int M  = QK_TQ / QK8_0;
     float tmp_x[QK_TQ];
     float tmp_y[QK8_0];
     float sumf = 0.0f;
-    int pos = 0;
-
-    const block_pq3_0 * GGML_RESTRICT x = (const block_pq3_0 *)vx;
-    const block_q8_0  * GGML_RESTRICT y = (const block_q8_0 *)vy;
-
-    const int nb = n / QK_TQ;
-
     for (int i = 0; i < nb; i++) {
+        GGML_CPU_PREFETCH(&x[i + 1], 0, 0);
+        GGML_CPU_PREFETCH(&y[(i + 1) * M], 0, 0);
         dequantize_row_pq3_0(x + i, tmp_x, QK_TQ);
-        for (int j = 0; j < QK_TQ / QK8_0; j++) {
-            dequantize_row_q8_0(y + pos, tmp_y, QK8_0);
+        float base = 0.0f;
+        for (int j = 0; j < M; j++) {
+            const float * GGML_RESTRICT xb = &tmp_x[j * QK8_0];
+            dequantize_row_q8_0(&y[i * M + j], tmp_y, QK8_0);
+            float acc = 0.0f;
             for (int k = 0; k < QK8_0; k++) {
-                sumf += tmp_x[j * QK8_0 + k] * tmp_y[k];
+                acc += xb[k] * tmp_y[k];
             }
-            pos++;
+            base += acc;
         }
+        sumf += base;
     }
     *s = sumf;
 }
@@ -335,25 +336,28 @@ void ggml_vec_dot_pq3_0_64_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const
     assert(nrc == 1);
     UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
 
+    const block_pq3_0_64 * GGML_RESTRICT x = (const block_pq3_0_64 *)vx;
+    const block_q8_0     * GGML_RESTRICT y = (const block_q8_0 *)vy;
+    const int nb = n / QK_TQ_64;
+    const int M  = QK_TQ_64 / QK8_0;
     float tmp_x[QK_TQ_64];
     float tmp_y[QK8_0];
     float sumf = 0.0f;
-    int pos = 0;
-
-    const block_pq3_0_64 * GGML_RESTRICT x = (const block_pq3_0_64 *)vx;
-    const block_q8_0     * GGML_RESTRICT y = (const block_q8_0 *)vy;
-
-    const int nb = n / QK_TQ_64;
-
     for (int i = 0; i < nb; i++) {
+        GGML_CPU_PREFETCH(&x[i + 1], 0, 0);
+        GGML_CPU_PREFETCH(&y[(i + 1) * M], 0, 0);
         dequantize_row_pq3_0_64(x + i, tmp_x, QK_TQ_64);
-        for (int j = 0; j < QK_TQ_64 / QK8_0; j++) {
-            dequantize_row_q8_0(y + pos, tmp_y, QK8_0);
+        float base = 0.0f;
+        for (int j = 0; j < M; j++) {
+            const float * GGML_RESTRICT xb = &tmp_x[j * QK8_0];
+            dequantize_row_q8_0(&y[i * M + j], tmp_y, QK8_0);
+            float acc = 0.0f;
             for (int k = 0; k < QK8_0; k++) {
-                sumf += tmp_x[j * QK8_0 + k] * tmp_y[k];
+                acc += xb[k] * tmp_y[k];
             }
-            pos++;
+            base += acc;
         }
+        sumf += base;
     }
     *s = sumf;
 }
@@ -381,25 +385,28 @@ void ggml_vec_dot_pq4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     assert(nrc == 1);
     UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
 
+    const block_pq4_0 * GGML_RESTRICT x = (const block_pq4_0 *)vx;
+    const block_q8_0  * GGML_RESTRICT y = (const block_q8_0 *)vy;
+    const int nb = n / QK_TQ;
+    const int M  = QK_TQ / QK8_0;
     float tmp_x[QK_TQ];
     float tmp_y[QK8_0];
     float sumf = 0.0f;
-    int pos = 0;
-
-    const block_pq4_0 * GGML_RESTRICT x = (const block_pq4_0 *)vx;
-    const block_q8_0  * GGML_RESTRICT y = (const block_q8_0 *)vy;
-
-    const int nb = n / QK_TQ;
-
     for (int i = 0; i < nb; i++) {
+        GGML_CPU_PREFETCH(&x[i + 1], 0, 0);
+        GGML_CPU_PREFETCH(&y[(i + 1) * M], 0, 0);
         dequantize_row_pq4_0(x + i, tmp_x, QK_TQ);
-        for (int j = 0; j < QK_TQ / QK8_0; j++) {
-            dequantize_row_q8_0(y + pos, tmp_y, QK8_0);
+        float base = 0.0f;
+        for (int j = 0; j < M; j++) {
+            const float * GGML_RESTRICT xb = &tmp_x[j * QK8_0];
+            dequantize_row_q8_0(&y[i * M + j], tmp_y, QK8_0);
+            float acc = 0.0f;
             for (int k = 0; k < QK8_0; k++) {
-                sumf += tmp_x[j * QK8_0 + k] * tmp_y[k];
+                acc += xb[k] * tmp_y[k];
             }
-            pos++;
+            base += acc;
         }
+        sumf += base;
     }
     *s = sumf;
 }
@@ -413,25 +420,28 @@ void ggml_vec_dot_pq4_0_64_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const
     assert(nrc == 1);
     UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
 
+    const block_pq4_0_64 * GGML_RESTRICT x = (const block_pq4_0_64 *)vx;
+    const block_q8_0     * GGML_RESTRICT y = (const block_q8_0 *)vy;
+    const int nb = n / QK_TQ_64;
+    const int M  = QK_TQ_64 / QK8_0;
     float tmp_x[QK_TQ_64];
     float tmp_y[QK8_0];
     float sumf = 0.0f;
-    int pos = 0;
-
-    const block_pq4_0_64 * GGML_RESTRICT x = (const block_pq4_0_64 *)vx;
-    const block_q8_0     * GGML_RESTRICT y = (const block_q8_0 *)vy;
-
-    const int nb = n / QK_TQ_64;
-
     for (int i = 0; i < nb; i++) {
+        GGML_CPU_PREFETCH(&x[i + 1], 0, 0);
+        GGML_CPU_PREFETCH(&y[(i + 1) * M], 0, 0);
         dequantize_row_pq4_0_64(x + i, tmp_x, QK_TQ_64);
-        for (int j = 0; j < QK_TQ_64 / QK8_0; j++) {
-            dequantize_row_q8_0(y + pos, tmp_y, QK8_0);
+        float base = 0.0f;
+        for (int j = 0; j < M; j++) {
+            const float * GGML_RESTRICT xb = &tmp_x[j * QK8_0];
+            dequantize_row_q8_0(&y[i * M + j], tmp_y, QK8_0);
+            float acc = 0.0f;
             for (int k = 0; k < QK8_0; k++) {
-                sumf += tmp_x[j * QK8_0 + k] * tmp_y[k];
+                acc += xb[k] * tmp_y[k];
             }
-            pos++;
+            base += acc;
         }
+        sumf += base;
     }
     *s = sumf;
 }
