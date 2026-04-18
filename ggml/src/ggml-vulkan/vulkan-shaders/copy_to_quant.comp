@@ -1,5 +1,17 @@
 #version 450
 
+// Cooperative quantization path for TurboQuant / PolarQuant types: one workgroup
+// (32 threads == 1 subgroup on NVIDIA) handles a single block of QUANT_K values,
+// using subgroupAdd for the norm / correction reductions, a parallel Fast Hadamard
+// Transform, and subgroupBallot for the QJL sign sketch.
+#if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ4_0) || defined(DATA_A_PQ3_0) || defined(DATA_A_PQ4_0) || \
+    defined(DATA_A_TBQ3_0_64) || defined(DATA_A_TBQ4_0_64) || defined(DATA_A_PQ3_0_64) || defined(DATA_A_PQ4_0_64)
+#define TQ_COOP 1
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#endif
+
 #include "rte.glsl"
 #include "types.glsl"
 
@@ -270,41 +282,63 @@ uint tbq3_quantize_val(float val) {
     }
 }
 
+// Cooperative scratch: one workgroup == one block.
+shared float tq3_sh_x[QUANT_K];
+shared uint  tq3_sh_idx[QUANT_K];
+#if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ3_0_64)
+shared float tq3_sh_proj[QUANT_K];
+#endif
+
 void quantize(uint dst_idx, uint src_idx)
 {
     const uint BK = QUANT_K;
     const uint QS_BYTES = (BK * 3u + 7u) / 8u;
-    const uint QJL_BYTES = BK / 8u;
     const uint NUM_GROUPS = BK / 8u;
+    const uint WG = 32u;
+    const uint STRIDE = BK / WG;
+    const uint lid = gl_LocalInvocationID.x;
 
-    float norm = 0.0;
-    for (uint j = 0u; j < BK; j++) {
+    // Load input, compute squared norm (strided indexing for coalesced reads).
+    float local_sq = 0.0;
+    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+        uint j = lid + s * WG;
         float v = data_s[src_idx + j];
-        norm += v * v;
+        tq3_sh_x[j] = v;
+        local_sq += v * v;
     }
-    norm = sqrt(norm);
-    data_q[dst_idx].d = float16_t(norm);
+    float total_sq = subgroupAdd(local_sq);
+    float norm = sqrt(total_sq);
+
+    if (lid == 0u) {
+        data_q[dst_idx].d = float16_t(norm);
+    }
 
     if (norm < 1e-15) {
-        for (uint j = 0u; j < QS_BYTES; j++) data_q[dst_idx].qs[j] = uint8_t(0);
+        for (uint j = lid; j < QS_BYTES; j += WG) data_q[dst_idx].qs[j] = uint8_t(0);
 #if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ3_0_64)
-        for (uint j = 0u; j < QJL_BYTES; j++) data_q[dst_idx].qjl[j] = uint8_t(0);
-        data_q[dst_idx].d_r = float16_t(0.0);
+        const uint QJL_BYTES = BK / 8u;
+        for (uint j = lid; j < QJL_BYTES; j += WG) data_q[dst_idx].qjl[j] = uint8_t(0);
+        if (lid == 0u) data_q[dst_idx].d_r = float16_t(0.0);
 #endif
         return;
     }
 
     float inv_norm = 1.0 / norm;
 
-    uint indices[QUANT_K];
-    for (uint j = 0u; j < BK; j++) {
-        indices[j] = tbq3_quantize_val(data_s[src_idx + j] * inv_norm);
+    // Quantize each value; strided write into shared idx table.
+    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+        uint j = lid + s * WG;
+        tq3_sh_idx[j] = tbq3_quantize_val(tq3_sh_x[j] * inv_norm);
     }
+    barrier();
 
-    for (uint g = 0u; g < NUM_GROUPS; g++) {
+    // Pack 8 indices -> 3 bytes per group. NUM_GROUPS is 16 (BK=128) or 8 (BK=64),
+    // so one thread per group covers all groups.
+    if (lid < NUM_GROUPS) {
+        uint g = lid;
         uint accum = 0u;
-        for (uint i = 0u; i < 8u; i++) {
-            accum |= indices[g * 8u + i] << (i * 3u);
+        [[unroll]] for (uint i = 0u; i < 8u; i++) {
+            accum |= tq3_sh_idx[g * 8u + i] << (i * 3u);
         }
         uint base = g * 3u;
         data_q[dst_idx].qs[base + 0u] = uint8_t(accum & 0xFFu);
@@ -313,53 +347,72 @@ void quantize(uint dst_idx, uint src_idx)
     }
 
 #if defined(TQ_NORM_CORRECTION)
-    float dot_xc = 0.0;
-    float dot_cc = 0.0;
-    for (uint j = 0u; j < BK; j++) {
-        float cv = TBQ3_CB[indices[j]];
-        dot_xc += data_s[src_idx + j] * cv;
-        dot_cc += cv * cv;
+    float local_xc = 0.0;
+    float local_cc = 0.0;
+    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+        uint j = lid + s * WG;
+        float cv = TBQ3_CB[tq3_sh_idx[j]];
+        local_xc += tq3_sh_x[j] * cv;
+        local_cc += cv * cv;
     }
+    float dot_xc = subgroupAdd(local_xc);
+    float dot_cc = subgroupAdd(local_cc);
     if (dot_cc > 1e-15) {
         norm = dot_xc / dot_cc;
     }
-    data_q[dst_idx].d = float16_t(norm);
+    if (lid == 0u) data_q[dst_idx].d = float16_t(norm);
 #endif
 
 #if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ3_0_64)
-    float residual[QUANT_K];
-    float r_norm_sq = 0.0;
-    for (uint j = 0u; j < BK; j++) {
-        float reconstructed = TBQ3_CB[indices[j]] * norm;
-        residual[j] = data_s[src_idx + j] - reconstructed;
-        r_norm_sq += residual[j] * residual[j];
+    const uint QJL_BYTES = BK / 8u;
+
+    // Residual with pre-applied QJL sign diagonal for the upcoming FHT.
+    float local_rsq = 0.0;
+    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+        uint j = lid + s * WG;
+        float r = tq3_sh_x[j] - TBQ3_CB[tq3_sh_idx[j]] * norm;
+        tq3_sh_proj[j] = r * qjl_get_sign(j);
+        local_rsq += r * r;
     }
-    float r_norm = sqrt(r_norm_sq);
-    data_q[dst_idx].d_r = float16_t(r_norm);
+    float r_norm = sqrt(subgroupAdd(local_rsq));
+    if (lid == 0u) data_q[dst_idx].d_r = float16_t(r_norm);
 
     if (r_norm < 1e-15) {
-        for (uint j = 0u; j < QJL_BYTES; j++) data_q[dst_idx].qjl[j] = uint8_t(0);
+        for (uint j = lid; j < QJL_BYTES; j += WG) data_q[dst_idx].qjl[j] = uint8_t(0);
         return;
     }
 
-    float proj[QUANT_K];
-    for (uint j = 0u; j < BK; j++) {
-        proj[j] = residual[j] * qjl_get_sign(j);
-    }
+    barrier();
+
+    // Parallel in-place FHT: each pass has BK/2 independent butterflies distributed
+    // across the 32 threads.
     for (uint h = 1u; h < BK; h <<= 1u) {
-        for (uint i = 0u; i < BK; i += h << 1u) {
-            for (uint j = i; j < i + h; j++) {
-                float a = proj[j];
-                float b = proj[j + h];
-                proj[j]     = a + b;
-                proj[j + h] = a - b;
-            }
+        for (uint bi = lid; bi < BK / 2u; bi += WG) {
+            uint grp = bi / h;
+            uint pos = bi % h;
+            uint j = grp * (h << 1u) + pos;
+            float a = tq3_sh_proj[j];
+            float b = tq3_sh_proj[j + h];
+            tq3_sh_proj[j]     = a + b;
+            tq3_sh_proj[j + h] = a - b;
         }
+        barrier();
     }
-    for (uint j = 0u; j < QJL_BYTES; j++) data_q[dst_idx].qjl[j] = uint8_t(0);
-    for (uint j = 0u; j < BK; j++) {
-        if (proj[j] > 0.0) {
-            data_q[dst_idx].qjl[j / 8u] |= uint8_t(1u << (j % 8u));
+
+    // Pack QJL sign bits with subgroupBallot: each ballot call contributes 32 bits
+    // covering positions [s*32, (s+1)*32). With WG == subgroup size, bit `lid` of
+    // ballot.x reflects this thread's predicate, matching the serial layout
+    // `qjl[j/8] |= 1 << (j%8)`.
+    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+        uint j = lid + s * WG;
+        uvec4 ballot = subgroupBallot(tq3_sh_proj[j] > 0.0);
+        if (lid == 0u) {
+            uint bits = ballot.x;
+            uint byte_off = s * 4u;
+            data_q[dst_idx].qjl[byte_off + 0u] = uint8_t(bits & 0xFFu);
+            data_q[dst_idx].qjl[byte_off + 1u] = uint8_t((bits >> 8u) & 0xFFu);
+            data_q[dst_idx].qjl[byte_off + 2u] = uint8_t((bits >> 16u) & 0xFFu);
+            data_q[dst_idx].qjl[byte_off + 3u] = uint8_t((bits >> 24u) & 0xFFu);
         }
     }
 #endif
@@ -412,88 +465,119 @@ uint tbq4_quantize_val(float val) {
     }
 }
 
+shared float tq4_sh_x[QUANT_K];
+shared uint  tq4_sh_idx[QUANT_K];
+#if defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
+shared float tq4_sh_proj[QUANT_K];
+#endif
+
 void quantize(uint dst_idx, uint src_idx)
 {
     const uint BK = QUANT_K;
     const uint QS_BYTES = BK / 2u;
-    const uint QJL_BYTES = BK / 8u;
+    const uint WG = 32u;
+    const uint STRIDE = BK / WG;
+    const uint lid = gl_LocalInvocationID.x;
 
-    float norm = 0.0;
-    for (uint j = 0u; j < BK; j++) {
+    float local_sq = 0.0;
+    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+        uint j = lid + s * WG;
         float v = data_s[src_idx + j];
-        norm += v * v;
+        tq4_sh_x[j] = v;
+        local_sq += v * v;
     }
-    norm = sqrt(norm);
-    data_q[dst_idx].d = float16_t(norm);
+    float total_sq = subgroupAdd(local_sq);
+    float norm = sqrt(total_sq);
+
+    if (lid == 0u) {
+        data_q[dst_idx].d = float16_t(norm);
+    }
 
     if (norm < 1e-15) {
-        for (uint j = 0u; j < QS_BYTES; j++) data_q[dst_idx].qs[j] = uint8_t(0);
+        for (uint j = lid; j < QS_BYTES; j += WG) data_q[dst_idx].qs[j] = uint8_t(0);
 #if defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
-        for (uint j = 0u; j < QJL_BYTES; j++) data_q[dst_idx].qjl[j] = uint8_t(0);
-        data_q[dst_idx].d_r = float16_t(0.0);
+        const uint QJL_BYTES = BK / 8u;
+        for (uint j = lid; j < QJL_BYTES; j += WG) data_q[dst_idx].qjl[j] = uint8_t(0);
+        if (lid == 0u) data_q[dst_idx].d_r = float16_t(0.0);
 #endif
         return;
     }
 
     float inv_norm = 1.0 / norm;
 
-    uint indices[QUANT_K];
-    for (uint j = 0u; j < BK; j++) {
-        indices[j] = tbq4_quantize_val(data_s[src_idx + j] * inv_norm);
+    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+        uint j = lid + s * WG;
+        tq4_sh_idx[j] = tbq4_quantize_val(tq4_sh_x[j] * inv_norm);
     }
+    barrier();
 
-    for (uint r = 0u; r < BK; r += 2u) {
-        data_q[dst_idx].qs[r / 2u] = uint8_t(indices[r] | (indices[r + 1u] << 4u));
+    // Pack nibble pairs: QS_BYTES = BK/2 (64 for BK=128, 32 for BK=64).
+    for (uint b = lid; b < QS_BYTES; b += WG) {
+        uint i0 = tq4_sh_idx[2u * b];
+        uint i1 = tq4_sh_idx[2u * b + 1u];
+        data_q[dst_idx].qs[b] = uint8_t(i0 | (i1 << 4u));
     }
 
 #if defined(TQ_NORM_CORRECTION)
-    float dot_xc = 0.0;
-    float dot_cc = 0.0;
-    for (uint j = 0u; j < BK; j++) {
-        float cv = TBQ4_CB[indices[j]];
-        dot_xc += data_s[src_idx + j] * cv;
-        dot_cc += cv * cv;
+    float local_xc = 0.0;
+    float local_cc = 0.0;
+    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+        uint j = lid + s * WG;
+        float cv = TBQ4_CB[tq4_sh_idx[j]];
+        local_xc += tq4_sh_x[j] * cv;
+        local_cc += cv * cv;
     }
+    float dot_xc = subgroupAdd(local_xc);
+    float dot_cc = subgroupAdd(local_cc);
     if (dot_cc > 1e-15) {
         norm = dot_xc / dot_cc;
     }
-    data_q[dst_idx].d = float16_t(norm);
+    if (lid == 0u) data_q[dst_idx].d = float16_t(norm);
 #endif
 
 #if defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
-    float residual[QUANT_K];
-    float r_norm_sq = 0.0;
-    for (uint j = 0u; j < BK; j++) {
-        float reconstructed = TBQ4_CB[indices[j]] * norm;
-        residual[j] = data_s[src_idx + j] - reconstructed;
-        r_norm_sq += residual[j] * residual[j];
+    const uint QJL_BYTES = BK / 8u;
+
+    float local_rsq = 0.0;
+    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+        uint j = lid + s * WG;
+        float r = tq4_sh_x[j] - TBQ4_CB[tq4_sh_idx[j]] * norm;
+        tq4_sh_proj[j] = r * qjl_get_sign(j);
+        local_rsq += r * r;
     }
-    float r_norm = sqrt(r_norm_sq);
-    data_q[dst_idx].d_r = float16_t(r_norm);
+    float r_norm = sqrt(subgroupAdd(local_rsq));
+    if (lid == 0u) data_q[dst_idx].d_r = float16_t(r_norm);
 
     if (r_norm < 1e-15) {
-        for (uint j = 0u; j < QJL_BYTES; j++) data_q[dst_idx].qjl[j] = uint8_t(0);
+        for (uint j = lid; j < QJL_BYTES; j += WG) data_q[dst_idx].qjl[j] = uint8_t(0);
         return;
     }
 
-    float proj[QUANT_K];
-    for (uint j = 0u; j < BK; j++) {
-        proj[j] = residual[j] * qjl_get_sign(j);
-    }
+    barrier();
+
     for (uint h = 1u; h < BK; h <<= 1u) {
-        for (uint i = 0u; i < BK; i += h << 1u) {
-            for (uint j = i; j < i + h; j++) {
-                float a = proj[j];
-                float b = proj[j + h];
-                proj[j]     = a + b;
-                proj[j + h] = a - b;
-            }
+        for (uint bi = lid; bi < BK / 2u; bi += WG) {
+            uint grp = bi / h;
+            uint pos = bi % h;
+            uint j = grp * (h << 1u) + pos;
+            float a = tq4_sh_proj[j];
+            float b = tq4_sh_proj[j + h];
+            tq4_sh_proj[j]     = a + b;
+            tq4_sh_proj[j + h] = a - b;
         }
+        barrier();
     }
-    for (uint j = 0u; j < QJL_BYTES; j++) data_q[dst_idx].qjl[j] = uint8_t(0);
-    for (uint j = 0u; j < BK; j++) {
-        if (proj[j] > 0.0) {
-            data_q[dst_idx].qjl[j / 8u] |= uint8_t(1u << (j % 8u));
+
+    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+        uint j = lid + s * WG;
+        uvec4 ballot = subgroupBallot(tq4_sh_proj[j] > 0.0);
+        if (lid == 0u) {
+            uint bits = ballot.x;
+            uint byte_off = s * 4u;
+            data_q[dst_idx].qjl[byte_off + 0u] = uint8_t(bits & 0xFFu);
+            data_q[dst_idx].qjl[byte_off + 1u] = uint8_t((bits >> 8u) & 0xFFu);
+            data_q[dst_idx].qjl[byte_off + 2u] = uint8_t((bits >> 16u) & 0xFFu);
+            data_q[dst_idx].qjl[byte_off + 3u] = uint8_t((bits >> 24u) & 0xFFu);
         }
     }
 #endif
@@ -521,7 +605,14 @@ void main() {
     init_iq_shmem(gl_WorkGroupSize);
 #endif
 
+#if defined(TQ_COOP)
+    // One workgroup == one block. gl_WorkGroupID is packed (z, y, x) where each
+    // workgroup corresponds to a single QUANT_K-sized block.
+    const uint block_idx = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint idx = block_idx * QUANT_K;
+#else
     const uint idx = ((gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x) * BLOCK_SIZE + gl_LocalInvocationID.x) * QUANT_K;
+#endif
 
     if (idx >= p.ne) {
         return;
@@ -549,7 +640,14 @@ void main() {
     init_iq_shmem(gl_WorkGroupSize);
 #endif
 
+#if defined(TQ_COOP)
+    // One workgroup == one block. Thread 0..31 of the workgroup cooperate on
+    // QUANT_K values, so we drop the *32 multiplier and the lane offset.
+    const uint block_idx = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint idx = block_idx * QUANT_K;
+#else
     const uint idx = (gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x) * QUANT_K;
+#endif
 
     if (idx >= p.ne) {
         return;
