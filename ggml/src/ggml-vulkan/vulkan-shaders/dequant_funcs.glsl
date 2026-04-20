@@ -554,28 +554,44 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #if defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
 #include "tq_utils.comp"
 
+// iqs is the element index (consistent with other QUANT_R=1 types). TBQ4 packs
+// 2 elements per byte, so byte = iqs/2 and nibble = iqs&1.
+float tbq4_dequantize1(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs >> 1u]);
+    return tbq4_dequant_raw(vui, iqs & 1u);
+}
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
     return vec2(tbq4_dequant_raw(vui, 0u), tbq4_dequant_raw(vui, 1u));
 }
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
-    const uint vui0 = uint(data_a[a_offset + ib].qs[iqs]);
-    const uint vui1 = uint(data_a[a_offset + ib].qs[iqs + 1u]);
-    return vec4(tbq4_dequant_raw(vui0, 0u), tbq4_dequant_raw(vui0, 1u), tbq4_dequant_raw(vui1, 0u), tbq4_dequant_raw(vui1, 1u));
+    return vec4(
+        tbq4_dequantize1(ib, iqs + 0u, a_offset),
+        tbq4_dequantize1(ib, iqs + 1u, a_offset),
+        tbq4_dequantize1(ib, iqs + 2u, a_offset),
+        tbq4_dequantize1(ib, iqs + 3u, a_offset)
+    );
 }
 #endif
 
 #if defined(DATA_A_PQ4_0) || defined(DATA_A_PQ4_0_64)
 #include "tq_utils.comp"
 
+float pq4_dequantize1(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs >> 1u]);
+    return tbq4_dequant_raw(vui, iqs & 1u);
+}
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
     return vec2(tbq4_dequant_raw(vui, 0u), tbq4_dequant_raw(vui, 1u));
 }
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
-    const uint vui0 = uint(data_a[a_offset + ib].qs[iqs]);
-    const uint vui1 = uint(data_a[a_offset + ib].qs[iqs + 1u]);
-    return vec4(tbq4_dequant_raw(vui0, 0u), tbq4_dequant_raw(vui0, 1u), tbq4_dequant_raw(vui1, 0u), tbq4_dequant_raw(vui1, 1u));
+    return vec4(
+        pq4_dequantize1(ib, iqs + 0u, a_offset),
+        pq4_dequantize1(ib, iqs + 1u, a_offset),
+        pq4_dequantize1(ib, iqs + 2u, a_offset),
+        pq4_dequantize1(ib, iqs + 3u, a_offset)
+    );
 }
 #endif
 

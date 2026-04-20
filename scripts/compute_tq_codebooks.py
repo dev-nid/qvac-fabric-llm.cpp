@@ -94,6 +94,23 @@ def format_c_array(name, centroids):
     return "\n".join(lines)
 
 
+def boundaries_of(centroids):
+    """Decision boundaries are midpoints between adjacent centroids (mirrors
+    ggml-quants.c:tq_compute_boundaries). Outputs n-1 values for n centroids.
+    """
+    return [(centroids[i] + centroids[i + 1]) / 2 for i in range(len(centroids) - 1)]
+
+
+def format_glsl_array(name, values):
+    """Format values as a GLSL const float array (for copy_to_quant.comp)."""
+    lines = [f"const float {name}[{len(values)}] = float[{len(values)}]("]
+    for i, v in enumerate(values):
+        comma = "," if i + 1 < len(values) else ""
+        lines.append(f"    {v: .17f}{comma}")
+    lines.append(");")
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Compute TurboQuant Lloyd-Max codebooks")
     parser.add_argument("--dims", type=int, nargs="+", default=[64, 128],
@@ -119,11 +136,24 @@ def main():
             logger.info("  Total MSE (d coords) = %.8f", d * mse)
 
             if args.c_code:
-                name = f"TQ{b}_CODEBOOK_{d}"
-                logger.info("\n%s", format_c_array(name, centroids))
+                cb_name = f"TQ{b}_CODEBOOK_{d}"
+                logger.info("\n%s", format_c_array(cb_name, centroids))
+                # Also emit the GLSL decision boundaries (midpoints between
+                # adjacent centroids), used by the Vulkan encoder
+                # copy_to_quant.comp to pick indices. These MUST track the
+                # codebook for FA / mul_mat to reproduce the CPU-reference
+                # quantization on the GPU.
+                bnd = boundaries_of(centroids)
+                glsl_name = f"TBQ{b}_B"
+                logger.info("\n// d=%d decision boundaries (midpoints of %s).", d, cb_name)
+                logger.info("// Gate this with #if defined(TQ_D64) in copy_to_quant.comp for d=64.")
+                logger.info("%s", format_glsl_array(glsl_name, bnd))
             else:
                 for i, c in enumerate(centroids):
                     logger.info("    [%2d] % .17f", i, c)
+                logger.info("    boundaries (midpoints):")
+                for i, v in enumerate(boundaries_of(centroids)):
+                    logger.info("      [%2d] % .17f", i, v)
 
 
 if __name__ == "__main__":

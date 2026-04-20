@@ -1,0 +1,145 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// QJL (Stage 2) correction pass for standalone MUL_MAT on TBQ3_0/TBQ4_0.
+//
+// The main mul_mm.comp dispatch already produced C = A_dequant * d · B with
+// the 3-bit/4-bit centroid values, matching what `mul_mat_vec_tbq*_0.comp`
+// computes before its QJL epilogue.  This kernel runs the same QJL epilogue
+// over the whole (M, N) output and accumulates the bias correction into C.
+//
+// One workgroup handles one (row_a, col_b, batch) triple and loops over the
+// K-blocks (QUANT_K elements each; 128 for TBQ*_0, 64 for TBQ*_0_64). The
+// thread layout matches the vec shader: local_size_x == QUANT_K so the
+// Walsh-Hadamard butterfly can be done in shared memory without cross-
+// workgroup communication.
+//
+// Specialization:
+//   DATA_A_TBQ3_0 / DATA_A_TBQ4_0 / DATA_A_TBQ3_0_64 / DATA_A_TBQ4_0_64
+//       picks the block_a layout and, transitively, QUANT_K.
+//   B_TYPE is float (f32) or float16_t (f16).  D_TYPE is float.
+
+#include "types.glsl"
+#include "tq_utils.comp"
+
+layout (local_size_x = QUANT_K, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
+layout (binding = 2)          buffer D {D_TYPE data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint M; uint N; uint K;
+    uint stride_a; uint stride_b; uint stride_d;
+    uint batch_stride_a; uint batch_stride_b; uint batch_stride_d;
+    uint k_split;
+    uint ne02; uint ne12; uint broadcast2; uint broadcast3;
+    uint padded_N;
+} p;
+
+shared float proj_b_sh[QUANT_K];
+
+void main() {
+    const uint row_a    = gl_WorkGroupID.x;
+    const uint col_b    = gl_WorkGroupID.y;
+    const uint batch_id = gl_WorkGroupID.z;
+    const uint tid      = gl_LocalInvocationID.x;
+
+    if (row_a >= p.M || col_b >= p.N) {
+        return;
+    }
+
+    // Broadcast src0 over batch dimensions (matches mul_mm.comp).
+    uint batch_idx_a = 0;
+    if (batch_id != 0) {
+        const uint i13 = batch_id / p.ne12;
+        const uint i12 = batch_id % p.ne12;
+        const uint i03 = i13 / p.broadcast3;
+        const uint i02 = i12 / p.broadcast2;
+        batch_idx_a = i03 * p.ne02 + i02;
+    }
+
+    // For src0 (A), the mul_mat host code populates batch_stride_a and
+    // stride_a in BLOCK units (via src0->nb[2] / sizeof(block) and
+    // src0->nb[1] / sizeof(block)), which lets us handle both contiguous
+    // and permuted (non dim01-contiguous) src0 layouts. For a contiguous
+    // src0 with K columns and QUANT_K elements per block, stride_a in
+    // blocks equals K / QUANT_K = num_blocks_per_row.
+    const uint a_batch_off_blocks = batch_idx_a * p.batch_stride_a;
+    const uint b_batch_off        = batch_id    * p.batch_stride_b;
+    const uint d_batch_off        = batch_id    * p.batch_stride_d;
+
+    const uint num_blocks_per_row = p.K / QUANT_K;
+    const uint ib0 = a_batch_off_blocks + row_a * p.stride_a;
+
+    float accum = 0.0;
+
+    for (uint blk = 0u; blk < num_blocks_per_row; ++blk) {
+        const uint ib = ib0 + blk;
+
+        const float d_r = float(data_a[ib].d_r);
+        const bool has_qjl = d_r > 1e-15;
+
+        // Load one B slice of QUANT_K elements into shared memory, sign-flipped
+        // by the QJL Stage 2 sign diagonal (seed 137).
+        const uint b_elem =
+            b_batch_off + col_b * p.stride_b + blk * QUANT_K + tid;
+        proj_b_sh[tid] = float(data_b[b_elem]) * qjl_get_sign(tid);
+        barrier();
+
+        // In-place Walsh-Hadamard transform across QUANT_K elements.
+        for (uint h = 1u; h < QUANT_K; h <<= 1u) {
+            if (tid < QUANT_K / 2u) {
+                const uint grp = tid / h;
+                const uint pos = tid % h;
+                const uint idx = grp * (h << 1u) + pos;
+                const float va = proj_b_sh[idx];
+                const float vb = proj_b_sh[idx + h];
+                proj_b_sh[idx]     = va + vb;
+                proj_b_sh[idx + h] = va - vb;
+            }
+            barrier();
+        }
+
+        // Thread 0 reduces the block's QJL dot product.
+        if (has_qjl && tid == 0u) {
+            const float qjl_scale = d_r * sqrt(1.5707963) / float(QUANT_K);
+            float pos_sum = 0.0;
+            float total_sum = 0.0;
+            [[unroll]] for (uint w = 0u; w < QUANT_K / 32u; w++) {
+                const uint bb = w * 4u;
+                uint bits = uint(data_a[ib].qjl[bb])
+                          | (uint(data_a[ib].qjl[bb + 1u]) << 8u)
+                          | (uint(data_a[ib].qjl[bb + 2u]) << 16u)
+                          | (uint(data_a[ib].qjl[bb + 3u]) << 24u);
+                [[unroll]] for (uint qq = 0u; qq < 8u; qq++) {
+                    const uint base_idx = (w * 8u + qq) * 4u;
+                    const vec4 pq = vec4(proj_b_sh[base_idx],
+                                         proj_b_sh[base_idx + 1u],
+                                         proj_b_sh[base_idx + 2u],
+                                         proj_b_sh[base_idx + 3u]);
+                    const vec4 mask_v = vec4(float(bits & 1u),
+                                             float((bits >> 1u) & 1u),
+                                             float((bits >> 2u) & 1u),
+                                             float((bits >> 3u) & 1u));
+                    pos_sum   += dot(mask_v, pq);
+                    total_sum += pq.x + pq.y + pq.z + pq.w;
+                    bits >>= 4u;
+                }
+            }
+            accum += qjl_scale * (2.0 * pos_sum - total_sum);
+        }
+        barrier();
+    }
+
+    // Thread 0 adds the accumulated correction into the output tensor.
+    if (tid == 0u) {
+        const uint d_idx = d_batch_off + col_b * p.stride_d + row_a;
+        data_d[d_idx] = D_TYPE(float(data_d[d_idx]) + accum);
+    }
+}

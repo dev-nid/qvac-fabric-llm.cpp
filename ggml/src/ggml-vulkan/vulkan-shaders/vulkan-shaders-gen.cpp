@@ -608,6 +608,39 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         }
 #endif
     }
+
+    // _64 variants (head_dim=64) of the standalone MUL_MAT path for TBQ/PQ.
+    //
+    // These are emitted outside the main `type_names` loop so we don't
+    // cascade through FA / MUL_MAT_ID / get_rows / ... which either already
+    // have dedicated _64 handling (FA) or don't apply to TBQ/PQ at all.
+    //
+    // Matches the `_128`-block TBQ/PQ matmul variants above: unaligned and
+    // aligned f32/f16 B, no cm2 (TBQ/PQ have no cm2 dequant_mul_mat_mat
+    // shader — the generic cm1/scalar pipeline is used on cm2 devices via
+    // the fallback in ggml_vk_get_mul_mat_mat_pipeline), no MUL_MAT_ID
+    // (gated off in supports_op for TBQ/PQ), no q8_1 integer-dot path.
+    if (matmul_id_type == MatMulIdType::NONE && !coopmat2) {
+        for (const auto& tname : {"tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
+            std::string t(tname);
+            std::string data_a_key = "DATA_A_" + to_uppercase(t);
+            std::string load_vec_quant = "2"; // matches tbq3_0 / pq3_0 / tbq4_0 / pq4_0 above
+            std::string load_vec_a_unaligned = load_vec_quant;
+            std::string load_vec_a = load_vec_quant;
+
+            const std::map<std::string, std::string> float_type_dict = {
+                {"FLOAT_TYPE",      FLOAT_TYPE(1, t)},
+                {"FLOAT_TYPE_VEC2", FLOAT_TYPE(2, t)},
+                {"FLOAT_TYPE_VEC4", FLOAT_TYPE(4, t)},
+                {"FLOAT_TYPE_VEC8", FLOAT_TYPE(8, t)},
+            };
+
+            string_to_spv(device_prefix + shader_name + "_" + t + "_f32",         "mul_mm.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, false, f16acc);
+            string_to_spv(device_prefix + shader_name + "_" + t + "_f32_aligned", "mul_mm.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, false, f16acc);
+            string_to_spv(device_prefix + shader_name + "_" + t + "_f16",         "mul_mm.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float16_t"},        {"D_TYPE", "float"}}), fp16, coopmat, false, f16acc);
+            string_to_spv(device_prefix + shader_name + "_" + t + "_f16_aligned", "mul_mm.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, false, f16acc);
+        }
+    }
 }
 
 void process_shaders() {
@@ -942,6 +975,11 @@ void process_shaders() {
         string_to_spv("cpy_f32_" + t, "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("cpy_f32_" + t + "_rte", "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
         string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        // f16 output variant: lets MUL_MAT dispatch dequantize non-contiguous
+        // quantized src0 to f16 directly on the GPU, instead of falling back
+        // to CPU (which used to happen because the f32 intermediate was the
+        // only available cpy path for quantized inputs).
+        string_to_spv("cpy_" + t + "_f16", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
     }
 
     // Norm-correction variants for TBQ/PQ copy_to_quant
@@ -966,6 +1004,20 @@ void process_shaders() {
         string_to_spv("set_rows_" + t + "_i32_nc_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
         string_to_spv("set_rows_" + t + "_i64_nc",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("set_rows_" + t + "_i64_nc_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
+    }
+
+    // TBQ standalone MUL_MAT QJL (Stage 2) correction pass.
+    // Applied after mul_mm.comp for TBQ3_0/TBQ4_0 when n > mul_mat_vec_max_cols,
+    // to match the epilogue that `mul_mat_vec_tbq*_0.comp` applies on the vec path.
+    // Shader is parameterised over QUANT_K (128 for TBQ*_0, 64 for TBQ*_0_64) via
+    // DATA_A_TBQ*_0*, so the same source file yields the right workgroup / shared-
+    // memory sizing and qjl[] loop bounds for both head-dim variants.
+    for (std::string t : {"tbq3_0", "tbq4_0", "tbq3_0_64", "tbq4_0_64"}) {
+        const std::string dak = "DATA_A_" + to_uppercase(t);
+        string_to_spv("mul_mm_qjl_" + t + "_f32", "mul_mm_tbq_qjl_correction.comp",
+                      {{dak, "1"}, {"B_TYPE", "float"},     {"D_TYPE", "float"}});
+        string_to_spv("mul_mm_qjl_" + t + "_f16", "mul_mm_tbq_qjl_correction.comp",
+                      {{dak, "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}});
     }
 
     auto get_type_str = [](bool f16) {

@@ -70,16 +70,22 @@ void main() {
     barrier();
 
 #ifdef HAS_QJL_CORRECTION
-    // Pre-compute QJL projection of Q: proj_q = FHT(D_qjl * q)
-    // Each row r gets its own projected query for the QJL dot correction.
-    // Note: we use the UN-scaled Q (divide out p.scale) since QJL correction
-    // operates on the raw query, and the result is added to Sf which already
-    // has p.scale baked in from the K·Q dot product.
+    // Pre-compute QJL projection of Q: proj_q = FHT(D_qjl * q).
+    //
+    // Read Q straight from the input SSBO (data_qv4). The alternative is to
+    // read the already-loaded Qf shared array and divide by p.scale to undo
+    // the p.scale that was multiplied into Qf for the main Q·K dot. For the
+    // scalar FA path Qf is f32 and p.scale is usually a power of two
+    // (1/sqrt(head_dim)), so the round-trip is mathematically exact; for
+    // the coopmat1 path Qf is f16, which makes the round-trip lossy for
+    // large-magnitude activations. Reading the raw f32 Q directly avoids
+    // both issues and matches what the non-FA mul_mm_tbq_qjl_correction pass
+    // does with src1.
     [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
         if (i * Br + r < N) {
-            // Load Q into proj array, undo scale, apply QJL signs
             for (uint32_t idx = tid; idx < QUANT_K; idx += gl_WorkGroupSize.x) {
-                float q_val = Qf[r][idx / 4][idx % 4] / p.scale;
+                vec4 qv = vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + idx / 4]);
+                float q_val = qv[idx % 4];
                 Qf_qjl_proj[r][idx] = q_val * qjl_get_sign(idx);
             }
         }

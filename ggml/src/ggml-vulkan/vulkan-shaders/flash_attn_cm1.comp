@@ -109,10 +109,15 @@ void main() {
     barrier();
 
 #ifdef HAS_QJL_CORRECTION
+    // See detailed comment in flash_attn.comp: we read Q directly from the
+    // input SSBO to avoid the Qf -> f16 -> /p.scale round-trip on the cm1
+    // path, which is lossy for the large activation magnitudes seen e.g. in
+    // Qwen2.5-0.5B's first layers.
     [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
         if (i * Br + r < N) {
             for (uint32_t idx = tid; idx < QUANT_K; idx += gl_WorkGroupSize.x) {
-                float q_val = float(Qf[r * qstride + idx / 4][idx % 4]) / float(p.scale);
+                vec4 qv = vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + idx / 4]);
+                float q_val = qv[idx % 4];
                 Qf_qjl_proj[r][idx] = q_val * qjl_get_sign(idx);
             }
         }
