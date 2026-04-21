@@ -8123,6 +8123,10 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
     std::cerr << ")),)");
+    // Vec path only supports dim01-contiguous quantized src0 (it does not run
+    // the pipeline_cpy_quant_f16 dequant step that the matrix path has). Keep
+    // this in lock-step with the dispatch gate in ggml_vk_mul_mat above, which
+    // routes non-dim01-contiguous quantized src0 to ggml_vk_mul_mat_q_f16.
     GGML_ASSERT(ggml_vk_dim01_contiguous(src0) || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);  // NOLINT
     GGML_ASSERT(ggml_vk_dim01_contiguous(src1) || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);  // NOLINT
 
@@ -8566,9 +8570,18 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
+    //
+    // Non-dim01-contiguous quantized src0 (e.g. the permuted K view fed to
+    // kq = mul_mat(K, Q) on the -fa off attention path) must go through the
+    // matrix path, because only ggml_vk_mul_mat_q_f16 knows how to dequantize
+    // src0 to f16 via pipeline_cpy_quant_f16 before the matmul. The vec path
+    // expects dim01-contiguous quantized src0 and would assert. supports_op
+    // advertises these cases as supported via has_quant_f16_cpy, so we must
+    // keep them on the GPU here rather than fall back to CPU.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) &&
-               src0->type != GGML_TYPE_TBQ3_0_64 && src0->type != GGML_TYPE_TBQ4_0_64 && src0->type != GGML_TYPE_PQ3_0_64 && src0->type != GGML_TYPE_PQ4_0_64) {
+               src0->type != GGML_TYPE_TBQ3_0_64 && src0->type != GGML_TYPE_TBQ4_0_64 && src0->type != GGML_TYPE_PQ3_0_64 && src0->type != GGML_TYPE_PQ4_0_64 &&
+               (!ggml_is_quantized(src0->type) || ggml_vk_dim01_contiguous(src0))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
