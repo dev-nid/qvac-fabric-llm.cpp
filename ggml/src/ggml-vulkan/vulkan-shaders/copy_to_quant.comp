@@ -1,15 +1,42 @@
 #version 450
 
 // Cooperative quantization path for TurboQuant / PolarQuant types: one workgroup
-// (32 threads == 1 subgroup on NVIDIA) handles a single block of QUANT_K values,
-// using subgroupAdd for the norm / correction reductions, a parallel Fast Hadamard
-// Transform, and subgroupBallot for the QJL sign sketch.
+// (WG == 32 threads) handles a single block of QUANT_K values, using subgroupAdd
+// for the norm / correction reductions, a parallel Fast Hadamard Transform, and
+// either subgroupBallot (when gl_SubgroupSize == WG) or a shared-memory atomicOr
+// fallback for the QJL sign sketch.
+//
+// Subgroup size generalization: the workgroup is always 32 threads, but the
+// hardware subgroup size can be smaller (Intel Xe/Arc: 8 or 16; Mali/Adreno: 4,
+// 8, 16; AMD wave32: 32; NVIDIA/Apple: 32; AMD wave64 with WG=32: 32 active
+// lanes in a 64-lane wave). We specialize on `SG_SIZE` at pipeline creation and
+// derive `NSG = WG / SG_SIZE` (number of subgroups per workgroup). When NSG==1,
+// the specialized SPIR-V emits the same subgroup ops (subgroupAdd and
+// subgroupBallot) and the same memory accesses as the original single-subgroup
+// shader, with the shared-memory stitch path dead-code-eliminated; when NSG>1,
+// the reductions and the QJL bit-pack go through a shared-memory stitching
+// step. SG_SIZE defaults to 32, so hosts that don't set the spec constant get
+// the original behaviour.
 #if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ4_0) || defined(DATA_A_PQ3_0) || defined(DATA_A_PQ4_0) || \
     defined(DATA_A_TBQ3_0_64) || defined(DATA_A_TBQ4_0_64) || defined(DATA_A_PQ3_0_64) || defined(DATA_A_PQ4_0_64)
 #define TQ_COOP 1
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
+
+// Subgroup size the pipeline will actually run with. The host passes this via
+// VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT and sets the spec
+// constant to the matching value. Default 32 matches the original shader.
+// NOTE: constant_id 0 is already used by generic_binary_head.glsl (norepeat)
+// in the SET_ROWS path; we pick 1 so the SET_ROWS entrypoint can set both
+// norepeat (id 0) and SG_SIZE (id 1) without collision. For the plain CPY
+// path generic_unary_head.glsl declares no spec constants, and unused entries
+// in VkSpecializationInfo are silently ignored by the driver, so passing a
+// 2-element {unused, SG_SIZE} vector from the host is safe in both cases.
+layout(constant_id = 1) const uint SG_SIZE = 32u;
+// Workgroup is always 32 threads for the cooperative TBQ/PQ path, see the
+// layout(local_size_x = 32) below. NSG is how many subgroups cover the WG.
+#define TQ_WG 32u
 #endif
 
 #include "rte.glsl"
@@ -247,6 +274,42 @@ void quantize(uint dst_idx, uint src_idx)
 #if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ4_0) || defined(DATA_A_PQ3_0) || defined(DATA_A_PQ4_0) || \
     defined(DATA_A_TBQ3_0_64) || defined(DATA_A_TBQ4_0_64) || defined(DATA_A_PQ3_0_64) || defined(DATA_A_PQ4_0_64)
 #include "tq_utils.comp"
+
+// Scratch for the cross-subgroup reduction stitch. Sized for the smallest
+// plausible subgroup (SG_SIZE=4 -> NSG=8). When SG_SIZE==32, NSG==1 and this
+// array is dead-code-eliminated after spec-constant substitution.
+shared float tq_sh_red[TQ_WG / 4u];
+// Scratch for the QJL ballot stitch: one uint per 32 bits of QJL output.
+// Longest QJL is BK=128 -> 128/8 = 16 bytes = 4 uints; we allocate the max.
+shared uint tq_sh_qjl[4];
+
+// Workgroup-wide sum. At NSG==1 (SG_SIZE >= TQ_WG, i.e. the whole workgroup
+// fits in one subgroup) this is a single subgroupAdd, matching the original
+// code exactly -- the trailing shared-memory stitch dead-code-folds away when
+// the spec constant `SG_SIZE` resolves to >= TQ_WG. SG_SIZE > TQ_WG happens on
+// AMD wave64 when the host doesn't request a 32-lane subgroup; subgroupAdd
+// still returns the correct sum since the extra lanes are inactive and
+// contribute zero.
+float tq_wg_add(float x) {
+    // Use max(SG_SIZE, TQ_WG) so SG_SIZE > TQ_WG behaves like SG_SIZE == TQ_WG
+    // (NSG = 1). Any SG_SIZE >= TQ_WG fits the workgroup in one subgroup.
+    const uint SG = SG_SIZE < TQ_WG ? SG_SIZE : TQ_WG;
+    const uint NSG = TQ_WG / SG;
+    float s = subgroupAdd(x);
+    if (NSG == 1u) {
+        return s;
+    }
+    if (subgroupElect()) {
+        tq_sh_red[gl_SubgroupID] = s;
+    }
+    barrier();
+    float total = 0.0;
+    [[unroll]] for (uint i = 0u; i < NSG; i++) {
+        total += tq_sh_red[i];
+    }
+    return total;
+}
+
 #endif
 
 #if defined(DATA_A_TBQ3_0) || defined(DATA_A_PQ3_0) || defined(DATA_A_TBQ3_0_64) || defined(DATA_A_PQ3_0_64)
@@ -306,7 +369,7 @@ void quantize(uint dst_idx, uint src_idx)
         tq3_sh_x[j] = v;
         local_sq += v * v;
     }
-    float total_sq = subgroupAdd(local_sq);
+    float total_sq = tq_wg_add(local_sq);
     float norm = sqrt(total_sq);
 
     if (lid == 0u) {
@@ -355,8 +418,8 @@ void quantize(uint dst_idx, uint src_idx)
         local_xc += tq3_sh_x[j] * cv;
         local_cc += cv * cv;
     }
-    float dot_xc = subgroupAdd(local_xc);
-    float dot_cc = subgroupAdd(local_cc);
+    float dot_xc = tq_wg_add(local_xc);
+    float dot_cc = tq_wg_add(local_cc);
     if (dot_cc > 1e-15) {
         norm = dot_xc / dot_cc;
     }
@@ -374,7 +437,7 @@ void quantize(uint dst_idx, uint src_idx)
         tq3_sh_proj[j] = r * qjl_get_sign(j);
         local_rsq += r * r;
     }
-    float r_norm = sqrt(subgroupAdd(local_rsq));
+    float r_norm = sqrt(tq_wg_add(local_rsq));
     if (lid == 0u) data_q[dst_idx].d_r = float16_t(r_norm);
 
     if (r_norm < 1e-15) {
@@ -399,16 +462,39 @@ void quantize(uint dst_idx, uint src_idx)
         barrier();
     }
 
-    // Pack QJL sign bits with subgroupBallot: each ballot call contributes 32 bits
-    // covering positions [s*32, (s+1)*32). With WG == subgroup size, bit `lid` of
+    // Pack QJL sign bits into qjl[]. When NSG==1 (SG_SIZE >= WG == 32), one
+    // subgroupBallot per 32-bit chunk fills all bits in one call; bit `lid` of
     // ballot.x reflects this thread's predicate, matching the serial layout
-    // `qjl[j/8] |= 1 << (j%8)`.
-    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
-        uint j = lid + s * WG;
-        uvec4 ballot = subgroupBallot(tq3_sh_proj[j] > 0.0);
-        if (lid == 0u) {
-            uint bits = ballot.x;
-            uint byte_off = s * 4u;
+    // `qjl[j/8] |= 1 << (j%8)`. When NSG>1 (smaller subgroups) each ballot only
+    // has SG_SIZE valid low bits, so we fall back to atomicOr into shared and
+    // then one thread serializes each 32-bit word out as 4 bytes.
+    if (SG_SIZE >= TQ_WG) {
+        [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+            uint j = lid + s * WG;
+            uvec4 ballot = subgroupBallot(tq3_sh_proj[j] > 0.0);
+            if (lid == 0u) {
+                uint bits = ballot.x;
+                uint byte_off = s * 4u;
+                data_q[dst_idx].qjl[byte_off + 0u] = uint8_t(bits & 0xFFu);
+                data_q[dst_idx].qjl[byte_off + 1u] = uint8_t((bits >> 8u) & 0xFFu);
+                data_q[dst_idx].qjl[byte_off + 2u] = uint8_t((bits >> 16u) & 0xFFu);
+                data_q[dst_idx].qjl[byte_off + 3u] = uint8_t((bits >> 24u) & 0xFFu);
+            }
+        }
+    } else {
+        const uint QJL_WORDS = (QJL_BYTES + 3u) / 4u;
+        if (lid < QJL_WORDS) tq_sh_qjl[lid] = 0u;
+        barrier();
+        [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+            uint j = lid + s * WG;
+            if (tq3_sh_proj[j] > 0.0) {
+                atomicOr(tq_sh_qjl[j / 32u], 1u << (j % 32u));
+            }
+        }
+        barrier();
+        if (lid < QJL_WORDS) {
+            uint bits = tq_sh_qjl[lid];
+            uint byte_off = lid * 4u;
             data_q[dst_idx].qjl[byte_off + 0u] = uint8_t(bits & 0xFFu);
             data_q[dst_idx].qjl[byte_off + 1u] = uint8_t((bits >> 8u) & 0xFFu);
             data_q[dst_idx].qjl[byte_off + 2u] = uint8_t((bits >> 16u) & 0xFFu);
@@ -486,7 +572,7 @@ void quantize(uint dst_idx, uint src_idx)
         tq4_sh_x[j] = v;
         local_sq += v * v;
     }
-    float total_sq = subgroupAdd(local_sq);
+    float total_sq = tq_wg_add(local_sq);
     float norm = sqrt(total_sq);
 
     if (lid == 0u) {
@@ -527,8 +613,8 @@ void quantize(uint dst_idx, uint src_idx)
         local_xc += tq4_sh_x[j] * cv;
         local_cc += cv * cv;
     }
-    float dot_xc = subgroupAdd(local_xc);
-    float dot_cc = subgroupAdd(local_cc);
+    float dot_xc = tq_wg_add(local_xc);
+    float dot_cc = tq_wg_add(local_cc);
     if (dot_cc > 1e-15) {
         norm = dot_xc / dot_cc;
     }
@@ -545,7 +631,7 @@ void quantize(uint dst_idx, uint src_idx)
         tq4_sh_proj[j] = r * qjl_get_sign(j);
         local_rsq += r * r;
     }
-    float r_norm = sqrt(subgroupAdd(local_rsq));
+    float r_norm = sqrt(tq_wg_add(local_rsq));
     if (lid == 0u) data_q[dst_idx].d_r = float16_t(r_norm);
 
     if (r_norm < 1e-15) {
@@ -568,12 +654,34 @@ void quantize(uint dst_idx, uint src_idx)
         barrier();
     }
 
-    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
-        uint j = lid + s * WG;
-        uvec4 ballot = subgroupBallot(tq4_sh_proj[j] > 0.0);
-        if (lid == 0u) {
-            uint bits = ballot.x;
-            uint byte_off = s * 4u;
+    // See tq3 path above for the NSG==1 vs NSG>1 split.
+    if (SG_SIZE >= TQ_WG) {
+        [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+            uint j = lid + s * WG;
+            uvec4 ballot = subgroupBallot(tq4_sh_proj[j] > 0.0);
+            if (lid == 0u) {
+                uint bits = ballot.x;
+                uint byte_off = s * 4u;
+                data_q[dst_idx].qjl[byte_off + 0u] = uint8_t(bits & 0xFFu);
+                data_q[dst_idx].qjl[byte_off + 1u] = uint8_t((bits >> 8u) & 0xFFu);
+                data_q[dst_idx].qjl[byte_off + 2u] = uint8_t((bits >> 16u) & 0xFFu);
+                data_q[dst_idx].qjl[byte_off + 3u] = uint8_t((bits >> 24u) & 0xFFu);
+            }
+        }
+    } else {
+        const uint QJL_WORDS = (QJL_BYTES + 3u) / 4u;
+        if (lid < QJL_WORDS) tq_sh_qjl[lid] = 0u;
+        barrier();
+        [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+            uint j = lid + s * WG;
+            if (tq4_sh_proj[j] > 0.0) {
+                atomicOr(tq_sh_qjl[j / 32u], 1u << (j % 32u));
+            }
+        }
+        barrier();
+        if (lid < QJL_WORDS) {
+            uint bits = tq_sh_qjl[lid];
+            uint byte_off = lid * 4u;
             data_q[dst_idx].qjl[byte_off + 0u] = uint8_t(bits & 0xFFu);
             data_q[dst_idx].qjl[byte_off + 1u] = uint8_t((bits >> 8u) & 0xFFu);
             data_q[dst_idx].qjl[byte_off + 2u] = uint8_t((bits >> 16u) & 0xFFu);
