@@ -30,6 +30,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include "vma/VmaUsage.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -15380,6 +15381,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const vk_device& device = ggml_vk_get_device(ctx->device);
                 if (op->op == GGML_OP_MUL_MAT_ID) {
                     if (src0_type == GGML_TYPE_TQ2_0) {
+                        return false;
+                    }
+                    constexpr std::array<ggml_type, 8> mul_mat_only_no_id_types = {
+                        GGML_TYPE_TBQ3_0,    GGML_TYPE_PQ3_0,    GGML_TYPE_TBQ4_0,    GGML_TYPE_PQ4_0,
+                        GGML_TYPE_TBQ3_0_64, GGML_TYPE_PQ3_0_64, GGML_TYPE_TBQ4_0_64, GGML_TYPE_PQ4_0_64,
+                    };
+                    if (std::find(mul_mat_only_no_id_types.begin(), mul_mat_only_no_id_types.end(), src0_type) !=
+                        mul_mat_only_no_id_types.end()) {
                         return false;
                     }
                     if (!device->mul_mat_id_s[src0_type] && !device->mul_mat_id_m[src0_type] && !device->mul_mat_id_l[src0_type]) {
