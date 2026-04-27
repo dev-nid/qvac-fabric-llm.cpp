@@ -2722,13 +2722,7 @@ size_t quantize_pq4_0_64(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 //   correction = sqrt(pi/2) / m * ||r_k|| * sum_j( sign_k_j * (R * q)_j )
 // where R is the same structured random projection applied on-the-fly to the query.
 
-#define QJL_SIGN_SEED_128 0xQJL128ULL
-#define QJL_SIGN_SEED_64  0xQJL064ULL
-
 // Use distinct seeds from the main Hadamard signs to get independent projections.
-// The actual numeric seeds — chosen to be clearly distinct from TQ_SIGN_SEED_*.
-#undef  QJL_SIGN_SEED_128
-#undef  QJL_SIGN_SEED_64
 #define QJL_SIGN_SEED_128 137
 #define QJL_SIGN_SEED_64  139
 
