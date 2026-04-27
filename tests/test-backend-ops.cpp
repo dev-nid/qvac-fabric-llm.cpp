@@ -7501,29 +7501,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // ggml-vulkan.cpp:3412 ("TBQ/PQ cm2 matmul shaders not yet generated") and the
     // supports_op switch that still lists TBQ/PQ for MUL_MAT.
     {
-        const ggml_type tbq_pq[] = {
-            GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0,
-        };
-        for (ggml_type type_a : tbq_pq) {
-            for (ggml_type type_b : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
-                // mul_mat_vec path (n small, e.g. decode-like)
-                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16,  1, 256, {1, 1}, {1, 1}));
-                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16,  8, 256, {1, 1}, {1, 1}));
-                // mat-mat path (n > 8, e.g. prefill — routes through dequant + f16 matmul on Vulkan)
-                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 16, 256, {1, 1}, {1, 1}));
-                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 32, 256, {1, 1}, {1, 1}));
-            }
-        }
-        // Non-dim01-contiguous small-n TBQ/PQ routes away from the vec path.
-        // TBQ still needs the standalone QJL correction there; PQ is the control.
         const ggml_type tbq_pq_all[] = {
             GGML_TYPE_TBQ3_0,    GGML_TYPE_TBQ4_0,    GGML_TYPE_PQ3_0,    GGML_TYPE_PQ4_0,
             GGML_TYPE_TBQ3_0_64, GGML_TYPE_TBQ4_0_64, GGML_TYPE_PQ3_0_64, GGML_TYPE_PQ4_0_64,
         };
         for (ggml_type type_a : tbq_pq_all) {
+            const int64_t k = 2*ggml_blck_size(type_a);
             for (ggml_type type_b : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
-                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
-                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 8, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+                // mul_mat_vec path (n small, e.g. decode-like)
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16,  1, k, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16,  8, k, {1, 1}, {1, 1}));
+                // mat-mat path (n > 8, e.g. prefill — routes through dequant + f16 matmul on Vulkan)
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 16, k, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 32, k, {1, 1}, {1, 1}));
+            }
+        }
+        // Non-dim01-contiguous small-n TBQ/PQ routes away from the vec path.
+        // TBQ still needs the standalone QJL correction there; PQ is the control.
+        for (ggml_type type_a : tbq_pq_all) {
+            const int64_t k = 2*ggml_blck_size(type_a);
+            for (ggml_type type_b : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, k, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 8, k, {2, 3}, {1, 1}, {0, 2, 1, 3}));
             }
         }
     }
@@ -8027,6 +8026,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Mixed K/V type flash attention (at least one side is TBQ/PQ)
     {
         const ggml_type mixed[]  = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
+        const ggml_type mixed_64[] = { GGML_TYPE_TBQ3_0_64, GGML_TYPE_TBQ4_0_64, GGML_TYPE_PQ3_0_64, GGML_TYPE_PQ4_0_64, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
 
         for (ggml_type tk : mixed) {
             for (ggml_type tv : mixed) {
@@ -8038,6 +8038,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                             test_cases.emplace_back(new test_flash_attn_ext(
                                 hs, hs, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, tk, tv));
                         }
+                    }
+                }
+            }
+        }
+        for (ggml_type tk : mixed_64) {
+            for (ggml_type tv : mixed_64) {
+                if (tk == tv) continue;
+                if (!ggml_is_tbq_or_pq(tk) && !ggml_is_tbq_or_pq(tv)) continue;
+                for (int kv : { 113, 512 }) {
+                    for (int nb : { 1, 32 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                            64, 64, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, tk, tv));
                     }
                 }
             }
