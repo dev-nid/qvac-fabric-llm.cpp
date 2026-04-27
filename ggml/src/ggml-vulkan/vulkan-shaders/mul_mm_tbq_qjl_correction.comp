@@ -55,22 +55,20 @@ void main() {
     }
 
     // Broadcast src0 over batch dimensions (matches mul_mm.comp).
-    uint batch_idx_a = 0;
+    uint i02 = 0;
+    uint i03 = 0;
     if (batch_id != 0) {
         const uint i13 = batch_id / p.ne12;
         const uint i12 = batch_id % p.ne12;
-        const uint i03 = i13 / p.broadcast3;
-        const uint i02 = i12 / p.broadcast2;
-        batch_idx_a = i03 * p.ne02 + i02;
+        i03 = i13 / p.broadcast3;
+        i02 = i12 / p.broadcast2;
     }
 
-    // For src0 (A), the mul_mat host code populates batch_stride_a and
-    // stride_a in BLOCK units (via src0->nb[2] / sizeof(block) and
-    // src0->nb[1] / sizeof(block)), which lets us handle both contiguous
-    // and permuted (non dim01-contiguous) src0 layouts. For a contiguous
-    // src0 with K columns and QUANT_K elements per block, stride_a in
-    // blocks equals K / QUANT_K = num_blocks_per_row.
-    const uint a_batch_off_blocks = batch_idx_a * p.batch_stride_a;
+    // For src0 (A), the host passes strides in BLOCK units. k_split is unused
+    // by this correction pass, so it carries src0->nb[3] / sizeof(block).
+    // Keeping dim2 and dim3 strides separate is required for permuted TBQ
+    // views, where nb[3] is not necessarily ne[2] * nb[2].
+    const uint a_batch_off_blocks = i02 * p.batch_stride_a + i03 * p.k_split;
     const uint b_batch_off        = batch_id    * p.batch_stride_b;
     const uint d_batch_off        = batch_id    * p.batch_stride_d;
 

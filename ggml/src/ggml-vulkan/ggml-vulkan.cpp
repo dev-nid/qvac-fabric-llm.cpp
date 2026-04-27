@@ -7992,10 +7992,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         // dispatch after ggml_vk_matmul below.
         //
         // For _128 TBQ the vec shader (small n path) embeds QJL inline, so we
-        // only need this extra pass for n > mul_mat_vec_max_cols.  For _64 TBQ
-        // we route *all* n through the mul_mm.comp matrix path (see the vec
-        // gate above), so QJL must run for every n.
-        if (ggml_is_tbq(src0->type) && !do_tiling && (ggml_is_tbq_64(src0->type) || ne11 > mul_mat_vec_max_cols) &&
+        // need this extra pass when n is large or when a non-contiguous src0
+        // forced the matrix path. For _64 TBQ we route *all* n through
+        // mul_mm.comp (see the vec gate above), so QJL must run for every n.
+        if (ggml_is_tbq(src0->type) && !do_tiling && (ggml_is_tbq_64(src0->type) || ne11 > mul_mat_vec_max_cols || qx_needs_dequant) &&
             split_k == 1 && !quantize_y) {
             // Mirror the QJL dispatch's choice of B source: prefer reading
             // F32 directly from src1 when contiguous, otherwise follow the
@@ -8131,9 +8131,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         // reads the raw TBQ block (d_r, qjl bitmask) plus the original B and
         // accumulates `d_r * sqrt(pi/2) / QUANT_K * sum_qjl(H(B))` into D.
         //
-        // Gated to non-tiling, non-split-k, contiguous src0 paths — other
-        // code paths are excluded from supports_op for TBQ.
-        if (ggml_is_tbq(src0->type) && (ggml_is_tbq_64(src0->type) || ne11 > mul_mat_vec_max_cols) && split_k == 1 &&
+        // Gated to non-tiling, non-split-k paths; other code paths are
+        // excluded from supports_op for TBQ.
+        if (ggml_is_tbq(src0->type) && (ggml_is_tbq_64(src0->type) || ne11 > mul_mat_vec_max_cols || qx_needs_dequant) && split_k == 1 &&
             !quantize_y) {
             // NOTE: `qx_needs_dequant` is allowed here. On cm2 the main
             // matmul dequantizes src0 to f16 (via to_fp16_vk_0) and runs a
@@ -8167,17 +8167,18 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             // src0 (the TBQ K tensor) may be a non dim01-contiguous view
             // (permuted KV cache on the -fa off attention path); the QJL
             // correction still reads the original TBQ blocks from d_Qx, so
-            // it needs the real in-memory block strides from src0->nb[1..2],
+            // it needs the real in-memory block strides from src0->nb[1..3],
             // not just "num_blocks_per_row" derived from K.
             const size_t blk_bytes = ggml_type_size(src0->type);
             const uint32_t qjl_stride_a       = (uint32_t)(src0->nb[1] / blk_bytes);
             const uint32_t qjl_stride_batch_a = (uint32_t)(src0->nb[2] / blk_bytes);
+            const uint32_t qjl_stride_batch3_a = (uint32_t)(src0->nb[3] / blk_bytes);
 
             const vk_mat_mat_push_constants qjl_pc = {
                 (uint32_t)ne01, (uint32_t)ne11, (uint32_t)ne10,
                 qjl_stride_a, (uint32_t)ne10, stride_d,
                 qjl_stride_batch_a, stride_batch_y, stride_batch_d,
-                (uint32_t)ne10,
+                qjl_stride_batch3_a,
                 (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
                 padded_n,
             };
