@@ -7995,13 +7995,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         // only need this extra pass for n > mul_mat_vec_max_cols.  For _64 TBQ
         // we route *all* n through the mul_mm.comp matrix path (see the vec
         // gate above), so QJL must run for every n.
-        const bool is_tbq_d128 =
-            src0->type == GGML_TYPE_TBQ3_0 || src0->type == GGML_TYPE_TBQ4_0;
-        const bool is_tbq_d64 =
-            src0->type == GGML_TYPE_TBQ3_0_64 || src0->type == GGML_TYPE_TBQ4_0_64;
-        if ((is_tbq_d128 || is_tbq_d64) &&
-            !do_tiling &&
-            (is_tbq_d64 || ne11 > mul_mat_vec_max_cols) &&
+        if (ggml_is_tbq(src0->type) && !do_tiling && (ggml_is_tbq_64(src0->type) || ne11 > mul_mat_vec_max_cols) &&
             split_k == 1 && !quantize_y) {
             // Mirror the QJL dispatch's choice of B source: prefer reading
             // F32 directly from src1 when contiguous, otherwise follow the
@@ -8139,13 +8133,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         //
         // Gated to non-tiling, non-split-k, contiguous src0 paths — other
         // code paths are excluded from supports_op for TBQ.
-        const bool is_tbq_d128_dispatch =
-            src0->type == GGML_TYPE_TBQ3_0 || src0->type == GGML_TYPE_TBQ4_0;
-        const bool is_tbq_d64_dispatch =
-            src0->type == GGML_TYPE_TBQ3_0_64 || src0->type == GGML_TYPE_TBQ4_0_64;
-        if ((is_tbq_d128_dispatch || is_tbq_d64_dispatch) &&
-            (is_tbq_d64_dispatch || ne11 > mul_mat_vec_max_cols) &&
-            split_k == 1 &&
+        if (ggml_is_tbq(src0->type) && (ggml_is_tbq_64(src0->type) || ne11 > mul_mat_vec_max_cols) && split_k == 1 &&
             !quantize_y) {
             // NOTE: `qx_needs_dequant` is allowed here. On cm2 the main
             // matmul dequantizes src0 to f16 (via to_fp16_vk_0) and runs a
@@ -9388,8 +9376,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         const bool coopmat_shape_supported = (dst->op_params[3] == GGML_PREC_F32 && ctx->device->coopmat_support_16x16x16_f32acc) ||
                                              (dst->op_params[3] != GGML_PREC_F32 && ctx->device->coopmat_support_16x16x16_f16acc);
 
-        const bool has_qjl                 = k->type == GGML_TYPE_TBQ3_0 || k->type == GGML_TYPE_TBQ4_0 ||
-                                             k->type == GGML_TYPE_TBQ3_0_64 || k->type == GGML_TYPE_TBQ4_0_64;
+        const bool has_qjl                 = ggml_is_tbq(k->type);
         const bool coopmat_shmem_supported = ggml_vk_flash_attn_coopmat_shmem_support(
             ctx->device, HSK, HSV, dst->op_params[3] == GGML_PREC_F32, has_qjl);
 
@@ -15383,12 +15370,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     if (src0_type == GGML_TYPE_TQ2_0) {
                         return false;
                     }
-                    constexpr std::array<ggml_type, 8> mul_mat_only_no_id_types = {
-                        GGML_TYPE_TBQ3_0,    GGML_TYPE_PQ3_0,    GGML_TYPE_TBQ4_0,    GGML_TYPE_PQ4_0,
-                        GGML_TYPE_TBQ3_0_64, GGML_TYPE_PQ3_0_64, GGML_TYPE_TBQ4_0_64, GGML_TYPE_PQ4_0_64,
-                    };
-                    if (std::find(mul_mat_only_no_id_types.begin(), mul_mat_only_no_id_types.end(), src0_type) !=
-                        mul_mat_only_no_id_types.end()) {
+                    if (ggml_is_tbq_or_pq(src0_type)) {
                         return false;
                     }
                     if (!device->mul_mat_id_s[src0_type] && !device->mul_mat_id_m[src0_type] && !device->mul_mat_id_l[src0_type]) {
@@ -15515,14 +15497,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     auto any = [](ggml_type t, std::initializer_list<ggml_type> s) {
                         return std::any_of(s.begin(), s.end(), [t](ggml_type v) { return v == t; });
                     };
-                    auto is_tbq_pq = [&](ggml_type t) {
-                        return any(t, { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0,
-                                        GGML_TYPE_TBQ3_0_64, GGML_TYPE_TBQ4_0_64, GGML_TYPE_PQ3_0_64, GGML_TYPE_PQ4_0_64 });
-                    };
-                    auto is_tbq = [&](ggml_type t) {
-                        return any(t, { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0,
-                                        GGML_TYPE_TBQ3_0_64, GGML_TYPE_TBQ4_0_64 });
-                    };
                     auto is_fa_mixed_v = [&](ggml_type t) {
                         return any(t, { GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0,
                                         GGML_TYPE_PQ3_0_64, GGML_TYPE_PQ4_0_64,
@@ -15530,7 +15504,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     };
 
                     if (k_type != v_type &&
-                        (!is_tbq_pq(k_type) || is_tbq(v_type) || !is_fa_mixed_v(v_type) ||
+                        (!ggml_is_tbq_or_pq(k_type) || ggml_is_tbq(v_type) || !is_fa_mixed_v(v_type) ||
                          !(device->subgroup_shuffle && device->subgroup_vote))) {
                         return false;
                     }

@@ -1643,12 +1643,12 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         const bool can_rotk =
             !hparams.is_n_embd_k_gqa_variable() &&
             hparams.n_embd_head_k % 64 == 0 &&
-            ggml_is_quantized(mctx_cur->type_k());
+            ggml_is_tbq_or_pq(mctx_cur->type_k());
 
         const bool can_rotv =
             !hparams.is_n_embd_v_gqa_variable() &&
             hparams.n_embd_head_v % 64 == 0 &&
-            ggml_is_quantized(mctx_cur->type_v());
+            ggml_is_tbq_or_pq(mctx_cur->type_v());
 
         inp->self_rotk = build_hadamard_rot(ctx0, can_rotk, hparams.n_embd_head_k);
         inp->self_rotv = build_hadamard_rot(ctx0, can_rotv, hparams.n_embd_head_v);
@@ -1947,12 +1947,12 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         const bool can_rotk =
             !hparams.is_n_embd_k_gqa_variable() &&
             hparams.n_embd_head_k % 64 == 0 &&
-            ggml_is_quantized(mctx_cur->get_base()->type_k());
+            ggml_is_tbq_or_pq(mctx_cur->get_base()->type_k());
 
         const bool can_rotv =
             !hparams.is_n_embd_v_gqa_variable() &&
             hparams.n_embd_head_v % 64 == 0 &&
-            ggml_is_quantized(mctx_cur->get_base()->type_v());
+            ggml_is_tbq_or_pq(mctx_cur->get_base()->type_v());
 
         inp->self_rotk = build_hadamard_rot(ctx0, can_rotk, hparams.n_embd_head_k);
         inp->self_rotv = build_hadamard_rot(ctx0, can_rotv, hparams.n_embd_head_v);

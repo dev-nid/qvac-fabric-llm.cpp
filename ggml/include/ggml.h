@@ -2557,7 +2557,7 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // logits
-            struct ggml_tensor  * b,  // labels  
+            struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // mask (1 for assistant tokens, 0 for masked)
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked_back(
             struct ggml_context * ctx,
@@ -2728,3 +2728,53 @@ extern "C" {
 #ifdef  __cplusplus
 }
 #endif
+
+static inline bool ggml_is_tbq_or_pq_64(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQ3_0_64:
+        case GGML_TYPE_TBQ4_0_64:
+        case GGML_TYPE_PQ3_0_64:
+        case GGML_TYPE_PQ4_0_64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static inline bool ggml_is_tbq_or_pq(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_PQ3_0:
+        case GGML_TYPE_PQ4_0:
+        case GGML_TYPE_TBQ3_0_64:
+        case GGML_TYPE_TBQ4_0_64:
+        case GGML_TYPE_PQ3_0_64:
+        case GGML_TYPE_PQ4_0_64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static inline bool ggml_is_tbq_64(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQ3_0_64:
+        case GGML_TYPE_TBQ4_0_64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static inline bool ggml_is_tbq(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQ3_0_64:
+        case GGML_TYPE_TBQ4_0_64:
+            return true;
+        default:
+            return false;
+    }
+}

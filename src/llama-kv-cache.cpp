@@ -133,10 +133,7 @@ llama_kv_cache::llama_kv_cache(
         // TurboQuant: auto-select block=64 variant when head_dim=64.
         // User specifies tbq3_0/tbq4_0 on the CLI; we swap to the _64 internal type if needed.
         auto resolve_tq_type = [&](ggml_type & type, const char * kv_label, uint32_t head_dim, uint32_t n_embd_gqa) {
-            if (type != GGML_TYPE_TBQ3_0 && type != GGML_TYPE_TBQ4_0 &&
-                type != GGML_TYPE_TBQ3_0_64 && type != GGML_TYPE_TBQ4_0_64 &&
-                type != GGML_TYPE_PQ3_0 && type != GGML_TYPE_PQ3_0_64 &&
-                type != GGML_TYPE_PQ4_0 && type != GGML_TYPE_PQ4_0_64) {
+            if (!ggml_is_tbq_or_pq(type)) {
                 return;
             }
             if (head_dim == 64) {
@@ -151,7 +148,7 @@ llama_kv_cache::llama_kv_cache(
                     std::to_string(head_dim) +
                     " for " + kv_label + ". Use a different --cache-type-" + kv_label + " (e.g. q8_0, q4_0).");
             }
-            uint32_t blk = (type == GGML_TYPE_TBQ3_0_64 || type == GGML_TYPE_TBQ4_0_64 || type == GGML_TYPE_PQ3_0_64 || type == GGML_TYPE_PQ4_0_64) ? 64 : 128;
+            uint32_t blk = ggml_is_tbq_or_pq_64(type) ? 64 : 128;
             if (n_embd_gqa % blk != 0) {
                 throw std::runtime_error(
                     std::string("KV cache type ") + ggml_type_name(type) +

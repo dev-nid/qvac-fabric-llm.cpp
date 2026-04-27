@@ -8014,14 +8014,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Mixed K/V type flash attention (at least one side is TBQ/PQ)
     {
-        const ggml_type tbq_pq[] = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0 };
         const ggml_type mixed[]  = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
-        auto is_tbq_pq = [&](ggml_type t) { return std::find(std::begin(tbq_pq), std::end(tbq_pq), t) != std::end(tbq_pq); };
 
         for (ggml_type tk : mixed) {
             for (ggml_type tv : mixed) {
                 if (tk == tv) continue;
-                if (!is_tbq_pq(tk) && !is_tbq_pq(tv)) continue;
+                if (!ggml_is_tbq_or_pq(tk) && !ggml_is_tbq_or_pq(tv)) continue;
                 for (int hs : { 64, 128 }) {
                     for (int kv : { 113, 512 }) {
                         for (int nb : { 1, 32 }) {
@@ -8250,18 +8248,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Mixed-type TurboQuant/PolarQuant Flash-Attention performance probes.
     // Filters with "tbq|pq" should now match these paths in MODE_PERF.
     {
-        const ggml_type tbq_pq[] = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0 };
         const ggml_type mixed[]  = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
-        auto is_tbq_pq = [&](ggml_type t) {
-            return std::find(std::begin(tbq_pq), std::end(tbq_pq), t) != std::end(tbq_pq);
-        };
 
         for (ggml_type tk : mixed) {
             for (ggml_type tv : mixed) {
                 if (tk == tv) {
                     continue;
                 }
-                if (!is_tbq_pq(tk) && !is_tbq_pq(tv)) {
+                if (!ggml_is_tbq_or_pq(tk) && !ggml_is_tbq_or_pq(tv)) {
                     continue;
                 }
                 for (int hs : { 64, 128 }) {
