@@ -103,6 +103,31 @@ run_sg_leg() {
     rm -f "$log"
 }
 
+# Run a single test-backend-ops QJL leg and record it in the same final
+# subgroup table. test-backend-ops reports "N/N tests passed" rather than the
+# "PASSED:" line emitted by test-copy-tbq-subgroups.
+run_qjl_sg_leg() {
+    local leg="$1" sg="$2" nsg="$3"
+    shift 3
+    local log
+    log=$(mktemp)
+    set +e
+    "$@" 2>&1 | tee "$log"
+    local rc=${PIPESTATUS[0]}
+    set -e
+    local result_line
+    result_line=$(grep -E '[0-9]+/[0-9]+ tests passed' "$log" | tail -1 || true)
+    local result="MISSING"
+    if [ "$rc" -eq 0 ] && [ -n "$result_line" ]; then
+        result="OK: $result_line"
+    else
+        result="FAILED"
+        num_failed=$((num_failed + 1))
+    fi
+    coverage_rows+=("${leg}	${sg}	${nsg}	${result}")
+    rm -f "$log"
+}
+
 # Render a Unicode box-drawing table summarising the subgroup-coverage legs.
 # Columns: Leg | Subgroup size | NSG | Result. Widths are computed dynamically
 # from the longest cell in each column so the table stays aligned no matter
@@ -298,6 +323,34 @@ if [ -f "$B/bin/test-copy-tbq-subgroups" ] && [ -f "$LVP_ICD" ]; then
         echo ""
     done
 fi
+
+# Standalone non-FA TBQ QJL correction coverage. Unlike copy_to_quant.comp,
+# mul_mm_tbq_qjl_correction.comp uses one workgroup per output element with
+# local_size_x == QUANT_K (64 or 128), so even SG=32 still spans multiple
+# subgroups. `test-backend-ops test` compares Vulkan against CPU reference;
+# restricting to TBQ + f32 + n=16 keeps this focused on the mat-mat path that
+# runs mul_mm followed by the QJL correction pass.
+echo "=== test-backend-ops (lavapipe TBQ MUL_MAT QJL SG sweep) ==="
+if [ -f "$B/bin/test-backend-ops" ] && [ -f "$LVP_ICD" ]; then
+    for W in 128 256 512; do
+        SG=$((W / 32))
+        NSG64=$((64 / SG))
+        NSG128=$((128 / SG))
+        echo "=== test-backend-ops TBQ QJL (lavapipe LP_NATIVE_VECTOR_WIDTH=$W, SG=$SG, NSG64=$NSG64, NSG128=$NSG128 stitch) ==="
+        run_qjl_sg_leg "QJL lavapipe W=${W}" "${SG}" "64:${NSG64}, 128:${NSG128} (stitch)" \
+            env GGML_VK_ALLOW_CPU_DEVICES=1 \
+            VK_ICD_FILENAMES="$LVP_ICD" \
+            LP_NATIVE_VECTOR_WIDTH="$W" \
+            GGML_VK_TBQ_COPY_SG_SIZE="$SG" \
+            "$B/bin/test-backend-ops" test \
+                -o MUL_MAT \
+                -p 'type_a=tbq.*type_b=f32.*n=16'
+        echo ""
+    done
+else
+    echo "SKIP: test-backend-ops or lavapipe ICD not found"
+fi
+echo ""
 
 # Guard against regressions in the shared MUL_MAT dispatcher. Our widening of
 # `supports_op` (pipeline_cpy_quant_f16) relaxed the non-dim01-contiguous rule
