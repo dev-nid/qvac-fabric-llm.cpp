@@ -418,13 +418,13 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-        GGML_TYPE_TBQ3_0    = 40, // TurboQuant 3-bit + QJL Stage 2, block=128 (4.375 bpw)
+        GGML_TYPE_TBQ3_0    = 40, // TurboQuant 3-bit + QJL Stage 2, block=128 (4.25 bpw)
         GGML_TYPE_TBQ4_0    = 41, // TurboQuant 4-bit + QJL Stage 2, block=128 (5.25 bpw)
-        GGML_TYPE_TBQ3_0_64 = 42, // TurboQuant 3-bit + QJL Stage 2, block=64  (4.375 bpw)
-        GGML_TYPE_TBQ4_0_64 = 43, // TurboQuant 4-bit + QJL Stage 2, block=64  (5.25 bpw)
-        GGML_TYPE_PQ3_0    = 44, // PolarQuant 3-bit (Stage 1 only), block=128 (3.25 bpw)
+        GGML_TYPE_TBQ3_0_64 = 42, // TurboQuant 3-bit + QJL Stage 2, block=64  (4.5 bpw)
+        GGML_TYPE_TBQ4_0_64 = 43, // TurboQuant 4-bit + QJL Stage 2, block=64  (5.5 bpw)
+        GGML_TYPE_PQ3_0    = 44, // PolarQuant 3-bit (Stage 1 only), block=128 (3.125 bpw)
         GGML_TYPE_PQ3_0_64 = 45, // PolarQuant 3-bit (Stage 1 only), block=64  (3.25 bpw)
-        GGML_TYPE_PQ4_0    = 46, // PolarQuant 4-bit (Stage 1 only), block=128 (4.25 bpw)
+        GGML_TYPE_PQ4_0    = 46, // PolarQuant 4-bit (Stage 1 only), block=128 (4.125 bpw)
         GGML_TYPE_PQ4_0_64 = 47, // PolarQuant 4-bit (Stage 1 only), block=64  (4.25 bpw)
         GGML_TYPE_COUNT    = 48,
     };
