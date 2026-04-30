@@ -135,6 +135,7 @@ add_library(llama
             models/wavtokenizer-dec.cpp
             models/xverse.cpp
             models/mistral3.cpp
+            models/dflash.cpp
             models/graph-context-mamba.cpp
             )
 

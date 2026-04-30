@@ -66,6 +66,37 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    // -----------------------------------------------------------------------
+    // DFlash: drafter cross-context input
+    // -----------------------------------------------------------------------
+    // Stage the projected target hidden states + sizes that the DFlash
+    // drafter graph will consume in build_inp_dflash(). The driver calls
+    // this on the *draft* context before each llama_decode().
+    //
+    //   target_hidden : flat float buffer, layout
+    //                   target_hidden[i_token * n_features + i_feat]
+    //   n_features    : per-token feature dim (n_target_layer_ids * n_embd)
+    //   n_ctx         : number of committed-prefix tokens encoded in the buffer
+    //   n_block       : number of noise tokens in the next decode (incl. id_last)
+    //
+    // The buffer is copied; the caller may free target_hidden after the call.
+    void set_dflash_input(const float * target_hidden,
+                          int64_t       n_features,
+                          int64_t       n_ctx,
+                          int64_t       n_block);
+
+    // Capture-side: tee out target hidden states from the listed layer ids.
+    void set_dflash_capture(const int32_t * layer_ids,
+                            size_t          n_layer_ids,
+                            int64_t         n_embd_target);
+
+    // After decode, returns the captured features and (via out param) the
+    // number of token positions covered. Returns nullptr if capture inactive.
+    const float * get_dflash_captured_features(int64_t * n_outputs_out) const;
+
+    // Read access for the graph builders (passed via llm_graph_params.dflash).
+    const llama_dflash * get_dflash() const;
+
     void attach_threadpool(
             ggml_threadpool_t threadpool,
             ggml_threadpool_t threadpool_batch);
@@ -268,6 +299,11 @@ private:
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
+
+    // DFlash drafter cross-context input.
+    // Populated by set_dflash_input(); consumed by llm_graph_input_dflash via
+    // the llama_dflash * forwarded through llm_graph_params.
+    llama_dflash dflash;
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;

@@ -541,3 +541,8 @@ struct llm_build_wavtokenizer_dec : public llm_graph_context {
 struct llm_build_xverse : public llm_graph_context {
     llm_build_xverse(const llama_model & model, const llm_graph_params & params);
 };
+
+// DFlash speculative-decoding draft model (Qwen3-shaped backbone with cross-attention to target hidden states).
+struct llm_build_dflash : public llm_graph_context {
+    llm_build_dflash(const llama_model & model, const llm_graph_params & params);
+};

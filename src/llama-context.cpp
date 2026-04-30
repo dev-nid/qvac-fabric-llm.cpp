@@ -664,6 +664,49 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+void llama_context::set_dflash_input(const float * target_hidden,
+                                     int64_t       n_features,
+                                     int64_t       n_ctx,
+                                     int64_t       n_block) {
+    dflash.n_features = n_features;
+    dflash.n_ctx      = n_ctx;
+    dflash.n_block    = n_block;
+
+    const size_t n_floats = (size_t) std::max<int64_t>(n_features, 0) * (size_t) std::max<int64_t>(n_ctx, 0);
+    dflash.target_hidden.assign(n_floats, 0.0f);
+    if (target_hidden != nullptr && n_floats > 0) {
+        std::memcpy(dflash.target_hidden.data(), target_hidden, n_floats * sizeof(float));
+    }
+}
+
+void llama_context::set_dflash_capture(const int32_t * layer_ids,
+                                       size_t          n_layer_ids,
+                                       int64_t         n_embd_target) {
+    dflash.capture_layer_ids.clear();
+    dflash.captured_features.clear();
+    dflash.captured_n_outputs = 0;
+    dflash.capture_n_embd     = n_embd_target;
+
+    if (layer_ids == nullptr || n_layer_ids == 0) {
+        return;
+    }
+    dflash.capture_layer_ids.assign(layer_ids, layer_ids + n_layer_ids);
+}
+
+const float * llama_context::get_dflash_captured_features(int64_t * n_outputs_out) const {
+    if (n_outputs_out) {
+        *n_outputs_out = dflash.captured_n_outputs;
+    }
+    if (dflash.captured_features.empty()) {
+        return nullptr;
+    }
+    return dflash.captured_features.data();
+}
+
+const llama_dflash * llama_context::get_dflash() const {
+    return &dflash;
+}
+
 void llama_context::attach_threadpool(
            ggml_threadpool_t threadpool,
            ggml_threadpool_t threadpool_batch) {
@@ -1092,6 +1135,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -2;
     };
 
+    // DFlash: pre-allocate the captured-features buffer for the full batch.
+    // Each ubatch will write into a slice based on n_outputs_prev.
+    if (!dflash.capture_layer_ids.empty() && dflash.capture_n_embd > 0) {
+        const int64_t n_features = (int64_t) dflash.capture_layer_ids.size() * dflash.capture_n_embd;
+        const size_t  total      = (size_t) n_features * (size_t) n_outputs_all;
+        dflash.captured_features.assign(total, 0.0f);
+        dflash.captured_n_outputs = n_outputs_all;
+    } else {
+        dflash.captured_features.clear();
+        dflash.captured_n_outputs = 0;
+    }
+
     int64_t n_outputs_prev = 0;
 
     do {
@@ -1226,6 +1281,53 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     {
                         GGML_ABORT("unknown pooling type");
                     }
+            }
+        }
+
+        // DFlash: copy per-layer hidden-state captures into the
+        // dflash.captured_features buffer at the n_outputs_prev offset.
+        // We expect the graph builder (e.g. qwen3.cpp) to have pushed one
+        // tensor per requested capture layer in the same order as
+        // dflash.capture_layer_ids; each tensor has shape [n_embd, n_outputs].
+        if (!dflash.capture_layer_ids.empty()
+                && !res->t_dflash_captures.empty()
+                && n_outputs > 0) {
+            GGML_ASSERT(res->t_dflash_captures.size() == dflash.capture_layer_ids.size()
+                        && "DFlash: graph builder pushed wrong number of captures");
+            const int64_t n_embd_target = dflash.capture_n_embd;
+            const int64_t n_layers_cap  = (int64_t) dflash.capture_layer_ids.size();
+            const int64_t n_features    = n_layers_cap * n_embd_target;
+
+            // For each output token i in this ubatch, the row in captured_features
+            // is captured_features[(n_outputs_prev + i) * n_features + ...].
+            // Each layer's contribution lives at offset (layer_idx * n_embd_target)
+            // within that row. To go from the per-tensor layout
+            //   t_capture[i_token * n_embd_target + i_feat]
+            // to the row-major captured_features layout, we copy column-by-column
+            // (i.e. layer-by-layer) into strided slots.
+            for (int64_t li = 0; li < n_layers_cap; ++li) {
+                ggml_tensor * t_cap = res->t_dflash_captures[li];
+                if (t_cap == nullptr) {
+                    continue;
+                }
+                ggml_backend_t bk = ggml_backend_sched_get_tensor_backend(sched.get(), t_cap);
+                GGML_ASSERT(bk != nullptr);
+
+                // Layout expected: ne[0] = n_embd_target, ne[1] = n_outputs (this ubatch).
+                GGML_ASSERT(t_cap->ne[0] == n_embd_target);
+                GGML_ASSERT(t_cap->ne[1] >= n_outputs && "DFlash capture: tensor smaller than n_outputs");
+
+                // Copy each token's contribution into the strided slot.
+                for (int64_t tok = 0; tok < n_outputs; ++tok) {
+                    const size_t src_off = (size_t) tok * n_embd_target * sizeof(float);
+                    const size_t dst_off = ((size_t)(n_outputs_prev + tok) * n_features
+                                            + (size_t) li * n_embd_target) * sizeof(float);
+                    ggml_backend_tensor_get_async(
+                        bk, t_cap,
+                        (uint8_t *) dflash.captured_features.data() + dst_off,
+                        src_off,
+                        n_embd_target * sizeof(float));
+                }
             }
         }
 
@@ -1468,6 +1570,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ &loras,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.dflash      =*/ &dflash,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -2679,6 +2782,26 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+void llama_set_dflash_input(llama_context * ctx,
+                            const float *   target_hidden,
+                            int64_t         n_features,
+                            int64_t         n_ctx,
+                            int64_t         n_block) {
+    ctx->set_dflash_input(target_hidden, n_features, n_ctx, n_block);
+}
+
+void llama_set_dflash_capture(llama_context * ctx,
+                              const int32_t * layer_ids,
+                              size_t          n_layer_ids,
+                              int64_t         n_embd_target) {
+    ctx->set_dflash_capture(layer_ids, n_layer_ids, n_embd_target);
+}
+
+const float * llama_get_dflash_captured_features(llama_context * ctx, int64_t * n_outputs_out) {
+    ctx->synchronize();
+    return ctx->get_dflash_captured_features(n_outputs_out);
 }
 
 // llama adapter API

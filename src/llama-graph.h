@@ -70,6 +70,51 @@ struct llama_cross {
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
 };
 
+// DFlash cross-context state.
+//
+// Two roles, one struct:
+//
+//  (a) On the *draft* context — the speculative driver writes target_hidden /
+//      n_features / n_ctx / n_block via llama_set_dflash_input() before each
+//      draft decode. The drafter graph (llm_build_dflash) reads them through
+//      build_inp_dflash() to construct K_ctx/V_ctx and the asymmetric
+//      kq_mask.
+//
+//  (b) On the *target* context — the driver writes capture_layer_ids /
+//      capture_n_embd via llama_set_dflash_capture() before any decode. The
+//      target graph (e.g. llm_build_qwen3) tees out hidden states at those
+//      layer indices, and after compute the context fills captured_features
+//      and captured_n_outputs for the driver to read.
+//
+// The two roles operate on different contexts; the same struct is used so a
+// single llama_dflash * forwarded through llm_graph_params lets the graph
+// builder discover whichever role applies on its own context.
+struct llama_dflash {
+    // ---------- (a) drafter input ----------
+    int64_t n_features = 0;       // per-token feature dim (n_target_layer_ids * n_embd)
+    int64_t n_ctx      = 0;       // committed-prefix tokens encoded in target_hidden
+    int64_t n_block    = 0;       // tokens in the next draft batch
+
+    // Concatenated target hidden states, laid out as
+    //   target_hidden[i_token * n_features + i_feat]
+    std::vector<float> target_hidden;
+
+    // ---------- (b) target capture ----------
+    // Layer indices (into the target model) whose post-block hidden states
+    // should be teed out per decode. Empty = no capture.
+    std::vector<int32_t> capture_layer_ids;
+
+    // Per-layer hidden dimension of the *target* model.
+    // (= hparams.n_embd of the target context.)
+    int64_t capture_n_embd = 0;
+
+    // After each decode, populated with [n_features, n_outputs] in row-major,
+    //   captured_features[i_token * n_features + i_feat]
+    // where n_features = capture_layer_ids.size() * capture_n_embd.
+    std::vector<float> captured_features;
+    int64_t            captured_n_outputs = 0;
+};
+
 struct llm_graph_params;
 
 //
@@ -247,6 +292,30 @@ public:
     const llama_cross * cross;
 };
 
+// DFlash drafter context input.
+// Stages target_hidden (committed-prefix features) into a backend tensor and
+// builds the per-block context positions + non-causal kq_mask for the
+// drafter's cross-attention. Owned by the graph; reads from the
+// llama_dflash struct on the context.
+class llm_graph_input_dflash : public llm_graph_input_i {
+public:
+    llm_graph_input_dflash(const llama_dflash * dflash, int64_t n_features, int64_t n_ctx, int64_t n_block)
+        : dflash(dflash), n_features(n_features), n_ctx(n_ctx), n_block(n_block) {}
+    virtual ~llm_graph_input_dflash() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * target_hidden = nullptr; // F32 [n_features, n_ctx]
+    ggml_tensor * pos_ctx       = nullptr; // I32 [n_ctx]
+    ggml_tensor * kq_mask       = nullptr; // F32 [n_ctx + n_block, n_block, 1, 1]
+    ggml_tensor * kq_mask_cnv   = nullptr; // f16 cast for flash_attn
+
+    const llama_dflash * dflash;
+    int64_t              n_features;
+    int64_t              n_ctx;
+    int64_t              n_block;
+};
+
 class llm_graph_input_attn_no_cache : public llm_graph_input_i {
 public:
     llm_graph_input_attn_no_cache(const llama_hparams & hparams, const llama_cparams & cparams) :
@@ -415,6 +484,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_dflash           * dflash; // DFlash drafter context (target_hidden + sizes)
 
     uint32_t n_outputs;
 
@@ -463,6 +533,7 @@ struct llm_graph_params {
             cvec      == other.cvec  &&
             loras     == other.loras &&
             cross     == other.cross &&
+            dflash    == other.dflash &&
             n_outputs == other.n_outputs;
     }
 };
@@ -503,6 +574,13 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+
+    // DFlash target hidden-state captures, one per entry in
+    // dflash->capture_layer_ids (parallel order). Each tensor has shape
+    // [n_embd_target, n_outputs] and is set with ggml_set_output() so the
+    // backend keeps it allocated; llama_context::decode() copies the contents
+    // into dflash.captured_features after compute.
+    std::vector<ggml_tensor *> t_dflash_captures;
 
     std::vector<llm_graph_input_ptr> inputs;
 
@@ -578,6 +656,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_dflash           * dflash; // DFlash drafter context
 
     const llm_graph_cb & cb_func;
 
@@ -687,6 +766,19 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos_bucket_enc() const;
     ggml_tensor * build_inp_pos_bucket_dec() const;
     ggml_tensor * build_pos_bias(ggml_tensor * pos_bucket, ggml_tensor * attn_rel_b) const;
+
+    // DFlash drafter cross-context input.
+    // Returns a struct of three tensors: target_hidden, pos_ctx, kq_mask.
+    // The graph builder is responsible for the math; this function just stages
+    // the inputs and registers them with the graph result.
+    llm_graph_input_dflash * build_inp_dflash() const;
+
+    // DFlash target hidden-state capture.
+    // If `il` is in dflash->capture_layer_ids, register `cur` (after the
+    // residual + post-FFN) as an output tensor and push it into
+    // res->t_dflash_captures so llama_context::decode() can read it back.
+    // No-op if dflash is null or capture is disabled.
+    void build_dflash_capture(ggml_tensor * cur, int il) const;
 
     //
     // attention

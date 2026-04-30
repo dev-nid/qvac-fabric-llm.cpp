@@ -561,6 +561,111 @@ extern "C" {
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
 
+    // -----------------------------------------------------------------------
+    // DFlash speculative-decoding draft model accessors
+    // -----------------------------------------------------------------------
+    //
+    // These getters return values stored in the GGUF of a DFlash draft model.
+    // They return 0 / LLAMA_TOKEN_NULL / negative values when the model is
+    // not a DFlash draft (i.e. the consumer can defensively call them
+    // without first checking the architecture).
+
+    // Block size: how many tokens the DFlash draft generates per forward pass.
+    // Returns 0 if the model is not a DFlash draft.
+    LLAMA_API uint32_t llama_model_dflash_block_size(const struct llama_model * model);
+
+    // Mask token id used to fill the draft block prior to running the draft.
+    // Returns LLAMA_TOKEN_NULL if the model is not a DFlash draft.
+    LLAMA_API llama_token llama_model_dflash_mask_token_id(const struct llama_model * model);
+
+    // Number of layer indices in the target_layer_ids list. Returns 0 if not DFlash.
+    LLAMA_API int32_t llama_model_dflash_n_target_layer_ids(const struct llama_model * model);
+
+    // Get the i-th target layer id (i.e. an index into the *target* model's layers,
+    // whose hidden state should be captured and fed to the DFlash draft).
+    // Returns -1 on out-of-range or non-DFlash model.
+    LLAMA_API int32_t llama_model_dflash_target_layer_id(const struct llama_model * model, int32_t i);
+
+    // Total number of target-model layers (informational; from training time).
+    LLAMA_API int32_t llama_model_dflash_num_target_layers(const struct llama_model * model);
+
+    // -----------------------------------------------------------------------
+    // DFlash: bind target model's tok_embd + lm_head into the draft
+    // -----------------------------------------------------------------------
+    //
+    // Paper §4.2: "the draft model shares the token embedding layer and
+    // language modeling head with the target model and keeps them frozen
+    // during training." A paper-faithful DFlash draft GGUF therefore does
+    // not contain its own tok_embd or output tensors; the inference engine
+    // must bind them from the target.
+    //
+    // Call this once after loading both models, before running any draft
+    // decode. It copies non-owning pointers from target → draft; the target
+    // model must outlive the draft.
+    //
+    // No-op if the draft already has its own tok_embd / output (i.e. when
+    // the GGUF was converted in self-contained mode). Returns false if
+    // either model is null.
+    LLAMA_API bool llama_dflash_bind_target(
+            struct llama_model *       model_dft,
+            const struct llama_model * model_tgt);
+
+    // -----------------------------------------------------------------------
+    // DFlash drafter input setter (call on the *draft* context)
+    // -----------------------------------------------------------------------
+    //
+    // Stage the projected target hidden states + sizes that the next call to
+    // llama_decode(ctx_dft) will consume in its DFlash drafter graph.
+    //
+    //   target_hidden : flat float buffer, layout
+    //                   target_hidden[i_token * n_features + i_feat]
+    //                   pass nullptr for the very first block (n_ctx == 0).
+    //   n_features    : per-token feature dim (n_target_layer_ids * n_embd_target)
+    //   n_ctx         : number of committed-prefix tokens encoded in the buffer
+    //   n_block       : number of tokens in the upcoming draft batch
+    //
+    // The buffer is copied; the caller may free target_hidden after the call.
+    LLAMA_API void llama_set_dflash_input(
+            struct llama_context * ctx,
+            const float *          target_hidden,
+            int64_t                n_features,
+            int64_t                n_ctx,
+            int64_t                n_block);
+
+    // -----------------------------------------------------------------------
+    // DFlash target hidden-state capture (call on the *target* context)
+    // -----------------------------------------------------------------------
+    //
+    // Tee out the post-block hidden state at the given target-model layer
+    // indices on every llama_decode() call. After decode, retrieve the
+    // captures via llama_get_dflash_captured_features().
+    //
+    //   layer_ids     : array of target-model layer indices to capture.
+    //   n_layer_ids   : count of layer_ids; pass 0 to disable capture.
+    //   n_embd_target : per-layer feature dim of the target model
+    //                   (== llama_model_n_embd(target_model)).
+    //
+    // Note: the caller must ensure the upcoming decode requests logits at
+    // every batch position (otherwise inp_out_ids subselects, and the
+    // captured tensors will only cover the output positions).
+    LLAMA_API void llama_set_dflash_capture(
+            struct llama_context * ctx,
+            const int32_t *        layer_ids,
+            size_t                 n_layer_ids,
+            int64_t                n_embd_target);
+
+    // After llama_decode() on the target context, returns a pointer to the
+    // captured features in row-major layout [n_features, n_outputs] where
+    //   n_features = n_layer_ids * n_embd_target
+    // and n_outputs is the number of output positions in the most recent
+    // ubatch. Returns NULL if capture is disabled or no decode has run.
+    // *n_outputs_out is filled with the n_outputs value.
+    // The buffer is owned by the context and is valid until the next decode
+    // or until llama_set_dflash_capture() is called again.
+    LLAMA_API const float * llama_get_dflash_captured_features(
+            struct llama_context * ctx,
+            int64_t *              n_outputs_out);
+
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
 

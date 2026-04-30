@@ -470,6 +470,23 @@ struct llama_model {
     struct ggml_tensor * dense_2_out_layers = nullptr;
     struct ggml_tensor * dense_3_out_layers = nullptr;
 
+    // DFlash speculative-decoding draft globals
+    // dflash_fc projects len(target_layer_ids)*n_embd -> n_embd
+    // dflash_hidden_norm is the RMSNorm applied to the projected target hidden state
+    struct ggml_tensor * dflash_fc           = nullptr;
+    struct ggml_tensor * dflash_hidden_norm  = nullptr;
+
+    // Paper §4.2: "the draft model shares the token embedding layer and language
+    // modeling head with the target model and keeps them frozen during training."
+    //
+    // A paper-faithful DFlash draft GGUF therefore does not contain its own
+    // tok_embd or output tensors. The speculative driver binds these from the
+    // *target* model at runtime via llama_dflash_bind_target() and the dflash
+    // graph builder uses them in place of the missing model.tok_embd /
+    // model.output. They are non-owning references — never freed by this model.
+    struct ggml_tensor * target_tok_embd = nullptr;
+    struct ggml_tensor * target_output   = nullptr;
+
     llama_model_params params;
 
     // gguf metadata

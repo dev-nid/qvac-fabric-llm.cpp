@@ -264,6 +264,72 @@ void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    if (dflash == nullptr) {
+        return;
+    }
+
+    // ----- target_hidden -----
+    // Copy the host-side target_hidden buffer into the backend tensor.
+    if (target_hidden) {
+        assert(target_hidden->type == GGML_TYPE_F32);
+
+        const size_t tensor_bytes = ggml_nbytes(target_hidden);
+        const int64_t n_real      = std::min<int64_t>(dflash->n_ctx, n_ctx);
+        const size_t  copy_bytes  = (size_t) n_real * (size_t) n_features * sizeof(float);
+
+        if (n_real > 0 && !dflash->target_hidden.empty()) {
+            const size_t actual = std::min(copy_bytes, tensor_bytes);
+            ggml_backend_tensor_set(target_hidden, dflash->target_hidden.data(), 0, actual);
+
+            if (actual < tensor_bytes) {
+                // Zero-fill the unused tail (kq_mask will mask it out anyway,
+                // but keep deterministic memory for reproducibility).
+                ggml_backend_tensor_memset(target_hidden, 0, actual, tensor_bytes - actual);
+            }
+        } else {
+            ggml_backend_tensor_memset(target_hidden, 0, 0, tensor_bytes);
+        }
+    }
+
+    // ----- pos_ctx -----
+    // Position ids for K_ctx RoPE: positions [0, 1, ..., n_real - 1] for the
+    // committed-prefix tokens, then 0 for the unused tail.
+    if (pos_ctx && pos_ctx->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(pos_ctx->buffer));
+        int32_t * data = (int32_t *) pos_ctx->data;
+        const int64_t n_real = std::min<int64_t>(dflash->n_ctx, n_ctx);
+        for (int64_t i = 0; i < n_ctx; ++i) {
+            data[i] = (i < n_real) ? (int32_t) i : 0;
+        }
+    }
+
+    // ----- kq_mask -----
+    // Shape: [n_kv = n_ctx + n_block, n_block, 1, 1].
+    // Full attention within the proposal block AND across the whole ctx prefix
+    //   (this matches the python reference: dflash attention is bidirectional).
+    // Mask the unused tail of the ctx (positions >= n_real) with -inf.
+    if (kq_mask && kq_mask->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
+        float * data         = (float *) kq_mask->data;
+        const int64_t n_real = std::min<int64_t>(dflash->n_ctx, n_ctx);
+        const int64_t n_kv   = n_ctx + n_block;
+        for (int64_t q = 0; q < n_block; ++q) {
+            for (int64_t k = 0; k < n_kv; ++k) {
+                if (k < n_ctx) {
+                    // ctx slot: open if within real ctx, masked otherwise
+                    data[q * n_kv + k] = (k < n_real) ? 0.0f : -INFINITY;
+                } else {
+                    // proposal slot: bidirectional (no causal mask)
+                    data[q * n_kv + k] = 0.0f;
+                }
+            }
+        }
+    }
+}
+
 static void print_mask(const float * data, int64_t n_tokens, int64_t n_kv, int64_t n_swa, llama_swa_type swa_type) {
     LLAMA_LOG_DEBUG("%s: === Attention mask ===\n", __func__);
     const char * swa_type_str = "unknown";
@@ -590,6 +656,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    dflash           (params.dflash),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -1285,6 +1352,69 @@ ggml_tensor * llm_graph_context::build_inp_cross_embd() const {
     res->add_input(std::move(inp));
 
     return cur;
+}
+
+void llm_graph_context::build_dflash_capture(ggml_tensor * cur, int il) const {
+    if (dflash == nullptr) {
+        return;
+    }
+    if (dflash->capture_layer_ids.empty()) {
+        return;
+    }
+    // is `il` in capture_layer_ids?
+    bool wanted = false;
+    for (int32_t want : dflash->capture_layer_ids) {
+        if (want == il) {
+            wanted = true;
+            break;
+        }
+    }
+    if (!wanted) {
+        return;
+    }
+    // Register `cur` as an output tensor so the scheduler keeps it around.
+    // Note: at this point in the qwen3 layer loop, `cur` has shape
+    // [n_embd, n_tokens] for non-final layers; the driver should request
+    // logits=true for every batch position so n_tokens == n_outputs.
+    ggml_set_output(cur);
+    // We push the same `cur` (no copy) — the backend allocator must keep the
+    // node materialised because of ggml_set_output above.
+    res->t_dflash_captures.push_back(cur);
+}
+
+llm_graph_input_dflash * llm_graph_context::build_inp_dflash() const {
+    GGML_ASSERT(dflash != nullptr && "build_inp_dflash() called without a llama_dflash on the context");
+
+    const int64_t n_features = dflash->n_features;
+    const int64_t n_ctx_dft  = dflash->n_ctx;
+    const int64_t n_block    = dflash->n_block;
+
+    GGML_ASSERT(n_features > 0 && "DFlash: n_features must be set before building the drafter graph");
+    GGML_ASSERT(n_block    > 0 && "DFlash: n_block must be > 0");
+
+    auto inp = std::make_unique<llm_graph_input_dflash>(dflash, n_features, n_ctx_dft, n_block);
+
+    // target_hidden: [n_features, n_ctx]  (zero ctx is allowed for the very first block)
+    inp->target_hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_features, std::max<int64_t>(n_ctx_dft, 1));
+    ggml_set_input(inp->target_hidden);
+    cb(inp->target_hidden, "dflash_target_hidden", -1);
+
+    // pos_ctx: [n_ctx]  (also at least 1 to satisfy ggml's positive-shape constraint)
+    inp->pos_ctx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, std::max<int64_t>(n_ctx_dft, 1));
+    ggml_set_input(inp->pos_ctx);
+    cb(inp->pos_ctx, "dflash_pos_ctx", -1);
+
+    // kq_mask: [n_ctx + n_block, n_block, 1, 1]
+    const int64_t n_kv = n_ctx_dft + n_block;
+    inp->kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, n_block, 1, 1);
+    ggml_set_input(inp->kq_mask);
+    cb(inp->kq_mask, "dflash_kq_mask", -1);
+
+    inp->kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->kq_mask, GGML_TYPE_F16) : inp->kq_mask;
+
+    auto * inp_ptr = inp.get();
+    res->add_input(std::move(inp));
+    return inp_ptr;
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos_bucket_enc() const {

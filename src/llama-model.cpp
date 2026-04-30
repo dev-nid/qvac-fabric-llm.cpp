@@ -2289,6 +2289,31 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_DFLASH:
+            {
+                // DFlash drafts share the Qwen3 hparam set, plus three DFlash-specific KVs.
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,           hparams.dflash_block_size);
+
+                // mask_token_id arrives as a uint32 in GGUF; cast into the signed token type
+                {
+                    uint32_t mask_id = 0;
+                    ml.get_key(LLM_KV_DFLASH_MASK_TOKEN_ID, mask_id);
+                    hparams.dflash_mask_token_id = (llama_token) mask_id;
+                }
+
+                ml.get_key(LLM_KV_DFLASH_NUM_TARGET_LAYERS, hparams.dflash_num_target_layers, false);
+
+                // target_layer_ids is an int32 array; load count first, then values
+                ml.get_arr_n(LLM_KV_DFLASH_TARGET_LAYER_IDS, hparams.dflash_n_target_layer_ids);
+                if (hparams.dflash_n_target_layer_ids > LLAMA_DFLASH_MAX_TARGET_LAYERS) {
+                    throw std::runtime_error("dflash.target_layer_ids exceeds compile-time maximum");
+                }
+                ml.get_arr(LLM_KV_DFLASH_TARGET_LAYER_IDS, hparams.dflash_target_layer_ids);
+
+                // DFlash drafts are tiny (1-2 layers) — no model-size taxonomy.
+                type = LLM_TYPE_UNKNOWN;
+            } break;
         default: throw std::runtime_error("unsupported model architecture");
     }
 
@@ -6590,6 +6615,46 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", i), { hparams.n_ff_shexp, n_embd }, 0);
                     }
                 } break;
+            case LLM_ARCH_DFLASH:
+                {
+                    // DFlash drafts share their token embedding and lm_head with the target model.
+                    // The token_embd / output tensors are bound at runtime; if they happen to be
+                    // present in the GGUF file we still load them (the converter may include them
+                    // for self-contained inference), but we mark them as not required.
+                    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+
+                    // DFlash-specific globals
+                    {
+                        const uint32_t n_tlid = hparams.dflash_n_target_layer_ids;
+                        if (n_tlid == 0) {
+                            throw std::runtime_error("dflash: target_layer_ids is empty");
+                        }
+                        const int64_t concat_dim = (int64_t) n_tlid * n_embd;
+                        dflash_fc          = create_tensor(tn(LLM_TENSOR_DFLASH_FC,          "weight"), {concat_dim, n_embd}, 0);
+                        dflash_hidden_norm = create_tensor(tn(LLM_TENSOR_DFLASH_HIDDEN_NORM, "weight"), {n_embd}, 0);
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa}, 0);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa}, 0);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+
+                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+                    }
+                } break;
             default:
                 throw std::runtime_error("unknown architecture");
         }
@@ -7660,6 +7725,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_mistral3>(*this, params);
             } break;
+        case LLM_ARCH_DFLASH:
+            {
+                llm = std::make_unique<llm_build_dflash>(*this, params);
+            } break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -7755,6 +7824,51 @@ const char * llama_model_cls_label(const struct llama_model * model, uint32_t i)
     return nullptr;
 }
 
+uint32_t llama_model_dflash_block_size(const struct llama_model * model) {
+    return model->hparams.dflash_block_size;
+}
+
+llama_token llama_model_dflash_mask_token_id(const struct llama_model * model) {
+    return model->hparams.dflash_mask_token_id;
+}
+
+int32_t llama_model_dflash_n_target_layer_ids(const struct llama_model * model) {
+    return (int32_t) model->hparams.dflash_n_target_layer_ids;
+}
+
+int32_t llama_model_dflash_target_layer_id(const struct llama_model * model, int32_t i) {
+    const auto & h = model->hparams;
+    if (i < 0 || (uint32_t) i >= h.dflash_n_target_layer_ids) {
+        return -1;
+    }
+    return h.dflash_target_layer_ids[i];
+}
+
+int32_t llama_model_dflash_num_target_layers(const struct llama_model * model) {
+    return (int32_t) model->hparams.dflash_num_target_layers;
+}
+
+bool llama_dflash_bind_target(struct llama_model * model_dft, const struct llama_model * model_tgt) {
+    if (model_dft == nullptr || model_tgt == nullptr) {
+        return false;
+    }
+
+    // The bind only makes sense if the draft is actually a DFlash draft.
+    // (Defensive — calling it on a non-DFlash draft is harmless but useless.)
+    if (model_dft->arch != LLM_ARCH_DFLASH) {
+        return false;
+    }
+
+    // Copy non-owning pointers from target → draft. Note: const_cast is safe
+    // here because target_tok_embd / target_output are read-only during draft
+    // graph evaluation; we just need to satisfy the existing tensor API which
+    // accepts non-const ggml_tensor*.
+    model_dft->target_tok_embd = const_cast<ggml_tensor *>(model_tgt->tok_embd);
+    model_dft->target_output   = const_cast<ggml_tensor *>(model_tgt->output);
+
+    return true;
+}
+
 // deprecated
 int32_t llama_n_ctx_train(const llama_model * model) {
     return llama_model_n_ctx_train(model);
@@ -7848,6 +7962,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3:
         case LLM_ARCH_QWEN3MOE:
+        case LLM_ARCH_DFLASH:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
         case LLM_ARCH_OLMO2:

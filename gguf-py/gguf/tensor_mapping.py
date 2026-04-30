@@ -1595,6 +1595,16 @@ class TensorNameMap:
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
         ),
+
+        # ---------- DFlash speculative-decoding draft globals -----------------
+        MODEL_TENSOR.DFLASH_FC: (
+            "fc",                # dflash python ref: DFlashDraftModel.fc
+            "model.fc",
+        ),
+        MODEL_TENSOR.DFLASH_HIDDEN_NORM: (
+            "hidden_norm",       # dflash python ref: DFlashDraftModel.hidden_norm
+            "model.hidden_norm",
+        ),
     }
 
     # architecture-specific block mappings

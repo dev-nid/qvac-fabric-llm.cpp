@@ -116,6 +116,7 @@ enum llm_arch {
     LLM_ARCH_RND1,
     LLM_ARCH_PANGU_EMBED,
     LLM_ARCH_MISTRAL3,
+    LLM_ARCH_DFLASH,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -304,6 +305,12 @@ enum llm_kv {
     LLM_KV_DENSE_2_FEAT_OUT,
     LLM_KV_DENSE_3_FEAT_IN,
     LLM_KV_DENSE_3_FEAT_OUT,
+
+    // DFlash speculative-decoding draft model parameters
+    LLM_KV_DFLASH_BLOCK_SIZE,
+    LLM_KV_DFLASH_MASK_TOKEN_ID,
+    LLM_KV_DFLASH_TARGET_LAYER_IDS,
+    LLM_KV_DFLASH_NUM_TARGET_LAYERS,
 };
 
 enum llm_tensor {
@@ -492,6 +499,10 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+
+    // DFlash speculative-decoding draft tensors
+    LLM_TENSOR_DFLASH_FC,            // projects concat of target hidden states down to hidden_size
+    LLM_TENSOR_DFLASH_HIDDEN_NORM,   // RMSNorm applied after dflash_fc
 };
 
 enum llm_tensor_layer {

@@ -699,6 +699,19 @@ class GGUFWriter:
     def add_shortconv_l_cache(self, length: int) -> None:
         self.add_uint32(Keys.ShortConv.L_CACHE.format(arch=self.arch), length)
 
+    # ---------- DFlash speculative-decoding draft -------------------------
+    def add_dflash_block_size(self, value: int) -> None:
+        self.add_uint32(Keys.DFlash.BLOCK_SIZE.format(arch=self.arch), value)
+
+    def add_dflash_mask_token_id(self, value: int) -> None:
+        self.add_uint32(Keys.DFlash.MASK_TOKEN_ID.format(arch=self.arch), value)
+
+    def add_dflash_target_layer_ids(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.DFlash.TARGET_LAYER_IDS.format(arch=self.arch), values)
+
+    def add_dflash_num_target_layers(self, value: int) -> None:
+        self.add_uint32(Keys.DFlash.NUM_TARGET_LAYERS.format(arch=self.arch), value)
+
     def add_block_count(self, length: int) -> None:
         self.add_uint32(Keys.LLM.BLOCK_COUNT.format(arch=self.arch), length)
 
