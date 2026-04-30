@@ -97,6 +97,39 @@ static bool append_captures(common_dflash_speculative * spec, int64_t n_tokens_k
     return true;
 }
 
+// Read the freshly-captured target features and APPEND them to the draft
+// context's persistent K/V side store via the encoder graph (paper §4.1).
+//
+// The captures cover all output positions of the most recent target decode;
+// we keep only the first `n_tokens_keep` of them (= the positions the
+// caller has just committed). `pos_start` is the absolute position of the
+// first kept token in the global sequence — its value drives K's RoPE.
+//
+// Returns true on success; sets the side store such that the next draft
+// decode reads pre-projected K_ctx / V_ctx via zero-copy views instead of
+// recomputing fc + per-layer wk/wv.
+static bool extend_ctx_kv(common_dflash_speculative * spec,
+                          int64_t                     n_tokens_keep,
+                          int64_t                     pos_start) {
+    int64_t n_outputs = 0;
+    const float * captures = llama_get_dflash_captured_features(spec->ctx_tgt, &n_outputs);
+    if (captures == nullptr || n_outputs == 0) {
+        LOG_ERR("%s: target captured no features\n", __func__);
+        return false;
+    }
+    if (n_tokens_keep > n_outputs) {
+        LOG_ERR("%s: asked to keep %lld captures but target produced only %lld\n",
+                __func__, (long long) n_tokens_keep, (long long) n_outputs);
+        return false;
+    }
+    const int32_t rc = llama_dflash_extend(spec->ctx_dft, captures, n_tokens_keep, pos_start);
+    if (rc != 0) {
+        LOG_ERR("%s: llama_dflash_extend failed (rc=%d)\n", __func__, rc);
+        return false;
+    }
+    return true;
+}
+
 // Roll the accumulator back to exactly `n_keep` tokens.
 static void truncate_accumulator(common_dflash_speculative * spec, int64_t n_keep) {
     GGML_ASSERT(n_keep <= spec->accumulated_n);
@@ -288,6 +321,10 @@ llama_tokens common_dflash_speculative_generate(
     spec->accumulated.clear();
     spec->accumulated_n = 0;
 
+    // Reset the draft's persistent K/V side store — we are starting a
+    // fresh prompt and must not carry over any state from a previous run.
+    llama_dflash_reset_ctx_kv(ctx_dft);
+
     LOG_DBG("%s: prefill target on %d tokens\n", __func__, (int) prompt.size());
     {
         common_batch_clear(spec->batch_tgt);
@@ -300,11 +337,12 @@ llama_tokens common_dflash_speculative_generate(
         }
     }
 
-    // Pull the prompt-wide captures into the persistent accumulator.
-    if (!append_captures(spec, (int64_t) prompt.size())) {
+    // Push the prompt-wide captures through the DFlash encoder so the
+    // draft can read pre-projected K_ctx / V_ctx for [0..prompt-1] from
+    // its side store (paper §4.1 K/V cache reuse).
+    if (!extend_ctx_kv(spec, (int64_t) prompt.size(), /*pos_start=*/0)) {
         return output;
     }
-    GGML_ASSERT(spec->accumulated_n == (int64_t) prompt.size());
 
     // Sample the very first generated token from the last prompt position.
     llama_token first_id = common_sampler_sample(smpl_tgt, ctx_tgt, /*idx=*/(int) prompt.size() - 1);
@@ -358,12 +396,11 @@ llama_tokens common_dflash_speculative_generate(
         // -----------------------------------------------------------------
         crop_kv_cache(ctx_dft, 0);
 
-        // Stage the persistent target_hidden buffer on the draft for this block.
-        llama_set_dflash_input(ctx_dft,
-                               spec->accumulated.empty() ? nullptr : spec->accumulated.data(),
-                               spec->n_features,
-                               spec->accumulated_n,
-                               bs);
+        // No host-side staging needed: the draft reads cross-context K/V
+        // straight from its persistent side store (populated above by
+        // extend_ctx_kv after each accepted block). The decoder graph
+        // pulls dflash.n_ctx from the side store's filled count, set
+        // by llama_dflash_extend(); n_block comes from the ubatch size.
 
         common_batch_clear(spec->batch_dft);
         for (int i = 0; i < bs; ++i) {
@@ -481,16 +518,17 @@ llama_tokens common_dflash_speculative_generate(
         // everything from that position onwards.
         crop_kv_cache(ctx_tgt, pos_block_start + n_keep_in_block);
 
-        // Append the captured features for the accepted positions only.
-        // The verify decode produced captures for all bs positions in the
-        // same input order; we keep the first n_keep_in_block.
-        if (!append_captures(spec, n_keep_in_block)) {
+        // Push the captured features for the accepted positions through
+        // the DFlash encoder. This appends pre-projected K_ctx / V_ctx
+        // for positions [pos_block_start..pos_block_start + accepted]
+        // into the draft's persistent side store, ready for the next
+        // block's draft decode (which will read them via zero-copy view).
+        if (!extend_ctx_kv(spec, n_keep_in_block, /*pos_start=*/(int64_t) pos_block_start)) {
             goto done;
         }
-        GGML_ASSERT(spec->accumulated_n == (int64_t) prompt.size() + n_committed_post_prompt);
 
-        LOG_DBG("%s: block #%d: bs=%d, accepted=%d (+1 bonus), n_predict=%d, accumulated_n=%lld\n",
-            __func__, n_blocks, bs, accepted, n_predict, (long long) spec->accumulated_n);
+        LOG_DBG("%s: block #%d: bs=%d, accepted=%d (+1 bonus), n_predict=%d\n",
+            __func__, n_blocks, bs, accepted, n_predict);
     }
 done:
 

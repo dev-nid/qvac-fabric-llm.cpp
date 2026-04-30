@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "models/models.h"
 
 #include <cinttypes>
 #include <cstring>
@@ -103,6 +104,30 @@ llama_context::llama_context(
         cparams.n_batch = GGML_KQ_MASK_PAD;
     }
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+    // The DFlash drafter decodes EXACTLY one block of `dflash_block_size`
+    // tokens per call, with bidirectional intra-block attention (paper §4.1).
+    // n_ubatch MUST equal block_size: a smaller ubatch would split the block
+    // across multiple llama_decode internal ubatches, each of which only
+    // sees its own subset as queries, breaking the bidirectional intra-block
+    // attention the draft relies on (acceptance collapses to ~0%). A larger
+    // ubatch is harmless but wastes worst-case compute buffer. We force it
+    // here regardless of what the user passed via --ubatch-size, because the
+    // standalone speculative-dflash example shares params.n_ubatch with the
+    // target context (where the user may legitimately want a different
+    // value, e.g. -ub 1 for byte-exact-match testing against llama-cli).
+    if (model.arch == LLM_ARCH_DFLASH) {
+        const uint32_t bs = std::max<uint32_t>(1, hparams.dflash_block_size);
+        if (cparams.n_ubatch != bs) {
+            LLAMA_LOG_INFO("%s: DFlash draft: forcing n_ubatch %u -> %u (= dflash_block_size); "
+                           "smaller ubatch breaks bidirectional intra-block attention\n",
+                           __func__, cparams.n_ubatch, bs);
+            cparams.n_ubatch = bs;
+        }
+        if (cparams.n_batch < bs) {
+            cparams.n_batch = bs;
+        }
+    }
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
@@ -303,6 +328,110 @@ llama_context::llama_context(
         }
 
         cross.v_embd.clear();
+
+        // Seed worst-case shapes for the DFlash drafter graph BEFORE
+        // graph_reserve runs. The driver overwrites these via
+        // llama_set_dflash_input() before each decode; the values here only
+        // matter for sizing compute buffers during the reserve pass.
+        if (model.arch == LLM_ARCH_DFLASH) {
+            GGML_ASSERT(model.dflash_fc != nullptr
+                && "DFlash draft model has no dflash_fc tensor — invalid GGUF.");
+            // n_features: dimensionality of `target_hidden` columns. Equals
+            //   num_captured_target_layers * target.n_embd, which is exactly
+            //   the input dim of the fc projection on the draft side.
+            dflash.n_features = model.dflash_fc->ne[0];
+            // n_block: every drafter forward pass decodes exactly block_size
+            //   tokens. The ubatch was clamped above, so n_tokens == block_size.
+            dflash.n_block    = std::max<int64_t>(1, hparams.dflash_block_size);
+            // n_ctx: worst case is "all of n_ctx_seq is committed prefix".
+            //   Subsequent decodes will pass a smaller value and the graph
+            //   builder will scale down accordingly (set_input clamps to
+            //   the dynamic value).
+            dflash.n_ctx      = (int64_t) cparams.n_ctx_seq;
+
+            // ---------- DFlash K/V side store (paper §4.1 reuse) ----------
+            // Per-layer K_ctx / V_ctx tensors that survive across decode
+            // calls. Allocated as backend tensors on the same buffer-type
+            // as each layer's wk/wv, so the encoder graph's matmul output
+            // can write into them without cross-device copies.
+            //
+            // Same allocator pattern as src/llama-kv-cache.cpp: one
+            // ggml_context per buffer-type, then one backend buffer per
+            // ggml_context. The tensor metadata lives in the per-buft
+            // ggml_context; the data lives in the buffer.
+            {
+                const uint32_t n_layer        = hparams.n_layer;
+                const int64_t  n_embd_k_gqa   = hparams.n_embd_k_gqa();
+                const int64_t  n_embd_v_gqa   = hparams.n_embd_v_gqa();
+                const ggml_type type_k        = params.type_k;
+                const ggml_type type_v        = params.type_v;
+                const int64_t  ctx_capacity   = (int64_t) cparams.n_ctx_seq;
+
+                struct ggml_backend_buft_comparator {
+                    bool operator()(const ggml_backend_buffer_type_t & lhs,
+                                    const ggml_backend_buffer_type_t & rhs) const {
+                        return strcmp(ggml_backend_buft_name(lhs),
+                                      ggml_backend_buft_name(rhs)) < 0;
+                    }
+                };
+                std::map<ggml_backend_buffer_type_t, ggml_context_ptr,
+                         ggml_backend_buft_comparator> ctx_map;
+
+                auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+                    auto it = ctx_map.find(buft);
+                    if (it != ctx_map.end()) return it->second.get();
+                    ggml_init_params p = {
+                        /*.mem_size   =*/ size_t(2u * n_layer * ggml_tensor_overhead()),
+                        /*.mem_buffer =*/ NULL,
+                        /*.no_alloc   =*/ true,
+                    };
+                    ggml_context * c = ggml_init(p);
+                    ctx_map.emplace(buft, c);
+                    return c;
+                };
+
+                dflash.ctx_K.resize(n_layer, nullptr);
+                dflash.ctx_V.resize(n_layer, nullptr);
+                dflash.ctx_capacity = ctx_capacity;
+                dflash.ctx_filled   = 0;
+                dflash.ctx_pos_base = 0;
+
+                for (uint32_t il = 0; il < n_layer; ++il) {
+                    ggml_backend_dev_t        dev  = model.dev_layer(il);
+                    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+                    ggml_context * c              = ctx_for_buft(buft);
+                    GGML_ASSERT(c != nullptr);
+
+                    ggml_tensor * k = ggml_new_tensor_2d(c, type_k, n_embd_k_gqa, ctx_capacity);
+                    ggml_tensor * v = ggml_new_tensor_2d(c, type_v, n_embd_v_gqa, ctx_capacity);
+                    ggml_format_name(k, "dflash_ctx_K_l%u", il);
+                    ggml_format_name(v, "dflash_ctx_V_l%u", il);
+
+                    dflash.ctx_K[il] = k;
+                    dflash.ctx_V[il] = v;
+                }
+
+                size_t total_bytes = 0;
+                for (auto & [buft, c] : ctx_map) {
+                    ggml_backend_buffer_t buf =
+                        ggml_backend_alloc_ctx_tensors_from_buft(c.get(), buft);
+                    if (!buf) {
+                        throw std::runtime_error(
+                            "failed to allocate buffer for DFlash K/V side store");
+                    }
+                    LLAMA_LOG_INFO("%s: %10s DFlash K/V side store size = %8.2f MiB\n",
+                            __func__, ggml_backend_buffer_name(buf),
+                            ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+                    total_bytes += ggml_backend_buffer_get_size(buf);
+                    ggml_backend_buffer_clear(buf, 0);
+                    dflash_kv_ctxs_bufs.emplace_back(std::move(c),
+                        ggml_backend_buffer_ptr(buf));
+                }
+                LLAMA_LOG_INFO("%s: DFlash K/V side store: total %.2f MiB across %d layers, capacity %u\n",
+                        __func__, total_bytes/1024.0/1024.0,
+                        (int) n_layer, (uint32_t) ctx_capacity);
+            }
+        }
 
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
@@ -691,6 +820,16 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids,
         return;
     }
     dflash.capture_layer_ids.assign(layer_ids, layer_ids + n_layer_ids);
+
+    // Changing capture_layer_ids changes the graph topology (each captured
+    // layer adds a ggml_set_output node). The cached graph from graph_reserve
+    // was built before captures were configured, so reusing it here would
+    // result in zero captures being produced and the post-decode bookkeeping
+    // copy_back loop in decode() would assert. Invalidate the cache so the
+    // next decode rebuilds the graph with the right number of capture nodes.
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
 }
 
 const float * llama_context::get_dflash_captured_features(int64_t * n_outputs_out) const {
@@ -705,6 +844,146 @@ const float * llama_context::get_dflash_captured_features(int64_t * n_outputs_ou
 
 const llama_dflash * llama_context::get_dflash() const {
     return &dflash;
+}
+
+void llama_context::dflash_reset_ctx_kv() {
+    dflash.ctx_filled   = 0;
+    dflash.ctx_pos_base = 0;
+    // The decoder graph's K_ctx view depends on ctx_filled; invalidate the
+    // cached graph so the next decode rebuilds with a zero-width view.
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+}
+
+int32_t llama_context::dflash_extend(const float * target_hidden_new,
+                                     int64_t       n_new,
+                                     int64_t       pos_start) {
+    if (model.arch != LLM_ARCH_DFLASH) {
+        LLAMA_LOG_ERROR("%s: model is not LLM_ARCH_DFLASH (arch=%d)\n",
+                __func__, (int) model.arch);
+        return -1;
+    }
+    if (n_new <= 0) {
+        return 0;
+    }
+    if (target_hidden_new == nullptr) {
+        LLAMA_LOG_ERROR("%s: target_hidden_new is null\n", __func__);
+        return -1;
+    }
+    if (dflash.ctx_K.empty() || dflash.ctx_V.empty()) {
+        LLAMA_LOG_ERROR("%s: DFlash K/V side store not allocated (model not "
+                "constructed with LLM_ARCH_DFLASH?)\n", __func__);
+        return -1;
+    }
+    if (dflash.ctx_filled + n_new > dflash.ctx_capacity) {
+        LLAMA_LOG_ERROR("%s: side store overflow: filled=%lld + new=%lld > capacity=%lld\n",
+                __func__, (long long) dflash.ctx_filled,
+                (long long) n_new, (long long) dflash.ctx_capacity);
+        return -1;
+    }
+    if (dflash.n_features <= 0) {
+        LLAMA_LOG_ERROR("%s: dflash.n_features not initialised\n", __func__);
+        return -1;
+    }
+
+    const int64_t write_offset = dflash.ctx_filled;
+
+    // Lazy-init the encoder graph result holder.
+    if (!gf_res_dflash_encode) {
+        gf_res_dflash_encode.reset(new llm_graph_result(graph_max_nodes()));
+    }
+    auto * res = gf_res_dflash_encode.get();
+    res->reset();
+
+    // The encoder graph's `n_tokens` is read from ubatch.n_tokens. Build a
+    // stub ubatch big enough to satisfy that field; the encoder doesn't
+    // touch any per-token batch metadata beyond the count.
+    llama_ubatch ub_stub = {};
+    ub_stub.n_tokens     = (uint32_t) n_new;
+    ub_stub.n_seq_tokens = (uint32_t) n_new;
+    ub_stub.n_seqs       = 1;
+    ub_stub.n_seqs_unq   = 1;
+
+    const auto gparams = graph_params(res, ub_stub, /*mctx=*/nullptr,
+                                      LLM_GRAPH_TYPE_DEFAULT);
+
+    // Build the encoder graph directly (bypasses model.build_graph dispatch
+    // — the encoder is a sibling of the decoder, not a regular per-arch
+    // build path).
+    {
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_eval_callback(sched.get(),
+            cparams.cb_eval, cparams.cb_eval_user_data);
+
+        llm_build_dflash_encode encode(model, gparams, write_offset);
+        ggml_cgraph * gf = res->get_gf();
+
+        if (!gf || ggml_graph_n_nodes(gf) == 0) {
+            LLAMA_LOG_ERROR("%s: encoder graph build produced no nodes\n", __func__);
+            return -1;
+        }
+
+        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate encoder graph\n", __func__);
+            return -2;
+        }
+
+        // ----- set inputs on the allocated graph -----
+        // The encoder builder created two input tensors with stable names
+        // in the graph's compute context. We retrieve them by name (they
+        // are leaves, not graph nodes, so iterating ggml_graph_node()
+        // would not find them).
+        ggml_tensor * t_target_hidden_new =
+            ggml_get_tensor(res->get_ctx(), "dflash_enc_target_hidden_new");
+        ggml_tensor * t_pos_new =
+            ggml_get_tensor(res->get_ctx(), "dflash_enc_pos_new");
+        GGML_ASSERT(t_target_hidden_new != nullptr && "encoder: target_hidden_new tensor not found");
+        GGML_ASSERT(t_pos_new           != nullptr && "encoder: pos_new tensor not found");
+
+        // Copy the user-provided F32 target_hidden block into the input tensor.
+        // Layout: row-major [n_new, n_features]; tensor is [n_features, n_new]
+        // with n_features as ne[0] (= contiguous within a token row).
+        const size_t bytes = (size_t) n_new * (size_t) dflash.n_features * sizeof(float);
+        GGML_ASSERT((size_t) ggml_nbytes(t_target_hidden_new) >= bytes);
+        ggml_backend_tensor_set(t_target_hidden_new, target_hidden_new, 0, bytes);
+
+        // Fill positions [pos_start..pos_start+n_new-1].
+        std::vector<int32_t> pos_buf((size_t) n_new);
+        for (int64_t i = 0; i < n_new; ++i) {
+            pos_buf[(size_t) i] = (int32_t) (pos_start + i);
+        }
+        ggml_backend_tensor_set(t_pos_new, pos_buf.data(),
+                                0, n_new * sizeof(int32_t));
+
+        // ----- compute -----
+        const auto status = graph_compute(gf, /*batched=*/n_new > 1);
+        if (status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: encoder graph compute failed (%d)\n",
+                    __func__, (int) status);
+            return -3;
+        }
+    }
+
+    // Compute succeeded; the side store now holds n_new more valid columns.
+    dflash.ctx_filled += n_new;
+
+    // Keep dflash.n_ctx in sync with ctx_filled — build_inp_dflash() sizes
+    // the kq_mask and pos_ctx tensors from dflash->n_ctx, and the decoder
+    // graph (with use_kv_reuse=true) views K_ctx / V_ctx with that width.
+    // Both the host-buffer legacy path and the side-store path use the
+    // same field; we update it here so subsequent decodes see the new
+    // value without a second API call.
+    dflash.n_ctx = dflash.ctx_filled;
+
+    // The decoder graph reads `ctx_filled` columns from the side store via
+    // a view sized at graph-build time. Changing ctx_filled changes the
+    // view's column count, so the cached decoder graph must be rebuilt on
+    // the next decode.
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+    return 0;
 }
 
 void llama_context::attach_threadpool(
@@ -2802,6 +3081,17 @@ void llama_set_dflash_capture(llama_context * ctx,
 const float * llama_get_dflash_captured_features(llama_context * ctx, int64_t * n_outputs_out) {
     ctx->synchronize();
     return ctx->get_dflash_captured_features(n_outputs_out);
+}
+
+int32_t llama_dflash_extend(llama_context * ctx,
+                            const float *   target_hidden_new,
+                            int64_t         n_new,
+                            int64_t         pos_start) {
+    return ctx->dflash_extend(target_hidden_new, n_new, pos_start);
+}
+
+void llama_dflash_reset_ctx_kv(llama_context * ctx) {
+    ctx->dflash_reset_ctx_kv();
 }
 
 // llama adapter API

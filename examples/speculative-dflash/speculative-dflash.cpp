@@ -63,6 +63,12 @@ int main(int argc, char ** argv) {
 
     // -----------------------------------------------------------------
     // Load the draft (DFlash) model
+    //
+    // Two-phase init: load the model first, bind the target's tok_embd /
+    // lm_head into it (paper §4.2 — the draft shares them with the target),
+    // then create the draft context. The bind has to happen before context
+    // creation because graph_reserve runs the dflash graph builder, which
+    // needs a non-null tok_embd for the worst-case shape pass.
     // -----------------------------------------------------------------
     {
         params.devices      = params.speculative.devices;
@@ -77,11 +83,27 @@ int main(int argc, char ** argv) {
         params.cpuparams_batch.n_threads = params.speculative.cpuparams_batch.n_threads;
         params.tensor_buft_overrides     = params.speculative.tensor_buft_overrides;
     }
-    common_init_result llama_init_dft = common_init_from_params(params);
+
+    common_init_result llama_init_dft;
+    {
+        auto mparams = common_model_params_to_llama(params);
+        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        if (model_dft == nullptr) {
+            LOG_ERR("%s: failed to load draft model '%s'\n", __func__, params.model.path.c_str());
+            return 1;
+        }
+
+        // Bind target's tok_embd / lm_head into the draft model BEFORE the
+        // draft context is created (graph_reserve runs at construction).
+        // No-op for non-DFlash drafts.
+        llama_dflash_bind_target(model_dft, model_tgt);
+
+        llama_init_dft = common_init_from_model_and_params(model_dft, std::move(llama_init_dft), params);
+    }
     llama_context * ctx_dft = llama_init_dft.context.get();
 
     if (ctx_dft == nullptr) {
-        LOG_ERR("%s: failed to load draft model\n", __func__);
+        LOG_ERR("%s: failed to create draft context\n", __func__);
         return 1;
     }
 

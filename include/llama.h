@@ -666,6 +666,38 @@ extern "C" {
             struct llama_context * ctx,
             int64_t *              n_outputs_out);
 
+    // -----------------------------------------------------------------------
+    // DFlash K/V cache reuse (paper §4.1) — call on the *draft* context
+    // -----------------------------------------------------------------------
+    //
+    // Append `n_new` newly-committed target features to the draft's
+    // persistent K/V side store. The encoder graph applies
+    // `fc + hidden_norm + per-layer wk/wv (+k_norm +RoPE on K)` once and
+    // writes the projected K/V into the side store at column offset
+    // `ctx_filled` (advances by n_new after the call). Subsequent decode
+    // calls then read these projected K/V via zero-copy views, bypassing
+    // the per-block recomputation.
+    //
+    //   target_hidden_new : host buffer, layout
+    //                       [n_new, n_features] row-major
+    //                       (== n_new contiguous tokens of n_features each)
+    //   n_new             : number of newly-committed target token positions
+    //   pos_start         : absolute position of the first new token
+    //                       (positions [pos_start..pos_start+n_new-1] are
+    //                       used for K's rotary embedding)
+    //
+    // The buffer is consumed; the caller may free target_hidden_new after
+    // the call. Returns 0 on success, non-zero on failure.
+    LLAMA_API int32_t llama_dflash_extend(
+            struct llama_context * ctx,
+            const float *          target_hidden_new,
+            int64_t                n_new,
+            int64_t                pos_start);
+
+    // Reset the K/V side store (e.g. on a new prompt). Does not free the
+    // backing buffer; subsequent llama_dflash_extend() calls reuse it.
+    LLAMA_API void llama_dflash_reset_ctx_kv(struct llama_context * ctx);
+
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
 

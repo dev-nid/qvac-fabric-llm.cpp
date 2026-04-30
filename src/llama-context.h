@@ -97,6 +97,25 @@ struct llama_context {
     // Read access for the graph builders (passed via llm_graph_params.dflash).
     const llama_dflash * get_dflash() const;
 
+    // Append `n_new` newly-committed target captures to the persistent K/V
+    // side store. `target_hidden_new` is host memory laid out
+    // [n_new, n_features] row-major; `pos_start` is the absolute position
+    // of the first new token (positions [pos_start..pos_start+n_new-1] are
+    // used for K's RoPE).
+    //
+    // Runs the DFlash encoder graph (llm_build_dflash_encode) once, which
+    // applies fc + hidden_norm + per-layer wk/wv (+k_norm +RoPE on K) and
+    // ggml_cpy's the result into ctx_K[il] / ctx_V[il] at column offset
+    // dflash.ctx_filled. On success, advances dflash.ctx_filled by n_new.
+    //
+    // Returns 0 on success, non-zero on failure.
+    int32_t dflash_extend(const float * target_hidden_new,
+                          int64_t       n_new,
+                          int64_t       pos_start);
+
+    // Reset the K/V side store to empty (e.g. on a new prompt).
+    void dflash_reset_ctx_kv();
+
     void attach_threadpool(
             ggml_threadpool_t threadpool,
             ggml_threadpool_t threadpool_batch);
@@ -304,6 +323,19 @@ private:
     // Populated by set_dflash_input(); consumed by llm_graph_input_dflash via
     // the llama_dflash * forwarded through llm_graph_params.
     llama_dflash dflash;
+
+    // ggml contexts + backend buffers backing the DFlash K/V side store.
+    // One context per buffer-type (== one per device when the model is
+    // split across GPUs); the same convention as llama_kv_cache_unified
+    // uses for the regular KV cache. Only populated when the model arch
+    // is LLM_ARCH_DFLASH; empty otherwise.
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> dflash_kv_ctxs_bufs;
+
+    // Encoder-graph result holder, kept across llama_dflash_extend() calls
+    // so the cached graph can be reused when the only thing changing
+    // between calls is the input tensor data. Topology (n_layer, types,
+    // tensor shapes) is invariant once allocated.
+    llm_graph_result_ptr gf_res_dflash_encode;
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;

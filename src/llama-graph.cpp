@@ -273,7 +273,13 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
 
     // ----- target_hidden -----
     // Copy the host-side target_hidden buffer into the backend tensor.
-    if (target_hidden) {
+    // If `target_hidden->buffer` is null, the scheduler has removed this
+    // input as unused (e.g. on the K/V cache reuse path the decoder
+    // graph reads K_ctx / V_ctx straight from the side store and never
+    // touches `target_hidden`). Skip the write in that case — the input
+    // is still in the graph for legacy callers but it has no backing
+    // memory to copy into.
+    if (target_hidden && target_hidden->buffer) {
         assert(target_hidden->type == GGML_TYPE_F32);
 
         const size_t tensor_bytes = ggml_nbytes(target_hidden);
@@ -307,24 +313,34 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
     }
 
     // ----- kq_mask -----
-    // Shape: [n_kv = n_ctx + n_block, n_block, 1, 1].
+    // Shape: [n_kv = n_ctx + n_block, n_block_pad, 1, 1] where
+    //   n_block_pad = GGML_PAD(n_block, GGML_KQ_MASK_PAD).
     // Full attention within the proposal block AND across the whole ctx prefix
     //   (this matches the python reference: dflash attention is bidirectional).
-    // Mask the unused tail of the ctx (positions >= n_real) with -inf.
+    // Rows q in [0, n_block):
+    //   * ctx slot k in [0, n_ctx)        — open if k < n_real, else -inf
+    //   * proposal slot k in [n_ctx, n_kv) — open (bidirectional)
+    // Rows q in [n_block, n_block_pad):  fully masked (-inf everywhere). These
+    //   rows exist only to satisfy the Flash-Attention kernel's pad
+    //   requirement; they have no corresponding query token.
     if (kq_mask && kq_mask->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
-        float * data         = (float *) kq_mask->data;
-        const int64_t n_real = std::min<int64_t>(dflash->n_ctx, n_ctx);
-        const int64_t n_kv   = n_ctx + n_block;
+        float * data            = (float *) kq_mask->data;
+        const int64_t n_real    = std::min<int64_t>(dflash->n_ctx, n_ctx);
+        const int64_t n_kv      = n_ctx + n_block;
+        const int64_t n_block_p = GGML_PAD(n_block, GGML_KQ_MASK_PAD);
         for (int64_t q = 0; q < n_block; ++q) {
             for (int64_t k = 0; k < n_kv; ++k) {
                 if (k < n_ctx) {
-                    // ctx slot: open if within real ctx, masked otherwise
                     data[q * n_kv + k] = (k < n_real) ? 0.0f : -INFINITY;
                 } else {
-                    // proposal slot: bidirectional (no causal mask)
                     data[q * n_kv + k] = 0.0f;
                 }
+            }
+        }
+        for (int64_t q = n_block; q < n_block_p; ++q) {
+            for (int64_t k = 0; k < n_kv; ++k) {
+                data[q * n_kv + k] = -INFINITY;
             }
         }
     }
@@ -551,6 +567,13 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+
+    // The DFlash capture vector is repopulated by the graph builder on every
+    // build (one entry per capture_layer_ids), so it must be cleared here
+    // alongside the other per-build outputs — otherwise repeated rebuilds
+    // accumulate stale tensor pointers and the post-decode bookkeeping in
+    // llama_context::decode() trips an "wrong number of captures" assert.
+    t_dflash_captures.clear();
 
     params = {};
 
@@ -1372,22 +1395,42 @@ void llm_graph_context::build_dflash_capture(ggml_tensor * cur, int il) const {
     if (!wanted) {
         return;
     }
-    // Register `cur` as an output tensor so the scheduler keeps it around.
-    // Note: at this point in the qwen3 layer loop, `cur` has shape
-    // [n_embd, n_tokens] for non-final layers; the driver should request
-    // logits=true for every batch position so n_tokens == n_outputs.
-    ggml_set_output(cur);
-    // We push the same `cur` (no copy) — the backend allocator must keep the
-    // node materialised because of ggml_set_output above.
-    res->t_dflash_captures.push_back(cur);
+    // We need each capture to own its own backend storage, otherwise
+    // ggml-alloc's per-backend scratch reuse aliases consecutive capture
+    // tensors to the same buffer offset and we end up reading the *last*
+    // captured layer's hidden state for every entry. Forcing a copy via
+    // ggml_dup() materialises a fresh leaf tensor that the allocator must
+    // place separately, and ggml_set_output() prevents that storage from
+    // being recycled before llama_context::decode() reads it back.
+    //
+    // The post-residual hidden state (`cur`) at this layer is also the
+    // input to the next layer. The dup tensor is purely a side output;
+    // it never re-enters the compute graph, so no extra residual paths.
+    ggml_tensor * cap = ggml_dup(ctx0, cur);
+    ggml_format_name(cap, "dflash_capture-%d", il);
+    ggml_set_output(cap);
+    ggml_build_forward_expand(gf, cap);
+    res->t_dflash_captures.push_back(cap);
 }
 
 llm_graph_input_dflash * llm_graph_context::build_inp_dflash() const {
     GGML_ASSERT(dflash != nullptr && "build_inp_dflash() called without a llama_dflash on the context");
 
+    // n_features is the column dim of `target_hidden`. The driver sets this
+    // when it stages real input, but during graph_reserve the llama_context
+    // constructor seeds it from `model.dflash_fc->ne[0]` so this assertion
+    // holds for every code path that reaches the drafter graph.
     const int64_t n_features = dflash->n_features;
     const int64_t n_ctx_dft  = dflash->n_ctx;
-    const int64_t n_block    = dflash->n_block;
+    // n_block is the proposal-window length. It must equal n_tokens (the
+    // ubatch size) because the kq_mask/Q tensors are sized per-graph-build
+    // from these two values and they have to agree. The DFlash drafter only
+    // ever decodes a single block per call (n_tokens == block_size by
+    // construction in the driver and by the n_ubatch clamp in
+    // llama_context's constructor), so deriving n_block from n_tokens here
+    // keeps the graph valid across both graph_reserve worst-case sizings
+    // and per-decode rebuilds.
+    const int64_t n_block    = (int64_t) n_tokens;
 
     GGML_ASSERT(n_features > 0 && "DFlash: n_features must be set before building the drafter graph");
     GGML_ASSERT(n_block    > 0 && "DFlash: n_block must be > 0");
@@ -1404,9 +1447,16 @@ llm_graph_input_dflash * llm_graph_context::build_inp_dflash() const {
     ggml_set_input(inp->pos_ctx);
     cb(inp->pos_ctx, "dflash_pos_ctx", -1);
 
-    // kq_mask: [n_ctx + n_block, n_block, 1, 1]
-    const int64_t n_kv = n_ctx_dft + n_block;
-    inp->kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, n_block, 1, 1);
+    // kq_mask: [n_kv = n_ctx + n_block, n_block_pad, 1, 1] where
+    //   n_block_pad = GGML_PAD(n_block, GGML_KQ_MASK_PAD)
+    // The Flash-Attention kernel asserts that the mask's second dimension is
+    // padded to GGML_KQ_MASK_PAD; padded rows (q >= n_block) are filled with
+    // -INFINITY in set_input so they never contribute to logits, but the
+    // tensor must be allocated at the padded size for the kernel to accept
+    // it. Vanilla MHA happily ignores the extra rows.
+    const int64_t n_kv         = n_ctx_dft + n_block;
+    const int64_t n_block_pad  = GGML_PAD(n_block, GGML_KQ_MASK_PAD);
+    inp->kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, n_block_pad, 1, 1);
     ggml_set_input(inp->kq_mask);
     cb(inp->kq_mask, "dflash_kq_mask", -1);
 

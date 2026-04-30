@@ -97,6 +97,9 @@ struct llama_dflash {
 
     // Concatenated target hidden states, laid out as
     //   target_hidden[i_token * n_features + i_feat]
+    // Used by the LEGACY recompute-every-block path. When the K/V cache reuse
+    // path is active (ctx_K non-empty), this stays empty and the decoder
+    // graph reads K_ctx / V_ctx directly from the side store instead.
     std::vector<float> target_hidden;
 
     // ---------- (b) target capture ----------
@@ -113,6 +116,28 @@ struct llama_dflash {
     // where n_features = capture_layer_ids.size() * capture_n_embd.
     std::vector<float> captured_features;
     int64_t            captured_n_outputs = 0;
+
+    // ---------- (c) per-layer K/V side store (paper §4.1 reuse) ----------
+    // Persistent per-layer K_ctx and V_ctx tensors, allocated as backend
+    // tensors at draft-context creation time and surviving across
+    // llama_decode() calls. Layout per layer:
+    //   ctx_K[il]: [n_embd_k_gqa, ctx_capacity]  (post wk + k_norm + RoPE)
+    //   ctx_V[il]: [n_embd_v_gqa, ctx_capacity]  (post wv, no norm/no RoPE)
+    // The encoder graph (llm_build_dflash_encode) computes K/V for newly
+    // committed target features and writes them at offset `ctx_filled`,
+    // bumping `ctx_filled` by `n_new` per call. The decoder graph
+    // (llm_build_dflash) reads `ctx_filled` columns via ggml_view_*().
+    //
+    // When `ctx_K` is empty, the implementation falls back to the
+    // recompute-every-block path that consumes `target_hidden` above.
+    std::vector<ggml_tensor *> ctx_K;
+    std::vector<ggml_tensor *> ctx_V;
+    int64_t ctx_filled   = 0;
+    int64_t ctx_capacity = 0;
+    // Position of the first cached ctx token within the global sequence.
+    // Always 0 for now; will become non-zero when sliding-window cap is
+    // ported (per buun fork's GGML_DFLASH_MAX_CTX).
+    int64_t ctx_pos_base = 0;
 };
 
 struct llm_graph_params;
