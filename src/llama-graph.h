@@ -113,11 +113,29 @@ struct llama_dflash {
     // (= hparams.n_embd of the target context.)
     int64_t capture_n_embd = 0;
 
-    // After each decode, populated with [n_features, n_outputs] in row-major,
+    // After each decode, populated with [n_outputs, n_features] in row-major,
     //   captured_features[i_token * n_features + i_feat]
     // where n_features = capture_layer_ids.size() * capture_n_embd.
     std::vector<float> captured_features;
     int64_t            captured_n_outputs = 0;
+
+    // Per-layer host staging buffers used by the post-decode read-back path
+    // in llama_context::decode(). Each entry is sized
+    //   capture_staging[il].size() == n_outputs_all * capture_n_embd
+    // and holds the layer's contribution in column-per-token layout
+    // (= the on-GPU tensor's native layout, contiguous after a single
+    // tensor_get_async). After all ubatches have been read into staging
+    // we sync the scheduler once and then host-transpose into
+    // `captured_features` (row-per-token, all-layers-side-by-side
+    // layout that the encoder graph in `dflash_extend()` expects).
+    //
+    // This batches the D2H reads from `n_layers * n_outputs` separate
+    // calls (one per (layer, token) pair) down to `n_layers` per ubatch,
+    // amortising the per-call backend submission overhead over more data
+    // (~16x fewer transactions on Qwen3-4B-DFlash with bs=16). The
+    // host-side transpose is a small set of fixed-stride memcpys and is
+    // negligible vs even one async-get's submission overhead.
+    std::vector<std::vector<float>> capture_staging;
 
     // ---------- (a') drafter inline argmax read-back ----------
     // After each decode on a draft context whose graph emitted

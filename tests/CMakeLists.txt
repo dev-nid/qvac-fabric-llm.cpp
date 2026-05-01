@@ -132,6 +132,17 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
         ARGS https://huggingface.co/ggml-org/vocabs ${PROJECT_SOURCE_DIR}/models/ggml-vocabs
     )
+
+    # DFlash strong-correctness gate: byte-exact greedy match between
+    # `llama-cli` and `llama-speculative-simple --draft-type dflash`.
+    # See the script header for env vars (DFLASH_TEST_TARGET / _DRAFT,
+    # DFLASH_TEST_FULL) and skip-on-missing-models semantics.
+    llama_test_cmd(
+        ${CMAKE_CURRENT_SOURCE_DIR}/test-dflash-correctness.sh
+        NAME test-dflash-correctness
+        WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+        LABEL "model"
+    )
 endif()
 
 if (LLAMA_LLGUIDANCE)

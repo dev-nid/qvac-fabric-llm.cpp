@@ -278,6 +278,12 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // overload that runs the graph on a caller-provided scheduler instead
+    // of the default `sched` member. Used by `dflash_extend` so the
+    // encoder graph runs on its dedicated `sched_dflash_encode`.
+    // Threadpool / n_threads setup is identical to the default overload.
+    ggml_status graph_compute(ggml_backend_sched_t sched_use, ggml_cgraph * gf, bool batched);
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false);
 
@@ -338,26 +344,35 @@ private:
     // is LLM_ARCH_DFLASH; empty otherwise.
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> dflash_kv_ctxs_bufs;
 
-    // Encoder-graph result holder, kept across llama_dflash_extend() calls
-    // so the same llm_graph_result instance is reused (its ctx_compute /
-    // gf are reset and rebuilt every call). After the commit-18 set_rows
-    // refactor the encoder graph topology depends only on `n_new` (the
-    // write_offset became a runtime input via `pos_idx`), so in principle
-    // we could skip the res->reset + rebuild + sched_alloc_graph cycle on
-    // matching `n_new`. In practice that doesn't work cleanly because the
-    // scheduler is shared with the draft-side decoder graph: every
-    // decoder run on ctx_dft (between consecutive extends) calls
-    // sched_reset + sched_alloc_graph for the decoder, which clobbers the
-    // encoder's compute-buffer slot assignments. Skipping the encoder's
-    // sched_alloc on a "cache hit" then crashes inside graph_compute on
-    // the next extend because the cached encoder tensors have stale
-    // device pointers. Tracked as future work in
-    // logs/core_architecture/07_review_and_next_steps.md item #5.
+    // Encoder-graph result holder, kept across `llama_dflash_extend()`
+    // calls so the same `llm_graph_result` instance is reused. Combined
+    // with the dedicated `sched_dflash_encode` (above), this enables
+    // per-`n_new` graph caching: when consecutive extends share the same
+    // `n_new` value, `dflash_extend` skips `res->reset + rebuild +
+    // sched_alloc_graph` and just re-runs `set_inputs + graph_compute` on
+    // the already-built graph. The dedicated encoder scheduler is what
+    // makes this safe — without it, the decoder's `sched_reset +
+    // sched_alloc_graph` calls on the regular `sched` would clobber the
+    // encoder's compute-buffer slot assignments and the cache-hit path
+    // would crash on stale device pointers.
     //
-    // `gf_res_dflash_encode_n_new` records the `n_new` the most recently
-    // built graph was sized for. Currently used only for diagnostic logs;
-    // when the scheduler interaction is sorted the cache-hit branch in
-    // `dflash_extend` can be re-enabled.
+    // `gf_res_dflash_encode_n_new` is the `n_new` value the cached graph
+    // was built for. -1 means "not built yet"; on a `dflash_extend` call
+    // with a different `n_new`, the cache misses and the field is
+    // updated. Reset on `dflash_reset_ctx_kv()` is unnecessary — the
+    // topology only depends on `n_new` (write_offset is a runtime input
+    // via `pos_idx`), and the side-store tensor objects survive across
+    // resets, so a cached graph stays valid across prompts.
+    //
+    // Cache hit rate observed on Qwen3-4B-DFlash speculative decoding:
+    // 20-35% per generation (varies by prompt: math ~33%, code ~21%,
+    // NL ~29% on 128-token generations). The wall-clock impact is
+    // perf-neutral within run-to-run noise on Vulkan + 2x RTX 5090 —
+    // the savings per cache hit (skipping a small graph build + a
+    // ggml-alloc pass) are dominated by the GPU compute time of the
+    // encoder graph itself. The architecture is in place for future
+    // workloads where the saved overhead matters more (slower CPUs,
+    // larger draft models, etc.).
     llm_graph_result_ptr gf_res_dflash_encode;
     int64_t              gf_res_dflash_encode_n_new = -1;
 
@@ -376,6 +391,17 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // Dedicated scheduler for the DFlash encoder graph
+    // (`llm_build_dflash_encode`). Lives in parallel with `sched` so that
+    // each `dflash_extend` call's compute-buffer slot assignments survive
+    // across intervening decoder runs on `sched` — without a separate
+    // scheduler, every decoder `sched_reset + sched_alloc_graph` would
+    // clobber the encoder's allocations and the per-`n_new` cache shortcut
+    // in `dflash_extend` (which skips re-build + re-alloc on cache hit)
+    // would crash on stale device pointers. Lazy-initialised on the first
+    // dflash_extend call (only meaningful for LLM_ARCH_DFLASH contexts).
+    ggml_backend_sched_ptr sched_dflash_encode;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

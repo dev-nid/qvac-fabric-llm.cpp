@@ -71,13 +71,19 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
         // matching the canonical post-MLP+residual capture point used in
         // the qwen3 / qwen3moe / qwen3vl decoders.
         //
-        // Note: Qwen3-Next uses sliding-window attention (`hparams.is_swa`)
-        // on some layers. Our DFlash drafter currently builds a single
-        // bidirectional kq_mask without an SWA-specific variant, so the
-        // captured features are correct but the draft attention may run
-        // unmasked across positions a Qwen3-Next-DFlash draft would
-        // expect to be masked. Tracked as item #8 in
-        // logs/core_architecture/07_review_and_next_steps.md.
+        // Note (correctness caveat for Qwen3-Next as a DFlash target):
+        // Qwen3-Next is a hybrid arch — `hparams.is_recurrent(il)` layers
+        // are gated-delta-net (linear / Mamba-like), the rest are full
+        // attention. There is NO sliding-window attention in this arch
+        // (verified: the Qwen3-Next loader in `src/llama-model.cpp` and
+        // graph builder above never touch `hparams.swa_type` /
+        // `hparams.is_swa`). Captures from delta-net layers therefore
+        // carry position dynamics that differ in functional form from
+        // captures from full-attention layers. Whether a published
+        // Qwen3-Next-DFlash draft is robust to that, given our drafter's
+        // bidirectional cross-attention to the side store, is an
+        // empirical question that can only be answered with a
+        // Qwen3-Next-DFlash GGUF on disk (none available locally).
         build_dflash_capture(cur, il);
 
         // Input for next layer

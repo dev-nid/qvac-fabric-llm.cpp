@@ -982,37 +982,46 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
 
     const int64_t write_offset = dflash.ctx_filled;
 
-    // Lazy-init the encoder graph result holder.
+    // Lazy-init the encoder graph result holder + its dedicated
+    // scheduler. The dedicated scheduler is what makes per-`n_new`
+    // graph caching safe: every dflash_extend call's compute-buffer
+    // slot assignments stay valid across intervening decoder runs on
+    // the regular `sched`, because the decoder runs touch a different
+    // scheduler entirely. Without `sched_dflash_encode` the cache-hit
+    // path below would crash on stale device pointers (the decoder's
+    // `sched_reset + sched_alloc_graph` would have clobbered the
+    // encoder's slot assignments).
     if (!gf_res_dflash_encode) {
         gf_res_dflash_encode.reset(new llm_graph_result(graph_max_nodes()));
     }
+    if (!sched_dflash_encode) {
+        // Same backends + buffer types as the regular `sched`. The
+        // encoder graph never benefits from pipeline parallelism
+        // (single-shot per call, ~50 ops, no useful work to overlap),
+        // so pass `parallel=false` regardless of what the regular
+        // sched chose.
+        sched_dflash_encode.reset(ggml_backend_sched_new(
+            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+            graph_max_nodes(), /*parallel=*/ false, cparams.op_offload));
+    }
     auto * res = gf_res_dflash_encode.get();
 
-    // Encoder graph reuse (item #5 in 07_review_and_next_steps.md):
-    //   The encoder graph topology depends only on `n_new` after the
-    //   commit-18 set_rows refactor (write_offset is now a runtime input
-    //   via `pos_idx` instead of being baked into a ggml_view_3d offset).
-    //   So we *could* skip res->reset + rebuild + sched_alloc_graph
-    //   whenever `n_new` matches the cached value. In practice this
-    //   doesn't work cleanly because the scheduler is shared with the
-    //   draft-side decoder graph: each decoder run on ctx_dft (between
-    //   consecutive extends) calls sched_reset + sched_alloc_graph for
-    //   the decoder, which clobbers the encoder's compute-buffer slot
-    //   assignments. Skipping the encoder's sched_alloc on a cache hit
-    //   then crashes inside graph_compute because the cached encoder
-    //   tensors have stale device pointers.
-    //
-    //   Until the scheduler interaction is sorted out we always
-    //   rebuild + alloc. The set_rows refactor still makes the graph
-    //   topology n_new-only (so a future caching attempt that solves
-    //   the scheduler issue won't need to re-touch the builder).
-    const bool cache_hit = false; // (gf_res_dflash_encode_n_new == n_new); // see comment above
+    // Encoder graph reuse: the topology depends only on `n_new` after
+    // the set_rows refactor (write_offset is a runtime input via
+    // `pos_idx`), so consecutive extends with the same `n_new` skip
+    // res->reset + rebuild + sched_alloc_graph entirely. In practice
+    // this gives a high cache hit rate during the spec_simple loop:
+    // most blocks accept the same number of drafts, so most extends
+    // share an `n_new` value with the previous one.
+    const bool cache_hit = (gf_res_dflash_encode_n_new == n_new);
     ggml_cgraph * gf = nullptr;
 
     if (cache_hit) {
         gf = res->get_gf();
         GGML_ASSERT(gf != nullptr && ggml_graph_n_nodes(gf) > 0
                     && "encoder cache: gf must be valid when cache_hit is true");
+        LLAMA_LOG_DEBUG("%s: encoder cache hit  (n_new=%lld); reusing cached graph\n",
+                __func__, (long long) n_new);
     } else {
         res->reset();
 
@@ -1029,8 +1038,8 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
         const auto gparams = graph_params(res, ub_stub, /*mctx=*/nullptr,
                                           LLM_GRAPH_TYPE_DEFAULT);
 
-        ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(),
+        ggml_backend_sched_reset(sched_dflash_encode.get());
+        ggml_backend_sched_set_eval_callback(sched_dflash_encode.get(),
             cparams.cb_eval, cparams.cb_eval_user_data);
 
         // Build the encoder graph directly (bypasses model.build_graph
@@ -1044,12 +1053,14 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
             return -1;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        if (!ggml_backend_sched_alloc_graph(sched_dflash_encode.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate encoder graph\n", __func__);
             return -2;
         }
 
         gf_res_dflash_encode_n_new = n_new;
+        LLAMA_LOG_DEBUG("%s: encoder cache miss (n_new=%lld); rebuilt + reallocated\n",
+                __func__, (long long) n_new);
     }
 
     // ----- set inputs on the allocated graph -----
@@ -1100,8 +1111,13 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
     }
 
     // ----- compute -----
+    // Run on the dedicated `sched_dflash_encode` (NOT the regular
+    // `sched`), so the next decoder run on `sched` doesn't see any
+    // encoder state / clobber the encoder's compute-buffer slot
+    // assignments — that's what makes the cache-hit shortcut above
+    // safe across consecutive extend ↔ decoder cycles.
     {
-        const auto status = graph_compute(gf, /*batched=*/n_new > 1);
+        const auto status = graph_compute(sched_dflash_encode.get(), gf, /*batched=*/n_new > 1);
         if (status != GGML_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: encoder graph compute failed (%d)\n",
                     __func__, (int) status);
@@ -1558,16 +1574,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -2;
     };
 
-    // DFlash: pre-allocate the captured-features buffer for the full batch.
-    // Each ubatch will write into a slice based on n_outputs_prev.
+    // DFlash: pre-allocate the captured-features buffer for the full batch
+    // plus the per-layer host staging buffers used by the batched D2H
+    // path further down. Each ubatch streams its layer outputs into the
+    // corresponding `capture_staging[il]` slice; after all ubatches we
+    // sync once and transpose into `captured_features`.
     if (!dflash.capture_layer_ids.empty() && dflash.capture_n_embd > 0) {
-        const int64_t n_features = (int64_t) dflash.capture_layer_ids.size() * dflash.capture_n_embd;
-        const size_t  total      = (size_t) n_features * (size_t) n_outputs_all;
+        const int64_t n_layers_cap   = (int64_t) dflash.capture_layer_ids.size();
+        const int64_t n_features     = n_layers_cap * dflash.capture_n_embd;
+        const size_t  total          = (size_t) n_features * (size_t) n_outputs_all;
+        const size_t  per_layer_size = (size_t) dflash.capture_n_embd * (size_t) n_outputs_all;
+
         dflash.captured_features.assign(total, 0.0f);
         dflash.captured_n_outputs = n_outputs_all;
+
+        dflash.capture_staging.assign((size_t) n_layers_cap, std::vector<float>());
+        for (int64_t il = 0; il < n_layers_cap; ++il) {
+            dflash.capture_staging[(size_t) il].assign(per_layer_size, 0.0f);
+        }
     } else {
         dflash.captured_features.clear();
         dflash.captured_n_outputs = 0;
+        dflash.capture_staging.clear();
     }
 
     // DFlash drafter: pre-allocate the inline-argmax read-back buffer for
@@ -1739,55 +1767,87 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        // DFlash: copy per-layer hidden-state captures into the
-        // dflash.captured_features buffer at the n_outputs_prev offset.
-        // We expect the graph builder (e.g. qwen3.cpp) to have pushed one
-        // tensor per requested capture layer in the same order as
-        // dflash.capture_layer_ids; each tensor has shape [n_embd, n_outputs].
+        // DFlash: stream per-layer hidden-state captures into the per-layer
+        // host staging buffers. ONE async D2H per layer per ubatch (= 5 calls
+        // per ubatch on Qwen3-4B-DFlash, vs the 80 calls / ubatch the previous
+        // per-(layer,token) loop submitted). Same total bandwidth, ~16x fewer
+        // backend submissions.
+        //
+        // The on-GPU capture tensors are 2D [n_embd_target, n_outputs] (= one
+        // column per output token); a single contiguous read of
+        // n_outputs * n_embd_target floats picks up the whole layer's slice.
+        // We stash that slice at offset n_outputs_prev * n_embd_target inside
+        // the per-layer host staging buffer; after the do-while loop ends a
+        // single scheduler sync drains all pending D2Hs and a tight
+        // memcpy-per-(layer,token) loop transposes everything into the
+        // row-per-token, all-layers-side-by-side `captured_features` layout.
         if (!dflash.capture_layer_ids.empty()
                 && !res->t_dflash_captures.empty()
                 && n_outputs > 0) {
             GGML_ASSERT(res->t_dflash_captures.size() == dflash.capture_layer_ids.size()
                         && "DFlash: graph builder pushed wrong number of captures");
+            GGML_ASSERT(dflash.capture_staging.size() == dflash.capture_layer_ids.size()
+                        && "DFlash: capture_staging size mismatch (allocated above)");
             const int64_t n_embd_target = dflash.capture_n_embd;
             const int64_t n_layers_cap  = (int64_t) dflash.capture_layer_ids.size();
-            const int64_t n_features    = n_layers_cap * n_embd_target;
 
-            // For each output token i in this ubatch, the row in captured_features
-            // is captured_features[(n_outputs_prev + i) * n_features + ...].
-            // Each layer's contribution lives at offset (layer_idx * n_embd_target)
-            // within that row. To go from the per-tensor layout
-            //   t_capture[i_token * n_embd_target + i_feat]
-            // to the row-major captured_features layout, we copy column-by-column
-            // (i.e. layer-by-layer) into strided slots.
             for (int64_t li = 0; li < n_layers_cap; ++li) {
-                ggml_tensor * t_cap = res->t_dflash_captures[li];
+                ggml_tensor * t_cap = res->t_dflash_captures[(size_t) li];
                 if (t_cap == nullptr) {
                     continue;
                 }
                 ggml_backend_t bk = ggml_backend_sched_get_tensor_backend(sched.get(), t_cap);
                 GGML_ASSERT(bk != nullptr);
-
-                // Layout expected: ne[0] = n_embd_target, ne[1] = n_outputs (this ubatch).
                 GGML_ASSERT(t_cap->ne[0] == n_embd_target);
                 GGML_ASSERT(t_cap->ne[1] >= n_outputs && "DFlash capture: tensor smaller than n_outputs");
 
-                // Copy each token's contribution into the strided slot.
-                for (int64_t tok = 0; tok < n_outputs; ++tok) {
-                    const size_t src_off = (size_t) tok * n_embd_target * sizeof(float);
-                    const size_t dst_off = ((size_t)(n_outputs_prev + tok) * n_features
-                                            + (size_t) li * n_embd_target) * sizeof(float);
-                    ggml_backend_tensor_get_async(
-                        bk, t_cap,
-                        (uint8_t *) dflash.captured_features.data() + dst_off,
-                        src_off,
-                        n_embd_target * sizeof(float));
-                }
+                auto & layer_buf       = dflash.capture_staging[(size_t) li];
+                const size_t bytes     = (size_t) n_outputs * (size_t) n_embd_target * sizeof(float);
+                const size_t dst_off_b = (size_t) n_outputs_prev * (size_t) n_embd_target * sizeof(float);
+                GGML_ASSERT(dst_off_b + bytes <= layer_buf.size() * sizeof(float));
+
+                ggml_backend_tensor_get_async(
+                    bk, t_cap,
+                    (uint8_t *) layer_buf.data() + dst_off_b,
+                    /*src_off=*/ 0,
+                    /*size=*/ bytes);
             }
         }
 
         n_outputs_prev += n_outputs;
     } while (mctx->next());
+
+    // DFlash: drain the per-layer staging D2Hs queued in the loop above
+    // and host-transpose them into the row-per-token, all-layers-side-by-side
+    // `captured_features` layout the encoder graph in dflash_extend()
+    // expects. The sync forces all pending async copies to land in the
+    // staging buffers before we read them; the transpose is a tight
+    // memcpy-per-(layer, token) loop (each memcpy is `n_embd_target` floats
+    // = ~10 KB on Qwen3-4B-DFlash, fully sequential on the dst side).
+    //
+    // Net per-decode for capture: `n_layers_cap * n_ubatch` async submits
+    // + 1 sync + `n_layers_cap * n_outputs_all` host memcpys, instead of
+    // the previous `n_layers_cap * n_outputs_all` async submits with no
+    // explicit sync (relied on the caller's later synchronize()).
+    if (!dflash.capture_layer_ids.empty()
+            && !dflash.capture_staging.empty()
+            && n_outputs_all > 0) {
+        ggml_backend_sched_synchronize(sched.get());
+
+        const int64_t n_embd_target = dflash.capture_n_embd;
+        const int64_t n_layers_cap  = (int64_t) dflash.capture_layer_ids.size();
+        const int64_t n_features    = n_layers_cap * n_embd_target;
+        for (int64_t li = 0; li < n_layers_cap; ++li) {
+            const auto & layer_buf = dflash.capture_staging[(size_t) li];
+            for (int64_t i = 0; i < n_outputs_all; ++i) {
+                std::memcpy(
+                    dflash.captured_features.data() + (size_t) i * (size_t) n_features
+                                                    + (size_t) li * (size_t) n_embd_target,
+                    layer_buf.data()                + (size_t) i * (size_t) n_embd_target,
+                    (size_t) n_embd_target * sizeof(float));
+            }
+        }
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2035,6 +2095,13 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    return graph_compute(sched.get(), gf, batched);
+}
+
+ggml_status llama_context::graph_compute(
+        ggml_backend_sched_t sched_use,
+                ggml_cgraph * gf,
+                       bool   batched) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -2051,12 +2118,12 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    auto status = ggml_backend_sched_graph_compute_async(sched_use, gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched_use));
 
     return status;
 }
