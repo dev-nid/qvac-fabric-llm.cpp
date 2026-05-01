@@ -64,6 +64,22 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
         cur = ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "post_moe", il);
 
+        // DFlash: tee out this layer's hidden state if requested. No-op when
+        // the context isn't being used as a DFlash target. The capture
+        // point sits after the FFN residual (post_moe) so the captured
+        // features match the layer's externally-observable output —
+        // matching the canonical post-MLP+residual capture point used in
+        // the qwen3 / qwen3moe / qwen3vl decoders.
+        //
+        // Note: Qwen3-Next uses sliding-window attention (`hparams.is_swa`)
+        // on some layers. Our DFlash drafter currently builds a single
+        // bidirectional kq_mask without an SWA-specific variant, so the
+        // captured features are correct but the draft attention may run
+        // unmasked across positions a Qwen3-Next-DFlash draft would
+        // expect to be masked. Tracked as item #8 in
+        // logs/core_architecture/07_review_and_next_steps.md.
+        build_dflash_capture(cur, il);
+
         // Input for next layer
         inpL = cur;
     }

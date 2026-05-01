@@ -38,6 +38,11 @@ struct llama_cparams {
 
     enum llama_pooling_type pooling_type;
 
+    // Sliding-window cap on the DFlash drafter's per-layer K/V side store
+    // (ignored for non-DFlash drafts). 0 = uncapped. See the docstring on
+    // llama_context_params::dflash_max_ctx for full semantics.
+    uint32_t dflash_max_ctx;
+
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 };

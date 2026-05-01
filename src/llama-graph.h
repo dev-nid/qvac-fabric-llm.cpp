@@ -74,11 +74,15 @@ struct llama_cross {
 //
 // Two roles, one struct:
 //
-//  (a) On the *draft* context — the speculative driver writes target_hidden /
-//      n_features / n_ctx / n_block via llama_set_dflash_input() before each
-//      draft decode. The drafter graph (llm_build_dflash) reads them through
-//      build_inp_dflash() to construct K_ctx/V_ctx and the asymmetric
-//      kq_mask.
+//  (a) On the *draft* context — the speculative driver pushes per-block
+//      target hidden states into the per-layer K/V side store via
+//      llama_dflash_extend(). The drafter graph (llm_build_dflash) reads
+//      `n_ctx` (the side store's currently-filled column count) and the
+//      side store tensors `ctx_K[il]` / `ctx_V[il]` to build the
+//      bidirectional cross-attention's K and V via zero-copy views.
+//      The encoder graph (llm_build_dflash_encode) reads `n_features`
+//      (= `n_target_layer_ids * n_embd_target`) when sizing its
+//      target_hidden_new input.
 //
 //  (b) On the *target* context — the driver writes capture_layer_ids /
 //      capture_n_embd via llama_set_dflash_capture() before any decode. The
@@ -90,17 +94,15 @@ struct llama_cross {
 // single llama_dflash * forwarded through llm_graph_params lets the graph
 // builder discover whichever role applies on its own context.
 struct llama_dflash {
-    // ---------- (a) drafter input ----------
-    int64_t n_features = 0;       // per-token feature dim (n_target_layer_ids * n_embd)
-    int64_t n_ctx      = 0;       // committed-prefix tokens encoded in target_hidden
-    int64_t n_block    = 0;       // tokens in the next draft batch
-
-    // Concatenated target hidden states, laid out as
-    //   target_hidden[i_token * n_features + i_feat]
-    // Used by the LEGACY recompute-every-block path. When the K/V cache reuse
-    // path is active (ctx_K non-empty), this stays empty and the decoder
-    // graph reads K_ctx / V_ctx directly from the side store instead.
-    std::vector<float> target_hidden;
+    // ---------- (a) drafter sizing ----------
+    int64_t n_features = 0;       // per-token feature dim (n_target_layer_ids * n_embd_target)
+    int64_t n_ctx      = 0;       // K_ctx column count seen by the drafter's
+                                  // attention. Seeded from `cparams.n_ctx_seq`
+                                  // at construction (worst-case for graph
+                                  // reserve) and kept in sync with `ctx_filled`
+                                  // by `dflash_extend()` at runtime, so the
+                                  // kq_mask shape always matches the side
+                                  // store view.
 
     // ---------- (b) target capture ----------
     // Layer indices (into the target model) whose post-block hidden states
@@ -117,6 +119,17 @@ struct llama_dflash {
     std::vector<float> captured_features;
     int64_t            captured_n_outputs = 0;
 
+    // ---------- (a') drafter inline argmax read-back ----------
+    // After each decode on a draft context whose graph emitted
+    // `res->t_logits_argmax` (i.e. LLM_ARCH_DFLASH; see
+    // `src/models/dflash.cpp::llm_build_dflash`), this holds the I32
+    // greedy top-1 token id per output position. Sized to `n_outputs_all`
+    // by the post-decode loop in llama_context::decode(). When
+    // `t_logits_argmax` was nullptr (e.g. on the target context), this
+    // stays empty and `draft_argmax_n_outputs` stays 0.
+    std::vector<int32_t> draft_argmax;
+    int64_t              draft_argmax_n_outputs = 0;
+
     // ---------- (c) per-layer K/V side store (paper §4.1 reuse) ----------
     // Persistent per-layer K_ctx and V_ctx tensors, allocated as backend
     // tensors at draft-context creation time and surviving across
@@ -126,10 +139,7 @@ struct llama_dflash {
     // The encoder graph (llm_build_dflash_encode) computes K/V for newly
     // committed target features and writes them at offset `ctx_filled`,
     // bumping `ctx_filled` by `n_new` per call. The decoder graph
-    // (llm_build_dflash) reads `ctx_filled` columns via ggml_view_*().
-    //
-    // When `ctx_K` is empty, the implementation falls back to the
-    // recompute-every-block path that consumes `target_hidden` above.
+    // (llm_build_dflash) reads `n_ctx` columns via ggml_view_*().
     std::vector<ggml_tensor *> ctx_K;
     std::vector<ggml_tensor *> ctx_V;
     int64_t ctx_filled   = 0;
@@ -318,25 +328,24 @@ public:
 };
 
 // DFlash drafter context input.
-// Stages target_hidden (committed-prefix features) into a backend tensor and
-// builds the per-block context positions + non-causal kq_mask for the
-// drafter's cross-attention. Owned by the graph; reads from the
-// llama_dflash struct on the context.
+// Builds the non-causal kq_mask for the drafter's cross-attention over
+// the [side-store K/V | proposal] segments. Owned by the graph; reads
+// committed-prefix sizing (`dflash->n_ctx`) from the llama_dflash struct
+// on the context. The K_ctx / V_ctx tensors themselves are zero-copy
+// views of the per-layer side store and are built directly in
+// llm_build_dflash, not staged through this input class.
 class llm_graph_input_dflash : public llm_graph_input_i {
 public:
-    llm_graph_input_dflash(const llama_dflash * dflash, int64_t n_features, int64_t n_ctx, int64_t n_block)
-        : dflash(dflash), n_features(n_features), n_ctx(n_ctx), n_block(n_block) {}
+    llm_graph_input_dflash(const llama_dflash * dflash, int64_t n_ctx, int64_t n_block)
+        : dflash(dflash), n_ctx(n_ctx), n_block(n_block) {}
     virtual ~llm_graph_input_dflash() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * target_hidden = nullptr; // F32 [n_features, n_ctx]
-    ggml_tensor * pos_ctx       = nullptr; // I32 [n_ctx]
-    ggml_tensor * kq_mask       = nullptr; // F32 [n_ctx + n_block, n_block, 1, 1]
-    ggml_tensor * kq_mask_cnv   = nullptr; // f16 cast for flash_attn
+    ggml_tensor * kq_mask     = nullptr; // F32 [n_ctx + n_block, n_block_pad, 1, 1]
+    ggml_tensor * kq_mask_cnv = nullptr; // f16 cast for flash_attn
 
     const llama_dflash * dflash;
-    int64_t              n_features;
     int64_t              n_ctx;
     int64_t              n_block;
 };
@@ -509,7 +518,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_dflash           * dflash; // DFlash drafter context (target_hidden + sizes)
+    const llama_dflash           * dflash; // DFlash drafter state (capture, K/V side store)
 
     uint32_t n_outputs;
 
@@ -599,6 +608,16 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+
+    // DFlash drafter: in-graph argmax of the per-position lm_head logits.
+    // Shape: I32 [n_outputs] (one int32 per draft position == greedy
+    // top-1 token id). When this is non-null, llm_build_dflash sets
+    // t_logits = nullptr — the float-logits read-back is intentionally
+    // skipped to eliminate the bs * n_vocab * 4 byte PCIe transfer per
+    // block. llama_context::decode() copies the int32s into the
+    // dflash.draft_argmax host buffer; the speculative-decoding driver
+    // reads them back via llama_get_dflash_draft_argmax().
+    ggml_tensor * t_logits_argmax = nullptr;
 
     // DFlash target hidden-state captures, one per entry in
     // dflash->capture_layer_ids (parallel order). Each tensor has shape
@@ -793,9 +812,11 @@ struct llm_graph_context {
     ggml_tensor * build_pos_bias(ggml_tensor * pos_bucket, ggml_tensor * attn_rel_b) const;
 
     // DFlash drafter cross-context input.
-    // Returns a struct of three tensors: target_hidden, pos_ctx, kq_mask.
-    // The graph builder is responsible for the math; this function just stages
-    // the inputs and registers them with the graph result.
+    // Returns the kq_mask input for the drafter's bidirectional
+    // cross-attention. K_ctx / V_ctx themselves are zero-copy views of
+    // the per-layer side store (`dflash->ctx_K[il]` / `dflash->ctx_V[il]`)
+    // and are built directly in llm_build_dflash; this function only
+    // stages the kq_mask and registers it with the graph result.
     llm_graph_input_dflash * build_inp_dflash() const;
 
     // DFlash target hidden-state capture.

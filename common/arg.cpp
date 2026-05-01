@@ -2869,6 +2869,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DRAFT_MAX"));
     add_opt(common_arg(
+        {"--draft-type"}, "TYPE",
+        "speculative decoding algorithm to use with the draft model: "
+        "'auto' (default; picks DFLASH if the draft GGUF has dflash.* metadata, else DRAFT), "
+        "'draft' (small vocab-compatible draft model, sampled token-by-token), "
+        "'dflash' (DFlash block-parallel speculative decoding)",
+        [](common_params & params, const std::string & value) {
+            if      (value == "auto"  ) { params.speculative.type = COMMON_SPECULATIVE_TYPE_AUTO;   }
+            else if (value == "draft" ) { params.speculative.type = COMMON_SPECULATIVE_TYPE_DRAFT;  }
+            else if (value == "dflash") { params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH; }
+            else {
+                throw std::invalid_argument(
+                    string_format("invalid --draft-type value '%s' (allowed: auto, draft, dflash)", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DRAFT_TYPE"));
+    add_opt(common_arg(
+        {"--dflash-max-ctx"}, "N",
+        string_format(
+            "DFlash drafter: sliding-window cap on the per-layer K/V side store (default: %d). "
+            "0 = uncapped (use the full --ctx-size-draft / n_ctx_seq for the draft). "
+            "Caps the worst-case draft VRAM (e.g. ~80 MiB at the default 4096 vs ~800 MiB at "
+            "uncapped n_ctx_seq=40960 on Qwen3-4B-DFlash-b16). For generations longer than the "
+            "cap, the oldest captures roll out via in-place left-shift inside dflash_extend(); "
+            "the target's bit-exact greedy output is unaffected.",
+            params.speculative.dflash_max_ctx),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument(
+                    string_format("invalid --dflash-max-ctx value %d (must be >= 0)", value));
+            }
+            params.speculative.dflash_max_ctx = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_MAX_CTX"));
+    add_opt(common_arg(
         {"--draft-min", "--draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.n_min),
         [](common_params & params, int value) {

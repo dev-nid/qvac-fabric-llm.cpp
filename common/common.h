@@ -224,15 +224,34 @@ struct common_params_model {
     std::string name        = ""; // in format <user>/<model>[:<tag>] (tag is optional)     // NOLINT
 };
 
+// Speculative-decoding algorithm picker.
+//
+// AUTO   = pick at runtime based on the loaded draft model: if the draft
+//          GGUF carries DFlash metadata (i.e. llama_model_dflash_block_size > 0)
+//          use DFLASH, otherwise use DRAFT.
+// DRAFT  = a small, vocab-compatible draft model is sampled token-by-token
+//          (the original llama.cpp speculative path).
+// DFLASH = block-parallel speculative decoding via the DFlash drafter
+//          (paper: "DFlash: block-diffusion speculative decoding").
+enum common_speculative_type {
+    COMMON_SPECULATIVE_TYPE_AUTO,
+    COMMON_SPECULATIVE_TYPE_DRAFT,
+    COMMON_SPECULATIVE_TYPE_DFLASH,
+};
+
 struct common_params_speculative {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
-    int32_t n_ctx        =     0; // draft context size
-    int32_t n_max        =    16; // maximum number of tokens to draft during speculative decoding
-    int32_t n_min        =     0; // minimum number of draft tokens to use for speculative decoding
-    int32_t n_gpu_layers =    -1; // number of layers to store in VRAM for the draft model (-1 - use default)
-    float   p_split      =  0.1f; // speculative decoding split probability
-    float   p_min        = 0.75f; // minimum speculative decoding probability (greedy)
+    enum common_speculative_type type = COMMON_SPECULATIVE_TYPE_AUTO; // see common_speculative_type docstring
+
+    int32_t n_ctx          =     0; // draft context size
+    int32_t n_max          =    16; // maximum number of tokens to draft during speculative decoding
+    int32_t n_min          =     0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_gpu_layers   =    -1; // number of layers to store in VRAM for the draft model (-1 - use default)
+    int32_t dflash_max_ctx =  4096; // sliding-window cap on the DFlash draft K/V side store (0 = uncapped).
+                                    // see llama_context_params::dflash_max_ctx for full semantics.
+    float   p_split        =  0.1f; // speculative decoding split probability
+    float   p_min          = 0.75f; // minimum speculative decoding probability (greedy)
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
@@ -423,6 +442,10 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+
+    int32_t dflash_max_ctx = 4096; // sliding-window cap on the DFlash drafter K/V side store
+                                   // (forwarded to llama_context_params::dflash_max_ctx; ignored
+                                   // for non-DFlash drafts). 0 = uncapped (uses n_ctx_seq).
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

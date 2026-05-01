@@ -129,8 +129,9 @@ llama_context::llama_context(
         }
     }
 
-    cparams.op_offload = params.op_offload;
-    cparams.kv_unified = params.kv_unified;
+    cparams.op_offload     = params.op_offload;
+    cparams.kv_unified     = params.kv_unified;
+    cparams.dflash_max_ctx = params.dflash_max_ctx;
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -330,24 +331,27 @@ llama_context::llama_context(
         cross.v_embd.clear();
 
         // Seed worst-case shapes for the DFlash drafter graph BEFORE
-        // graph_reserve runs. The driver overwrites these via
-        // llama_set_dflash_input() before each decode; the values here only
-        // matter for sizing compute buffers during the reserve pass.
+        // graph_reserve runs. The driver / dflash_extend() overwrites
+        // n_ctx at runtime; the value here only sizes the worst-case
+        // compute buffer during the reserve pass.
         if (model.arch == LLM_ARCH_DFLASH) {
             GGML_ASSERT(model.dflash_fc != nullptr
                 && "DFlash draft model has no dflash_fc tensor — invalid GGUF.");
-            // n_features: dimensionality of `target_hidden` columns. Equals
+            // n_features: per-token feature dim consumed by the encoder
+            //   graph's `target_hidden_new` input. Equals
             //   num_captured_target_layers * target.n_embd, which is exactly
             //   the input dim of the fc projection on the draft side.
             dflash.n_features = model.dflash_fc->ne[0];
-            // n_block: every drafter forward pass decodes exactly block_size
-            //   tokens. The ubatch was clamped above, so n_tokens == block_size.
-            dflash.n_block    = std::max<int64_t>(1, hparams.dflash_block_size);
-            // n_ctx: worst case is "all of n_ctx_seq is committed prefix".
-            //   Subsequent decodes will pass a smaller value and the graph
-            //   builder will scale down accordingly (set_input clamps to
-            //   the dynamic value).
-            dflash.n_ctx      = (int64_t) cparams.n_ctx_seq;
+            // n_ctx: worst case = ctx_capacity (the side store's allocated
+            //   width, set just below). The kq_mask + side-store K/V views
+            //   are reserved at this width; dflash_extend() updates n_ctx
+            //   to ctx_filled per accepted block (always <= ctx_capacity,
+            //   so the rebuilt decoder graph fits inside the worst-case
+            //   compute buffer).
+            const int64_t ctx_capacity_seed = (cparams.dflash_max_ctx > 0)
+                ? std::min<int64_t>((int64_t) cparams.n_ctx_seq, (int64_t) cparams.dflash_max_ctx)
+                : (int64_t) cparams.n_ctx_seq;
+            dflash.n_ctx      = ctx_capacity_seed;
 
             // ---------- DFlash K/V side store (paper §4.1 reuse) ----------
             // Per-layer K_ctx / V_ctx tensors that survive across decode
@@ -365,7 +369,17 @@ llama_context::llama_context(
                 const int64_t  n_embd_v_gqa   = hparams.n_embd_v_gqa();
                 const ggml_type type_k        = params.type_k;
                 const ggml_type type_v        = params.type_v;
-                const int64_t  ctx_capacity   = (int64_t) cparams.n_ctx_seq;
+                // Sliding-window cap on the side store. With the default
+                // dflash_max_ctx=4096 and a Qwen3-4B-DFlash-b16 draft on
+                // n_ctx_seq=40960 this drops the side store from ~800 MiB
+                // to ~80 MiB across both GPUs without measurable acceptance
+                // loss for prompts that generate <= 4096 tokens (the slide
+                // never engages); for longer generations the oldest
+                // captures roll out via dflash_extend()'s sliding logic and
+                // ctx_pos_base advances accordingly.
+                const int64_t  ctx_capacity   = (cparams.dflash_max_ctx > 0)
+                    ? std::min<int64_t>((int64_t) cparams.n_ctx_seq, (int64_t) cparams.dflash_max_ctx)
+                    : (int64_t) cparams.n_ctx_seq;
 
                 struct ggml_backend_buft_comparator {
                     bool operator()(const ggml_backend_buffer_type_t & lhs,
@@ -793,21 +807,6 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
-void llama_context::set_dflash_input(const float * target_hidden,
-                                     int64_t       n_features,
-                                     int64_t       n_ctx,
-                                     int64_t       n_block) {
-    dflash.n_features = n_features;
-    dflash.n_ctx      = n_ctx;
-    dflash.n_block    = n_block;
-
-    const size_t n_floats = (size_t) std::max<int64_t>(n_features, 0) * (size_t) std::max<int64_t>(n_ctx, 0);
-    dflash.target_hidden.assign(n_floats, 0.0f);
-    if (target_hidden != nullptr && n_floats > 0) {
-        std::memcpy(dflash.target_hidden.data(), target_hidden, n_floats * sizeof(float));
-    }
-}
-
 void llama_context::set_dflash_capture(const int32_t * layer_ids,
                                        size_t          n_layer_ids,
                                        int64_t         n_embd_target) {
@@ -842,6 +841,16 @@ const float * llama_context::get_dflash_captured_features(int64_t * n_outputs_ou
     return dflash.captured_features.data();
 }
 
+const int32_t * llama_context::get_dflash_draft_argmax(int64_t * n_outputs_out) const {
+    if (n_outputs_out) {
+        *n_outputs_out = dflash.draft_argmax_n_outputs;
+    }
+    if (dflash.draft_argmax.empty()) {
+        return nullptr;
+    }
+    return dflash.draft_argmax.data();
+}
+
 const llama_dflash * llama_context::get_dflash() const {
     return &dflash;
 }
@@ -854,6 +863,65 @@ void llama_context::dflash_reset_ctx_kv() {
     if (gf_res_prev) {
         gf_res_prev->reset();
     }
+}
+
+bool llama_context::dflash_slide_left(int64_t n_drop) {
+    // Caller invariant: 0 < n_drop <= dflash.ctx_filled.
+    GGML_ASSERT(n_drop > 0);
+    GGML_ASSERT(n_drop <= dflash.ctx_filled);
+
+    const int64_t n_keep = dflash.ctx_filled - n_drop;
+
+    // n_keep == 0 is the "full reset" case: nothing to copy, just bump
+    // counters. Falls through to the same advance below.
+    if (n_keep > 0) {
+        // For each per-layer K and V tensor, shift columns
+        // [n_drop .. ctx_filled-1] down to columns [0 .. n_keep-1].
+        //
+        // We can't use ggml_backend_tensor_copy with overlapping src and
+        // dst on the same buffer (Vulkan kernels make no inter-workgroup
+        // ordering guarantee, so a left-shift across multiple workgroups
+        // can race), so we round-trip through a host scratch buffer
+        // sized for one layer's K (or V — they have the same shape on
+        // every DFlash arch we support; we pick the larger as a
+        // belt-and-braces).
+        //
+        // Cost: (n_layer * 2) D2H + H2D copies of `n_keep * n_embd_*_gqa`
+        // elements each. For Qwen3-4B-DFlash-b16 with the 4096 default
+        // cap and a slide of (block_size+1) = 17 columns at a time, that
+        // is ~32 layers × 2 × (4079 * 1024 * 2 bytes f16) ≈ 510 MiB
+        // round-trip per slide. Slides only engage once per ctx_capacity
+        // tokens generated, so the amortised cost per generated token is
+        // a few microseconds.
+        std::vector<uint8_t> scratch;
+
+        for (size_t il = 0; il < dflash.ctx_K.size(); ++il) {
+            ggml_tensor * K = dflash.ctx_K[il];
+            ggml_tensor * V = dflash.ctx_V[il];
+            GGML_ASSERT(K != nullptr && V != nullptr);
+
+            // K / V are 2D [n_embd_*_gqa, ctx_capacity]. nb[1] is the
+            // byte stride between consecutive columns; n_keep contiguous
+            // columns starting at column n_drop occupy `n_keep * nb[1]`
+            // bytes.
+            const size_t bytes_K = (size_t) n_keep * K->nb[1];
+            const size_t bytes_V = (size_t) n_keep * V->nb[1];
+            const size_t off_K   = (size_t) n_drop * K->nb[1];
+            const size_t off_V   = (size_t) n_drop * V->nb[1];
+
+            if (scratch.size() < bytes_K) scratch.resize(bytes_K);
+            ggml_backend_tensor_get(K, scratch.data(), off_K, bytes_K);
+            ggml_backend_tensor_set(K, scratch.data(), 0,    bytes_K);
+
+            if (scratch.size() < bytes_V) scratch.resize(bytes_V);
+            ggml_backend_tensor_get(V, scratch.data(), off_V, bytes_V);
+            ggml_backend_tensor_set(V, scratch.data(), 0,    bytes_V);
+        }
+    }
+
+    dflash.ctx_filled    = n_keep;
+    dflash.ctx_pos_base += n_drop;
+    return true;
 }
 
 int32_t llama_context::dflash_extend(const float * target_hidden_new,
@@ -876,11 +944,36 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
                 "constructed with LLM_ARCH_DFLASH?)\n", __func__);
         return -1;
     }
-    if (dflash.ctx_filled + n_new > dflash.ctx_capacity) {
-        LLAMA_LOG_ERROR("%s: side store overflow: filled=%lld + new=%lld > capacity=%lld\n",
-                __func__, (long long) dflash.ctx_filled,
-                (long long) n_new, (long long) dflash.ctx_capacity);
+    if (n_new > dflash.ctx_capacity) {
+        // n_new alone exceeds the side store's allocated width. Should not
+        // happen in normal speculative-decoding flow (n_new <= block_size+1
+        // for the gen_draft loop, and prompts > capacity get split into
+        // capacity-sized extends by target_prefill in the future — see
+        // 07_*.md item #2 follow-up). Reject explicitly so a misuse turns
+        // into a clear error rather than silently dropping all old captures.
+        LLAMA_LOG_ERROR("%s: n_new=%lld exceeds side store capacity=%lld; "
+                "consider raising --dflash-max-ctx or splitting the call into "
+                "<= capacity-sized chunks\n",
+                __func__, (long long) n_new, (long long) dflash.ctx_capacity);
         return -1;
+    }
+    if (dflash.ctx_filled + n_new > dflash.ctx_capacity) {
+        // Sliding-window cap engaged: drop the oldest captures so the
+        // n_new newcomers fit. This mirrors buun fork's GGML_DFLASH_MAX_CTX
+        // behaviour. The decoder graph reads K_ctx / V_ctx via zero-copy
+        // views of the same per-layer tensors, so the slide is transparent
+        // to the next gen_draft (the cached graph gets invalidated below
+        // when ctx_filled changes anyway).
+        const int64_t n_drop = dflash.ctx_filled + n_new - dflash.ctx_capacity;
+        if (!dflash_slide_left(n_drop)) {
+            return -1;
+        }
+        LLAMA_LOG_DEBUG("%s: slid side store left by %lld columns "
+                "(ctx_filled=%lld, ctx_pos_base=%lld, ctx_capacity=%lld)\n",
+                __func__, (long long) n_drop,
+                (long long) dflash.ctx_filled,
+                (long long) dflash.ctx_pos_base,
+                (long long) dflash.ctx_capacity);
     }
     if (dflash.n_features <= 0) {
         LLAMA_LOG_ERROR("%s: dflash.n_features not initialised\n", __func__);
@@ -894,30 +987,57 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
         gf_res_dflash_encode.reset(new llm_graph_result(graph_max_nodes()));
     }
     auto * res = gf_res_dflash_encode.get();
-    res->reset();
 
-    // The encoder graph's `n_tokens` is read from ubatch.n_tokens. Build a
-    // stub ubatch big enough to satisfy that field; the encoder doesn't
-    // touch any per-token batch metadata beyond the count.
-    llama_ubatch ub_stub = {};
-    ub_stub.n_tokens     = (uint32_t) n_new;
-    ub_stub.n_seq_tokens = (uint32_t) n_new;
-    ub_stub.n_seqs       = 1;
-    ub_stub.n_seqs_unq   = 1;
+    // Encoder graph reuse (item #5 in 07_review_and_next_steps.md):
+    //   The encoder graph topology depends only on `n_new` after the
+    //   commit-18 set_rows refactor (write_offset is now a runtime input
+    //   via `pos_idx` instead of being baked into a ggml_view_3d offset).
+    //   So we *could* skip res->reset + rebuild + sched_alloc_graph
+    //   whenever `n_new` matches the cached value. In practice this
+    //   doesn't work cleanly because the scheduler is shared with the
+    //   draft-side decoder graph: each decoder run on ctx_dft (between
+    //   consecutive extends) calls sched_reset + sched_alloc_graph for
+    //   the decoder, which clobbers the encoder's compute-buffer slot
+    //   assignments. Skipping the encoder's sched_alloc on a cache hit
+    //   then crashes inside graph_compute because the cached encoder
+    //   tensors have stale device pointers.
+    //
+    //   Until the scheduler interaction is sorted out we always
+    //   rebuild + alloc. The set_rows refactor still makes the graph
+    //   topology n_new-only (so a future caching attempt that solves
+    //   the scheduler issue won't need to re-touch the builder).
+    const bool cache_hit = false; // (gf_res_dflash_encode_n_new == n_new); // see comment above
+    ggml_cgraph * gf = nullptr;
 
-    const auto gparams = graph_params(res, ub_stub, /*mctx=*/nullptr,
-                                      LLM_GRAPH_TYPE_DEFAULT);
+    if (cache_hit) {
+        gf = res->get_gf();
+        GGML_ASSERT(gf != nullptr && ggml_graph_n_nodes(gf) > 0
+                    && "encoder cache: gf must be valid when cache_hit is true");
+    } else {
+        res->reset();
 
-    // Build the encoder graph directly (bypasses model.build_graph dispatch
-    // — the encoder is a sibling of the decoder, not a regular per-arch
-    // build path).
-    {
+        // The encoder graph's `n_tokens` is read from ubatch.n_tokens.
+        // Build a stub ubatch big enough to satisfy that field; the
+        // encoder doesn't touch any per-token batch metadata beyond
+        // the count.
+        llama_ubatch ub_stub = {};
+        ub_stub.n_tokens     = (uint32_t) n_new;
+        ub_stub.n_seq_tokens = (uint32_t) n_new;
+        ub_stub.n_seqs       = 1;
+        ub_stub.n_seqs_unq   = 1;
+
+        const auto gparams = graph_params(res, ub_stub, /*mctx=*/nullptr,
+                                          LLM_GRAPH_TYPE_DEFAULT);
+
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(),
             cparams.cb_eval, cparams.cb_eval_user_data);
 
-        llm_build_dflash_encode encode(model, gparams, write_offset);
-        ggml_cgraph * gf = res->get_gf();
+        // Build the encoder graph directly (bypasses model.build_graph
+        // dispatch — the encoder is a sibling of the decoder, not a
+        // regular per-arch build path).
+        llm_build_dflash_encode encode(model, gparams);
+        gf = res->get_gf();
 
         if (!gf || ggml_graph_n_nodes(gf) == 0) {
             LLAMA_LOG_ERROR("%s: encoder graph build produced no nodes\n", __func__);
@@ -929,34 +1049,58 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
             return -2;
         }
 
-        // ----- set inputs on the allocated graph -----
-        // The encoder builder created two input tensors with stable names
-        // in the graph's compute context. We retrieve them by name (they
-        // are leaves, not graph nodes, so iterating ggml_graph_node()
-        // would not find them).
-        ggml_tensor * t_target_hidden_new =
-            ggml_get_tensor(res->get_ctx(), "dflash_enc_target_hidden_new");
-        ggml_tensor * t_pos_new =
-            ggml_get_tensor(res->get_ctx(), "dflash_enc_pos_new");
-        GGML_ASSERT(t_target_hidden_new != nullptr && "encoder: target_hidden_new tensor not found");
-        GGML_ASSERT(t_pos_new           != nullptr && "encoder: pos_new tensor not found");
+        gf_res_dflash_encode_n_new = n_new;
+    }
 
-        // Copy the user-provided F32 target_hidden block into the input tensor.
-        // Layout: row-major [n_new, n_features]; tensor is [n_features, n_new]
-        // with n_features as ne[0] (= contiguous within a token row).
+    // ----- set inputs on the allocated graph -----
+    // The encoder builder created three input tensors with stable names in
+    // the graph's compute context. We retrieve them by name (they are
+    // leaves, not graph nodes, so iterating ggml_graph_node() would not
+    // find them).
+    ggml_tensor * t_target_hidden_new =
+        ggml_get_tensor(res->get_ctx(), "dflash_enc_target_hidden_new");
+    ggml_tensor * t_pos_new =
+        ggml_get_tensor(res->get_ctx(), "dflash_enc_pos_new");
+    ggml_tensor * t_pos_idx =
+        ggml_get_tensor(res->get_ctx(), "dflash_enc_pos_idx");
+    GGML_ASSERT(t_target_hidden_new != nullptr && "encoder: target_hidden_new tensor not found");
+    GGML_ASSERT(t_pos_new           != nullptr && "encoder: pos_new tensor not found");
+    GGML_ASSERT(t_pos_idx           != nullptr && "encoder: pos_idx tensor not found");
+
+    // target_hidden_new : F32 [n_features, n_new], row-major user buffer.
+    {
         const size_t bytes = (size_t) n_new * (size_t) dflash.n_features * sizeof(float);
         GGML_ASSERT((size_t) ggml_nbytes(t_target_hidden_new) >= bytes);
         ggml_backend_tensor_set(t_target_hidden_new, target_hidden_new, 0, bytes);
+    }
 
-        // Fill positions [pos_start..pos_start+n_new-1].
+    // pos_new : I32 [n_new] = absolute sequence positions for K's RoPE.
+    {
         std::vector<int32_t> pos_buf((size_t) n_new);
         for (int64_t i = 0; i < n_new; ++i) {
             pos_buf[(size_t) i] = (int32_t) (pos_start + i);
         }
         ggml_backend_tensor_set(t_pos_new, pos_buf.data(),
                                 0, n_new * sizeof(int32_t));
+    }
 
-        // ----- compute -----
+    // pos_idx : I64 [n_new] = side-store column indices to write to. Each
+    // ggml_set_rows in the encoder writes K_new[:, i] / V_new[:, i] to
+    // dst_K[:, pos_idx[i]] / dst_V[:, pos_idx[i]]. With sliding-window
+    // capping, write_offset can be anywhere in [0, ctx_capacity - n_new];
+    // the caller has already adjusted via dflash_slide_left() above so
+    // that write_offset + n_new <= ctx_capacity holds.
+    {
+        std::vector<int64_t> idx_buf((size_t) n_new);
+        for (int64_t i = 0; i < n_new; ++i) {
+            idx_buf[(size_t) i] = write_offset + i;
+        }
+        ggml_backend_tensor_set(t_pos_idx, idx_buf.data(),
+                                0, n_new * sizeof(int64_t));
+    }
+
+    // ----- compute -----
+    {
         const auto status = graph_compute(gf, /*batched=*/n_new > 1);
         if (status != GGML_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: encoder graph compute failed (%d)\n",
@@ -969,11 +1113,11 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
     dflash.ctx_filled += n_new;
 
     // Keep dflash.n_ctx in sync with ctx_filled — build_inp_dflash() sizes
-    // the kq_mask and pos_ctx tensors from dflash->n_ctx, and the decoder
-    // graph (with use_kv_reuse=true) views K_ctx / V_ctx with that width.
-    // Both the host-buffer legacy path and the side-store path use the
-    // same field; we update it here so subsequent decodes see the new
-    // value without a second API call.
+    // the kq_mask from dflash->n_ctx, and the decoder graph views K_ctx /
+    // V_ctx with that width. dflash.n_ctx was seeded to ctx_capacity at
+    // construction (worst-case for graph_reserve); switching it to
+    // ctx_filled here means the runtime decoder graph reads only the
+    // committed columns instead of the full capacity.
     dflash.n_ctx = dflash.ctx_filled;
 
     // The decoder graph reads `ctx_filled` columns from the side store via
@@ -1426,6 +1570,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
         dflash.captured_n_outputs = 0;
     }
 
+    // DFlash drafter: pre-allocate the inline-argmax read-back buffer for
+    // the full batch. The post-decode loop (further down) populates this
+    // when the graph emitted `res->t_logits_argmax` — i.e. on a draft
+    // context built from an LLM_ARCH_DFLASH model. Always reset to 0 here
+    // so a target-side decode doesn't see stale data from a previous
+    // draft-side decode (and vice versa).
+    if (model.arch == LLM_ARCH_DFLASH) {
+        dflash.draft_argmax.assign((size_t) n_outputs_all, 0);
+        dflash.draft_argmax_n_outputs = n_outputs_all;
+    } else {
+        dflash.draft_argmax.clear();
+        dflash.draft_argmax_n_outputs = 0;
+    }
+
     int64_t n_outputs_prev = 0;
 
     do {
@@ -1505,6 +1663,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits_size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+            }
+        }
+
+        // DFlash drafter: extract the in-graph argmax. The decoder graph
+        // (llm_build_dflash) emits `t_logits_argmax = ggml_argmax(lm_head)`
+        // and intentionally sets `t_logits = nullptr` so the float
+        // read-back above is skipped — for Qwen3 vocab=151,936 and
+        // bs=16 that saves ~9.7 MiB of PCIe traffic per draft step,
+        // replacing it with this ~64-byte int32 read-back.
+        if (auto * t_argmax = res->t_logits_argmax) {
+            if (n_outputs > 0) {
+                ggml_backend_t backend_argmax = ggml_backend_sched_get_tensor_backend(sched.get(), t_argmax);
+                GGML_ASSERT(backend_argmax != nullptr);
+                GGML_ASSERT(t_argmax->type == GGML_TYPE_I32);
+                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                GGML_ASSERT((size_t)(n_outputs_prev + n_outputs) <= dflash.draft_argmax.size());
+                int32_t * argmax_out = dflash.draft_argmax.data() + n_outputs_prev;
+                ggml_backend_tensor_get_async(backend_argmax, t_argmax, argmax_out, 0, n_outputs * sizeof(int32_t));
             }
         }
 
@@ -2883,6 +3059,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.training                    =*/ false,
+        /*.dflash_max_ctx              =*/ 4096,
     };
 
     return result;
@@ -3063,14 +3240,6 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->get_embeddings_seq(seq_id);
 }
 
-void llama_set_dflash_input(llama_context * ctx,
-                            const float *   target_hidden,
-                            int64_t         n_features,
-                            int64_t         n_ctx,
-                            int64_t         n_block) {
-    ctx->set_dflash_input(target_hidden, n_features, n_ctx, n_block);
-}
-
 void llama_set_dflash_capture(llama_context * ctx,
                               const int32_t * layer_ids,
                               size_t          n_layer_ids,
@@ -3081,6 +3250,11 @@ void llama_set_dflash_capture(llama_context * ctx,
 const float * llama_get_dflash_captured_features(llama_context * ctx, int64_t * n_outputs_out) {
     ctx->synchronize();
     return ctx->get_dflash_captured_features(n_outputs_out);
+}
+
+const int32_t * llama_get_dflash_draft_argmax(llama_context * ctx, int64_t * n_outputs_out) {
+    ctx->synchronize();
+    return ctx->get_dflash_draft_argmax(n_outputs_out);
 }
 
 int32_t llama_dflash_extend(llama_context * ctx,

@@ -67,25 +67,12 @@ struct llama_context {
     float * get_embeddings_seq(llama_seq_id seq_id);
 
     // -----------------------------------------------------------------------
-    // DFlash: drafter cross-context input
+    // DFlash: capture target hidden states for the drafter
     // -----------------------------------------------------------------------
-    // Stage the projected target hidden states + sizes that the DFlash
-    // drafter graph will consume in build_inp_dflash(). The driver calls
-    // this on the *draft* context before each llama_decode().
-    //
-    //   target_hidden : flat float buffer, layout
-    //                   target_hidden[i_token * n_features + i_feat]
-    //   n_features    : per-token feature dim (n_target_layer_ids * n_embd)
-    //   n_ctx         : number of committed-prefix tokens encoded in the buffer
-    //   n_block       : number of noise tokens in the next decode (incl. id_last)
-    //
-    // The buffer is copied; the caller may free target_hidden after the call.
-    void set_dflash_input(const float * target_hidden,
-                          int64_t       n_features,
-                          int64_t       n_ctx,
-                          int64_t       n_block);
-
-    // Capture-side: tee out target hidden states from the listed layer ids.
+    // Tee out target hidden states from the listed layer ids on every
+    // llama_decode(). The capture is read by the speculative-decoding
+    // driver via get_dflash_captured_features() and then pushed through
+    // the encoder graph (dflash_extend) into the draft's K/V side store.
     void set_dflash_capture(const int32_t * layer_ids,
                             size_t          n_layer_ids,
                             int64_t         n_embd_target);
@@ -93,6 +80,17 @@ struct llama_context {
     // After decode, returns the captured features and (via out param) the
     // number of token positions covered. Returns nullptr if capture inactive.
     const float * get_dflash_captured_features(int64_t * n_outputs_out) const;
+
+    // After decode on a draft context (LLM_ARCH_DFLASH), returns the
+    // greedy top-1 token id per output position from the in-graph argmax
+    // (= ggml_argmax of lm_head, emitted by llm_build_dflash). Saves the
+    // per-decode `bs * n_vocab * 4` byte float-logits PCIe transfer
+    // (~9.7 MiB per block on Qwen3 vocab=151,936) in favour of a
+    // ~`bs * 4` byte int32 read-back (~64 bytes per block). Returns
+    // nullptr on a non-DFlash context. *n_outputs_out is filled with the
+    // number of positions covered (= n_outputs_all of the most recent
+    // decode).
+    const int32_t * get_dflash_draft_argmax(int64_t * n_outputs_out) const;
 
     // Read access for the graph builders (passed via llm_graph_params.dflash).
     const llama_dflash * get_dflash() const;
@@ -115,6 +113,13 @@ struct llama_context {
 
     // Reset the K/V side store to empty (e.g. on a new prompt).
     void dflash_reset_ctx_kv();
+
+    // Internal: drop the oldest `n_drop` columns of the per-layer K/V side
+    // store, shifting the surviving columns left to offset 0. Bumps
+    // `dflash.ctx_pos_base` by n_drop and decrements `dflash.ctx_filled`
+    // by n_drop. Used by dflash_extend() when a new write would exceed
+    // dflash.ctx_capacity. Returns true on success.
+    bool dflash_slide_left(int64_t n_drop);
 
     void attach_threadpool(
             ggml_threadpool_t threadpool,
@@ -319,9 +324,11 @@ private:
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
 
-    // DFlash drafter cross-context input.
-    // Populated by set_dflash_input(); consumed by llm_graph_input_dflash via
-    // the llama_dflash * forwarded through llm_graph_params.
+    // DFlash drafter cross-context state.
+    // Populated by set_dflash_capture() (capture install) and
+    // dflash_extend() (per-layer K/V side store population). Consumed
+    // by llm_graph_input_dflash via the llama_dflash * forwarded
+    // through llm_graph_params.
     llama_dflash dflash;
 
     // ggml contexts + backend buffers backing the DFlash K/V side store.
@@ -332,10 +339,27 @@ private:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> dflash_kv_ctxs_bufs;
 
     // Encoder-graph result holder, kept across llama_dflash_extend() calls
-    // so the cached graph can be reused when the only thing changing
-    // between calls is the input tensor data. Topology (n_layer, types,
-    // tensor shapes) is invariant once allocated.
+    // so the same llm_graph_result instance is reused (its ctx_compute /
+    // gf are reset and rebuilt every call). After the commit-18 set_rows
+    // refactor the encoder graph topology depends only on `n_new` (the
+    // write_offset became a runtime input via `pos_idx`), so in principle
+    // we could skip the res->reset + rebuild + sched_alloc_graph cycle on
+    // matching `n_new`. In practice that doesn't work cleanly because the
+    // scheduler is shared with the draft-side decoder graph: every
+    // decoder run on ctx_dft (between consecutive extends) calls
+    // sched_reset + sched_alloc_graph for the decoder, which clobbers the
+    // encoder's compute-buffer slot assignments. Skipping the encoder's
+    // sched_alloc on a "cache hit" then crashes inside graph_compute on
+    // the next extend because the cached encoder tensors have stale
+    // device pointers. Tracked as future work in
+    // logs/core_architecture/07_review_and_next_steps.md item #5.
+    //
+    // `gf_res_dflash_encode_n_new` records the `n_new` the most recently
+    // built graph was sized for. Currently used only for diagnostic logs;
+    // when the scheduler interaction is sorted the cache-hit branch in
+    // `dflash_extend` can be re-enabled.
     llm_graph_result_ptr gf_res_dflash_encode;
+    int64_t              gf_res_dflash_encode_n_new = -1;
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;

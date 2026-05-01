@@ -2,13 +2,21 @@
 //
 // DFlash is a small Qwen3-shaped decoder that drafts an entire block of
 // tokens in a single forward pass. The decisive architectural difference
-// vs. plain Qwen3 is the per-layer attention block: keys and values are the
-// concatenation of (a) projections of *frozen target hidden states* -- the
-// committed-prefix context staged on the context via llama_set_dflash_input
-// -- and (b) projections of the current draft tokens. Queries come only from
-// the draft tokens. Attention spans the [ctx | proposal] segments and is
+// vs. plain Qwen3 is the per-layer attention block: keys and values are
+// the concatenation of (a) per-layer K_ctx / V_ctx pre-projected from
+// the *committed* target hidden states (read as zero-copy views of the
+// per-layer K/V side store populated by the encoder graph
+// `llm_build_dflash_encode` via `llama_dflash_extend`) and (b)
+// projections of the current draft tokens. Queries come only from the
+// draft tokens. Attention spans the [ctx | proposal] segments and is
 // non-causal within the proposal block (matches the python reference's
 // is_causal=False on the bidirectional draft attention).
+//
+// The K/V side store is the paper §4.1 reuse optimisation: the
+// `fc + hidden_norm + per-layer wk/wv (+k_norm +RoPE)` chain runs ONCE
+// when each block of target features is committed (in the encoder
+// graph), and every subsequent draft decode reads pre-projected
+// post-RoPE K and post-projection V via zero-copy views.
 //
 // References:
 //   dflash/dflash/model.py      — Qwen3DFlashAttention.forward
@@ -24,32 +32,27 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
     GGML_ASSERT(n_embd_head == hparams.n_rot);
     GGML_ASSERT(model.dflash_fc          != nullptr);
     GGML_ASSERT(model.dflash_hidden_norm != nullptr);
-    GGML_ASSERT(dflash != nullptr && "DFlash drafter graph requires the dflash drafter input");
-
-    // Are we using the K/V cache reuse (paper §4.1) path?
-    //   YES if the side store has been allocated and contains data.
-    //   In that case the per-layer K_ctx/V_ctx are read via zero-copy
-    //   views of `dflash->ctx_K[il]` / `dflash->ctx_V[il]` instead of
-    //   recomputing fc + per-layer wk/wv from `target_hidden` every block.
-    //
-    //   The legacy "recompute every block" path stays as a fall-back for
-    //   the transitional period when set_dflash_input() is still being
-    //   used (and for sanity/comparison).
-    const bool use_kv_reuse =
-        !dflash->ctx_K.empty()
-        && !dflash->ctx_V.empty()
-        && dflash->ctx_filled > 0;
+    GGML_ASSERT(dflash != nullptr && "DFlash drafter graph requires the dflash drafter state");
+    GGML_ASSERT(!dflash->ctx_K.empty() && !dflash->ctx_V.empty()
+                && "DFlash drafter graph requires the per-layer K/V side store "
+                   "to have been allocated by llama_context's constructor");
 
     // ---------- DFlash drafter inputs ----------
     auto * inp_dflash = build_inp_dflash();
-    ggml_tensor * target_hidden = inp_dflash->target_hidden;
-    ggml_tensor * pos_ctx       = inp_dflash->pos_ctx;
-    ggml_tensor * kq_mask       = inp_dflash->kq_mask_cnv;
+    ggml_tensor * kq_mask = inp_dflash->kq_mask_cnv;
 
-    // n_ctx_dft is the K_ctx column count seen by attention. With the side
-    // store path it's `ctx_filled` (real, no padding); with the legacy path
-    // it's the input tensor's allocated width.
-    const int64_t n_ctx_dft = use_kv_reuse ? dflash->ctx_filled : dflash->n_ctx;
+    // n_ctx_dft is the K_ctx column count seen by attention. We read it
+    // from `dflash->n_ctx`, which holds:
+    //   * `ctx_capacity` during graph_reserve (worst-case sizing — the
+    //     constructor seeds it to cparams.n_ctx_seq before any
+    //     graph_reserve is invoked, so the compute buffer is reserved for
+    //     the largest possible attention matmul);
+    //   * `ctx_filled`   at runtime (kept in sync by `dflash_extend`).
+    // The decoder graph is rebuilt each time `n_ctx` changes (the kq_mask
+    // shape depends on it via `build_inp_dflash`), so the per-decode view
+    // is always exactly the right size and fits comfortably inside the
+    // worst-case compute buffer.
+    const int64_t n_ctx_dft = dflash->n_ctx;
     // The proposal-window length always equals n_tokens (the ubatch size).
     // build_inp_dflash() above derives it from n_tokens directly, and the
     // n_ubatch clamp in llama_context's constructor pins n_tokens to the
@@ -79,20 +82,11 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // ---------- DFlash globals: project the concatenated target hidden states ----------
-    // dflash_fc: [n_features, n_embd]
-    // dflash_hidden_norm: [n_embd]
-    //
-    // Computed only on the legacy (recompute every block) path — when the K/V
-    // reuse cache is active, K_ctx and V_ctx already cache the post-projection
-    // result and the per-layer wk/wv projections, so this entire chain is
-    // skipped.
-    ggml_tensor * h_ctx_proj = nullptr;
-    if (!use_kv_reuse) {
-        h_ctx_proj = build_lora_mm(model.dflash_fc, target_hidden); // [n_embd, n_ctx]
-        h_ctx_proj = build_norm(h_ctx_proj, model.dflash_hidden_norm, NULL, LLM_NORM_RMS, -1);
-        cb(h_ctx_proj, "dflash_h_ctx_proj", -1);
-    }
+    // The shared `fc + hidden_norm + per-layer wk/wv (+ k_norm + RoPE)` chain
+    // that legacy DFlash implementations recompute on every block lives in
+    // `llm_build_dflash_encode` instead — it runs once per accepted block,
+    // writes the post-projection K and V into the per-layer side store, and
+    // the decoder below just reads zero-copy views of it.
 
     // ---------- decoder stack ----------
     for (int il = 0; il < n_layer; ++il) {
@@ -125,32 +119,27 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
                     ext_factor, attn_factor, beta_fast, beta_slow);
             cb(Kcur_n, "Kcur_noise", il);
 
-            // K from target context.
-            //   reuse path: zero-copy view of the cached side store (already
-            //               post wk + k_norm + RoPE — encoder did all of that).
-            //   legacy path: recompute wk · h_ctx_proj + k_norm + RoPE every block.
+            // K from target context: zero-copy view of the per-layer side
+            // store, already post `wk + k_norm + RoPE` (the encoder graph
+            // applied all of that when the features were committed).
+            //
+            // ne[2] uses the live `n_ctx_dft` (= dflash->n_ctx, which
+            // tracks ctx_capacity at graph_reserve time and ctx_filled at
+            // runtime), clamped to 1 because ggml does not allow zero-size
+            // dimensions even when the ctx is empty (e.g. the very first
+            // block before any extend has run — though in practice
+            // target_prefill always extends before the first gen_draft).
             const int64_t n_ctx_eff = std::max<int64_t>(n_ctx_dft, 1);
-            ggml_tensor * Kcur_c;
-            if (use_kv_reuse) {
-                ggml_tensor * dst_K = dflash->ctx_K[il];
-                GGML_ASSERT(dst_K != nullptr);
-                GGML_ASSERT(dst_K->ne[0] == n_embd_head * n_head_kv);
-                const size_t row_size_K = ggml_row_size(dst_K->type, n_embd_head);
-                Kcur_c = ggml_view_3d(
-                    ctx0, dst_K,
-                    n_embd_head, n_head_kv, n_ctx_eff,
-                    /*nb1=*/ row_size_K,
-                    /*nb2=*/ dst_K->nb[1],
-                    /*offset=*/ 0);
-            } else {
-                Kcur_c = build_lora_mm(model.layers[il].wk, h_ctx_proj);
-                Kcur_c = ggml_reshape_3d(ctx0, Kcur_c, n_embd_head, n_head_kv, n_ctx_eff);
-                Kcur_c = build_norm(Kcur_c, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
-                Kcur_c = ggml_rope_ext(
-                        ctx0, Kcur_c, pos_ctx, nullptr,
-                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                        ext_factor, attn_factor, beta_fast, beta_slow);
-            }
+            ggml_tensor * dst_K = dflash->ctx_K[il];
+            GGML_ASSERT(dst_K != nullptr);
+            GGML_ASSERT(dst_K->ne[0] == n_embd_head * n_head_kv);
+            const size_t row_size_K = ggml_row_size(dst_K->type, n_embd_head);
+            ggml_tensor * Kcur_c = ggml_view_3d(
+                ctx0, dst_K,
+                n_embd_head, n_head_kv, n_ctx_eff,
+                /*nb1=*/ row_size_K,
+                /*nb2=*/ dst_K->nb[1],
+                /*offset=*/ 0);
             cb(Kcur_c, "Kcur_ctx", il);
 
             // V from proposal (noise) tokens.
@@ -158,23 +147,18 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
             Vcur_n = ggml_reshape_3d(ctx0, Vcur_n, n_embd_head, n_head_kv, n_tokens);
             cb(Vcur_n, "Vcur_noise", il);
 
-            // V from target context (no norm, no RoPE — same in both paths).
-            ggml_tensor * Vcur_c;
-            if (use_kv_reuse) {
-                ggml_tensor * dst_V = dflash->ctx_V[il];
-                GGML_ASSERT(dst_V != nullptr);
-                GGML_ASSERT(dst_V->ne[0] == n_embd_head * n_head_kv);
-                const size_t row_size_V = ggml_row_size(dst_V->type, n_embd_head);
-                Vcur_c = ggml_view_3d(
-                    ctx0, dst_V,
-                    n_embd_head, n_head_kv, n_ctx_eff,
-                    row_size_V,
-                    dst_V->nb[1],
-                    0);
-            } else {
-                Vcur_c = build_lora_mm(model.layers[il].wv, h_ctx_proj);
-                Vcur_c = ggml_reshape_3d(ctx0, Vcur_c, n_embd_head, n_head_kv, n_ctx_eff);
-            }
+            // V from target context: zero-copy view of the per-layer side
+            // store (no norm, no RoPE — V is just `wv · h_ctx_proj`).
+            ggml_tensor * dst_V = dflash->ctx_V[il];
+            GGML_ASSERT(dst_V != nullptr);
+            GGML_ASSERT(dst_V->ne[0] == n_embd_head * n_head_kv);
+            const size_t row_size_V = ggml_row_size(dst_V->type, n_embd_head);
+            ggml_tensor * Vcur_c = ggml_view_3d(
+                ctx0, dst_V,
+                n_embd_head, n_head_kv, n_ctx_eff,
+                /*nb1=*/ row_size_V,
+                /*nb2=*/ dst_V->nb[1],
+                /*offset=*/ 0);
             cb(Vcur_c, "Vcur_ctx", il);
 
             // ggml_concat requires matching types. The side store is allocated
@@ -271,11 +255,29 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
                 && "DFlash drafter: no lm_head found. Either load a self-contained "
                    "DFlash GGUF that includes output.weight, or call llama_dflash_bind_target() "
                    "before running speculative decoding.");
-    cur = build_lora_mm(lm_head_use, cur);
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+    ggml_tensor * logits = build_lora_mm(lm_head_use, cur);
+    cb(logits, "result_output", -1);
 
-    ggml_build_forward_expand(gf, cur);
+    // In-graph argmax (paper §3 + buun fork's GGML_DFLASH_INLINE_ARGMAX).
+    // The DFlash speculative driver only ever needs the greedy top-1 token
+    // per draft position, never the full vocab distribution. Doing the
+    // argmax inside the graph and reading back I32 [n_outputs] (~64 bytes
+    // per block) instead of F32 [n_outputs * n_vocab] (~9.7 MB per block
+    // for Qwen3 vocab=151,936 and bs=16) eliminates the dominant draft-
+    // side PCIe transfer.
+    //
+    // Note that we deliberately set `res->t_logits = nullptr` so the
+    // generic logits read-back path in llama_context::decode() skips the
+    // float copy entirely — the lm_head matmul still computes, but its
+    // output is a graph-internal intermediate (no ggml_set_output) and
+    // ggml-alloc is free to reuse the storage as soon as ggml_argmax is
+    // done with it.
+    ggml_tensor * argmax = ggml_argmax(ctx0, logits);
+    cb(argmax, "result_output_argmax", -1);
+    res->t_logits        = nullptr;
+    res->t_logits_argmax = argmax;
+
+    ggml_build_forward_expand(gf, argmax);
 }
 
 // =================================================================
@@ -283,20 +285,33 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
 // =================================================================
 //
 // One-shot graph that projects newly-committed target features through
-// `fc + hidden_norm + per-layer wk/wv (+k_norm +RoPE for K)` and writes
-// the results into the persistent DFlash K/V side store at column
-// offset `write_offset`. The caller (llama_context::dflash_extend) is
-// responsible for advancing `dflash->ctx_filled` after compute returns.
+// `fc + hidden_norm + per-layer wk/wv (+k_norm +RoPE for K)` and scatters
+// the results into the persistent DFlash K/V side store at the columns
+// specified by the runtime input `pos_idx`. The caller
+// (llama_context::dflash_extend) is responsible for advancing
+// `dflash->ctx_filled` after compute returns.
 //
 // This is the central performance optimisation from paper §4.1:
 // per-layer K_ctx / V_ctx are computed ONCE when their corresponding
 // target features are committed, and reused across every subsequent
 // drafting iteration.
 //
+// Graph-reuse contract: the topology depends ONLY on `n_new` (the
+// `n_tokens` derived from the stub ubatch). The destination columns
+// are runtime inputs via `pos_idx`, so `dflash_extend` can cache the
+// built graph by `n_new` and reuse it on consecutive calls with the
+// same `n_new` (skipping `res->reset` + rebuild +
+// `ggml_backend_sched_alloc_graph`). For most workloads consecutive
+// extends share the same `n_new` (= accepted_drafts + 1 stays
+// roughly constant within a phase of generation), so the cache hit
+// rate is high.
+//
 // Required inputs (allocated by this builder, filled by the caller
-// pre-compute via ggml_backend_tensor_set):
+// pre-compute via `ggml_backend_tensor_set`):
 //   target_hidden_new : F32 [n_features, n_new]
-//   pos_new           : I32 [n_new]              (= absolute positions for RoPE)
+//   pos_new           : I32 [n_new]   (= absolute sequence positions for RoPE)
+//   pos_idx           : I64 [n_new]   (= side-store column indices to write to,
+//                                        commonly = [write_offset..write_offset+n_new-1])
 
 class llm_graph_input_dflash_encode : public llm_graph_input_i {
 public:
@@ -309,14 +324,14 @@ public:
 
     ggml_tensor * target_hidden_new = nullptr; // F32 [n_features, n_new]
     ggml_tensor * pos_new           = nullptr; // I32 [n_new]
+    ggml_tensor * pos_idx           = nullptr; // I64 [n_new]
 
     int64_t n_features;
     int64_t n_new;
 };
 
 llm_build_dflash_encode::llm_build_dflash_encode(const llama_model    & model,
-                                                 const llm_graph_params & params,
-                                                 int64_t                  write_offset)
+                                                 const llm_graph_params & params)
     : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v;
 
@@ -345,15 +360,20 @@ llm_build_dflash_encode::llm_build_dflash_encode(const llama_model    & model,
     ggml_set_input(inp->pos_new);
     cb(inp->pos_new, "dflash_enc_pos_new", -1);
 
+    inp->pos_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_new);
+    ggml_set_input(inp->pos_idx);
+    cb(inp->pos_idx, "dflash_enc_pos_idx", -1);
+
     ggml_tensor * target_hidden_new = inp->target_hidden_new;
     ggml_tensor * pos_new           = inp->pos_new;
+    ggml_tensor * pos_idx           = inp->pos_idx;
 
     // ---------- shared projection: h_proj = hidden_norm(fc(target_hidden_new)) ----------
     ggml_tensor * h_proj = build_lora_mm(model.dflash_fc, target_hidden_new);   // [n_embd, n_new]
     h_proj = build_norm(h_proj, model.dflash_hidden_norm, NULL, LLM_NORM_RMS, -1);
     cb(h_proj, "dflash_enc_h_proj", -1);
 
-    // ---------- per-layer K/V projection + write to side store ----------
+    // ---------- per-layer K/V projection + scatter into side store via set_rows ----------
     for (int il = 0; il < n_layer; ++il) {
         // K_new = wk · h_proj  → [n_embd_head, n_head_kv, n_new]
         ggml_tensor * K_new = build_lora_mm(model.layers[il].wk, h_proj);
@@ -370,49 +390,43 @@ llm_build_dflash_encode::llm_build_dflash_encode(const llama_model    & model,
         V_new = ggml_reshape_3d(ctx0, V_new, n_embd_head, n_head_kv, n_new);
         cb(V_new, "dflash_enc_V_new", il);
 
-        // ---------- write K_new / V_new into the side store at column `write_offset` ----------
-        // Side-store layout: ctx_K[il] is shape [n_embd_k_gqa, ctx_capacity] = 2D.
-        // The "columns" are absolute positions; each column holds one token's
-        // [n_embd_head * n_head_kv] flattened K (or V) vector.
-        //
-        // Build a 3D view of the destination slice covering n_new columns
-        // starting at `write_offset`, with the same head-major layout as K_new.
+        // Scatter K_new / V_new into the per-layer side store at the rows
+        // indicated by pos_idx. Side-store layout: dst_K[il] is 2D
+        // [n_embd_k_gqa, ctx_capacity] (ne[1] == ctx_capacity is the row
+        // dim that pos_idx indexes into). K_new / V_new are 3D
+        // [n_embd_head, n_head_kv, n_new]; we view them as 2D
+        // [n_embd_head*n_head_kv, n_new] for set_rows. This matches the
+        // pattern used by `llama_kv_cache::cpy_k` (see
+        // `src/llama-kv-cache.cpp`) — same op, same convention.
         ggml_tensor * dst_K = dflash->ctx_K[il];
         ggml_tensor * dst_V = dflash->ctx_V[il];
         GGML_ASSERT(dst_K != nullptr && dst_V != nullptr);
         GGML_ASSERT(dst_K->ne[0] == n_embd_head * n_head_kv);
         GGML_ASSERT(dst_V->ne[0] == n_embd_head * n_head_kv);
-        GGML_ASSERT(write_offset >= 0);
-        GGML_ASSERT(write_offset + n_new <= dst_K->ne[1]);
 
-        // View the destination as [head_dim, n_head_kv, n_new] starting at column write_offset.
-        // The 2D source has stride dst_K->nb[1] per column; n_head_kv columns
-        // form one "token slot" with element stride dst_K->nb[0].
-        const size_t row_size_K = ggml_row_size(dst_K->type, n_embd_head); // bytes per head_dim row
-        const size_t row_size_V = ggml_row_size(dst_V->type, n_embd_head);
-        ggml_tensor * dst_K_view = ggml_view_3d(
-            ctx0, dst_K,
-            n_embd_head, n_head_kv, n_new,
-            /*nb1=*/ row_size_K,
-            /*nb2=*/ dst_K->nb[1],
-            /*offset=*/ (size_t) write_offset * dst_K->nb[1]);
-        ggml_tensor * dst_V_view = ggml_view_3d(
-            ctx0, dst_V,
-            n_embd_head, n_head_kv, n_new,
-            row_size_V,
-            dst_V->nb[1],
-            (size_t) write_offset * dst_V->nb[1]);
+        // Merge the [head_dim, n_head_kv] dims of K_new / V_new into
+        // a single [n_embd_k_gqa] dim so the source rank matches the
+        // 2D dst. The `ggml_row_size(K_new->type, n_embd_head) ==
+        // K_new->nb[1]` invariant is required by `ggml_view_2d` here
+        // (and is the same precondition `cpy_k` checks); it holds
+        // because the head dim is contiguous after reshape_3d + RoPE.
+        GGML_ASSERT(ggml_row_size(K_new->type, n_embd_head) == K_new->nb[1]);
+        GGML_ASSERT(ggml_row_size(V_new->type, n_embd_head) == V_new->nb[1]);
+        ggml_tensor * K_new_2d = ggml_view_2d(
+            ctx0, K_new, n_embd_head * n_head_kv, n_new, K_new->nb[2], 0);
+        ggml_tensor * V_new_2d = ggml_view_2d(
+            ctx0, V_new, n_embd_head * n_head_kv, n_new, V_new->nb[2], 0);
 
-        ggml_tensor * cpy_K = ggml_cpy(ctx0, K_new, dst_K_view);
-        ggml_tensor * cpy_V = ggml_cpy(ctx0, V_new, dst_V_view);
+        ggml_tensor * scatter_K = ggml_set_rows(ctx0, dst_K, K_new_2d, pos_idx);
+        ggml_tensor * scatter_V = ggml_set_rows(ctx0, dst_V, V_new_2d, pos_idx);
 
-        ggml_build_forward_expand(gf, cpy_K);
-        ggml_build_forward_expand(gf, cpy_V);
+        ggml_build_forward_expand(gf, scatter_K);
+        ggml_build_forward_expand(gf, scatter_V);
     }
 
     // The encoder graph has no t_logits / t_embd; its outputs are the
-    // ggml_cpy nodes built above, which write straight into the side
-    // store. Add the input class so the scheduler keeps the inputs
+    // ggml_set_rows nodes built above, which scatter straight into the
+    // side store. Add the input class so the scheduler keeps the inputs
     // alive until the graph is computed.
     res->add_input(std::move(inp));
 }

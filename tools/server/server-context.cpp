@@ -571,13 +571,16 @@ struct server_context_impl {
 
             auto params_dft = params_base;
 
-            params_dft.devices      = params_base.speculative.devices;
-            params_dft.model        = params_base.speculative.model;
-            params_dft.n_ctx        = params_base.speculative.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_base.speculative.n_ctx;
-            params_dft.n_gpu_layers = params_base.speculative.n_gpu_layers;
-            params_dft.n_parallel   = 1;
-            params_dft.cache_type_k = params_base.speculative.cache_type_k;
-            params_dft.cache_type_v = params_base.speculative.cache_type_v;
+            params_dft.devices        = params_base.speculative.devices;
+            params_dft.model          = params_base.speculative.model;
+            params_dft.n_ctx          = params_base.speculative.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_base.speculative.n_ctx;
+            params_dft.n_gpu_layers   = params_base.speculative.n_gpu_layers;
+            params_dft.n_parallel     = 1;
+            params_dft.cache_type_k   = params_base.speculative.cache_type_k;
+            params_dft.cache_type_v   = params_base.speculative.cache_type_v;
+            // Forward the speculative.dflash_max_ctx into the top-level params so
+            // common_context_params_to_llama() picks it up for the draft context.
+            params_dft.dflash_max_ctx = params_base.speculative.dflash_max_ctx;
 
             params_dft.cpuparams.n_threads = params_base.speculative.cpuparams.n_threads;
             params_dft.cpuparams_batch.n_threads = params_base.speculative.cpuparams_batch.n_threads;

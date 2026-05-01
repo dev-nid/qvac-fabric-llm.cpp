@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 int main(int argc, char ** argv) {
@@ -34,7 +35,6 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     llama_model * model_tgt = NULL;
-    //llama_model * model_dft = NULL;
 
     llama_context * ctx_tgt = NULL;
     llama_context * ctx_dft = NULL;
@@ -45,26 +45,66 @@ int main(int argc, char ** argv) {
     model_tgt = llama_init_tgt.model.get();
     ctx_tgt   = llama_init_tgt.context.get();
 
-    const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
-
-    // load the draft model
-    params.devices      = params.speculative.devices;
-    params.model        = params.speculative.model;
-    params.n_ctx        = params.speculative.n_ctx;
-    params.n_batch      = params.speculative.n_ctx > 0 ? params.speculative.n_ctx : params.n_batch;
-    params.n_gpu_layers = params.speculative.n_gpu_layers;
-
-    if (params.speculative.cpuparams.n_threads > 0) {
-        params.cpuparams.n_threads = params.speculative.cpuparams.n_threads;
+    if (model_tgt == nullptr || ctx_tgt == nullptr) {
+        LOG_ERR("%s: failed to load target model '%s'\n", __func__, params.model.path.c_str());
+        return 1;
     }
 
-    params.cpuparams_batch.n_threads = params.speculative.cpuparams_batch.n_threads;
-    params.tensor_buft_overrides     = params.speculative.tensor_buft_overrides;
+    const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
 
-    common_init_result llama_init_dft = common_init_from_params(params);
+    // -----------------------------------------------------------------
+    // Load the draft model.
+    //
+    // We use a load → bind → init split (rather than the one-shot
+    // common_init_from_params used by the original speculative-simple
+    // driver) because DFlash drafts share their tok_embd / lm_head with
+    // the target model and the binding has to happen *before* the draft
+    // context is constructed (graph_reserve runs at construction time).
+    //
+    // For non-DFlash drafts, llama_dflash_bind_target() is a no-op, so
+    // the split is harmless. The rest of the params shuffling (devices,
+    // n_ctx, n_gpu_layers, cpuparams, tensor_buft_overrides) is identical
+    // to what the original driver did via common_init_from_params.
+    // -----------------------------------------------------------------
+    {
+        params.devices         = params.speculative.devices;
+        params.model           = params.speculative.model;
+        params.n_ctx           = params.speculative.n_ctx;
+        params.n_batch         = params.speculative.n_ctx > 0 ? params.speculative.n_ctx : params.n_batch;
+        params.n_gpu_layers    = params.speculative.n_gpu_layers;
+        // Forward the speculative.dflash_max_ctx into the top-level params so
+        // common_context_params_to_llama() picks it up for the draft context.
+        params.dflash_max_ctx  = params.speculative.dflash_max_ctx;
 
-    //model_dft = llama_init_dft.model.get();
-    ctx_dft   = llama_init_dft.context.get();
+        if (params.speculative.cpuparams.n_threads > 0) {
+            params.cpuparams.n_threads = params.speculative.cpuparams.n_threads;
+        }
+        params.cpuparams_batch.n_threads = params.speculative.cpuparams_batch.n_threads;
+        params.tensor_buft_overrides     = params.speculative.tensor_buft_overrides;
+    }
+
+    common_init_result llama_init_dft;
+    {
+        auto mparams = common_model_params_to_llama(params);
+        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        if (model_dft == nullptr) {
+            LOG_ERR("%s: failed to load draft model '%s'\n", __func__, params.model.path.c_str());
+            return 1;
+        }
+
+        // Paper §4.2: the DFlash draft shares tok_embd / lm_head with the
+        // target. The bind must happen *before* the draft context is
+        // created. No-op for non-DFlash drafts.
+        llama_dflash_bind_target(model_dft, model_tgt);
+
+        llama_init_dft = common_init_from_model_and_params(model_dft, std::move(llama_init_dft), params);
+    }
+    ctx_dft = llama_init_dft.context.get();
+
+    if (ctx_dft == nullptr) {
+        LOG_ERR("%s: failed to create draft context\n", __func__);
+        return 1;
+    }
 
     if (!common_speculative_are_compatible(ctx_tgt, ctx_dft)) {
         LOG_INF("the draft model '%s' is not compatible with the target model '%s'. tokens will be translated between the draft and target models.\n", params.speculative.model.path.c_str(), params.model.path.c_str());
@@ -114,8 +154,42 @@ int main(int argc, char ** argv) {
     // target model sampling context
     struct common_sampler * smpl = common_sampler_init(model_tgt, params.sampling);
 
-    // eval the prompt
-    llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size() - 1));
+    // init the speculator. AUTO picks DFLASH iff the draft GGUF carries
+    // dflash.* metadata; otherwise DRAFT (the original llama.cpp path).
+    struct common_speculative * spec = common_speculative_init_typed(
+            ctx_tgt, ctx_dft, params.speculative.type);
+    if (spec == nullptr) {
+        LOG_ERR("%s: failed to initialise speculative decoder (--draft-type "
+                "incompatible with the loaded draft model)\n", __func__);
+        return 1;
+    }
+    for (auto &pair : params.speculative.replacements) {
+        common_speculative_add_replacement_tgt_dft(spec, pair.first.c_str(), pair.second.c_str());
+    }
+
+    const enum common_speculative_type spec_type = common_speculative_get_type(spec);
+    const bool is_dflash = (spec_type == COMMON_SPECULATIVE_TYPE_DFLASH);
+    if (is_dflash) {
+        // The DFlash drafter always returns exactly block_size-1 tokens; the
+        // n_draft_min discard logic in the loop below would throw them all
+        // away if the user (or the default n_min=0 case) ever raised this
+        // above 0. Force-disable it for DFlash to keep a single shape.
+        n_draft_min = 0;
+        // For DFlash, n_draft is the block size (number of mask positions in
+        // each forward pass). Default 16 matches the Qwen3-4B-DFlash-b16
+        // training value; n_min has no semantic for block-parallel drafting.
+        LOG_INF("%s: --draft-type dflash: block_size=%d (capped at the trained value)\n",
+                __func__, n_draft);
+    }
+
+    // Run the prompt prefill on the target context. For DRAFT this is the
+    // legacy llama_decode(batch_get_one(prompt[0..n-1])); for DFLASH it
+    // also pushes the prompt-wide captures through the encoder so the
+    // first gen_draft has a populated K/V side store.
+    if (!common_speculative_target_prefill(spec, inp)) {
+        LOG_ERR("%s: target prompt prefill failed\n", __func__);
+        return 1;
+    }
 
     // note: keep the last token separate!
     llama_token id_last = inp.back();
@@ -126,16 +200,11 @@ int main(int argc, char ** argv) {
 
     int n_past = inp.size() - 1;
 
-    // init the speculator
+    // init the speculator's per-call params
     struct common_speculative_params params_spec;
     params_spec.n_draft = n_draft;
     params_spec.n_reuse = llama_n_ctx(ctx_dft) - n_draft;
     params_spec.p_min   = p_min;
-
-    struct common_speculative * spec = common_speculative_init(ctx_tgt, ctx_dft);
-    for (auto &pair : params.speculative.replacements) {
-        common_speculative_add_replacement_tgt_dft(spec, pair.first.c_str(), pair.second.c_str());
-    }
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
@@ -161,7 +230,8 @@ int main(int argc, char ** argv) {
 
         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
         {
-            // do not waste time on small drafts
+            // do not waste time on small drafts (DRAFT only — DFlash blocks
+            // are always exactly block_size-1 tokens by construction)
             if (draft.size() < (size_t) n_draft_min) {
                 draft.clear();
             }
@@ -191,17 +261,30 @@ int main(int argc, char ** argv) {
         n_past    += ids.size() - 1;
         n_drafted += draft.size(); // note: we ignore the discarded small drafts
         n_accept  += ids.size() - 1;
-        n_predict += ids.size();
 
         // process the accepted tokens and update contexts
         //
         // this is the standard token post-processing that we normally do
         // in this case, we do it for a group of accepted tokens at once
         //
+        // We cap at exactly params.n_predict tokens (rather than
+        // n_predict_pre_loop + ids.size(), which can overshoot by up to
+        // ids.size() - 1 and produces an extra "trailing token" that's
+        // confusing for byte-exact comparisons against llama-cli output).
+        // The cap is shared across DRAFT and DFLASH so that
+        // `--n-predict N` always produces exactly N generated tokens
+        // (or stops early on EOG).
+        const int n_predict_pre_loop = n_predict;
         for (size_t i = 0; i < ids.size(); ++i) {
+            if (params.n_predict >= 0 && (n_predict_pre_loop + (int) i) >= params.n_predict) {
+                has_eos = true; // sentinel to break the outer loop
+                break;
+            }
+
             prompt_tgt.push_back(id_last);
 
             id_last = ids[i];
+            ++n_predict;
 
             if (llama_vocab_is_eog(vocab, id_last)) {
                 has_eos = true;
@@ -225,7 +308,7 @@ int main(int argc, char ** argv) {
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
         }
 
-        if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
+        if ((params.n_predict >= 0 && n_predict >= params.n_predict) || has_eos) {
             break;
         }
     }
@@ -240,11 +323,12 @@ int main(int argc, char ** argv) {
     LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));
 
     LOG_INF("\n");
-    LOG_INF("n_draft   = %d\n", n_draft);
+    LOG_INF("draft-type = %s\n", is_dflash ? "dflash" : "draft");
+    LOG_INF("n_draft   = %d%s\n", n_draft, is_dflash ? " (block_size)" : "");
     LOG_INF("n_predict = %d\n", n_predict);
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
-    LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
+    LOG_INF("accept    = %.3f%%\n", n_drafted > 0 ? 100.0f * n_accept / n_drafted : 0.0f);
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");

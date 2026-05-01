@@ -364,6 +364,14 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool training;    // if true, we're in training mode (affects LoRA K/V gradient flow)
+
+        uint32_t dflash_max_ctx; // sliding-window cap on the DFlash drafter's per-layer K/V side store.
+                                 // 0 = uncapped (uses cparams.n_ctx_seq, the same value as the regular KV cache).
+                                 // For long-running generation this dominates draft-side VRAM (Qwen3-4B-DFlash-b16 with
+                                 // n_ctx_seq=40960 allocates ~800 MiB across both GPUs). When ctx_filled + n_new exceeds
+                                 // this cap, dflash_extend() slides the side store left by the overflow amount and bumps
+                                 // ctx_pos_base, dropping the oldest captures. Default 4096 (matches buun fork's
+                                 // GGML_DFLASH_MAX_CTX). Ignored for non-DFlash drafts.
     };
 
     // model quantization parameters
@@ -611,28 +619,6 @@ extern "C" {
             const struct llama_model * model_tgt);
 
     // -----------------------------------------------------------------------
-    // DFlash drafter input setter (call on the *draft* context)
-    // -----------------------------------------------------------------------
-    //
-    // Stage the projected target hidden states + sizes that the next call to
-    // llama_decode(ctx_dft) will consume in its DFlash drafter graph.
-    //
-    //   target_hidden : flat float buffer, layout
-    //                   target_hidden[i_token * n_features + i_feat]
-    //                   pass nullptr for the very first block (n_ctx == 0).
-    //   n_features    : per-token feature dim (n_target_layer_ids * n_embd_target)
-    //   n_ctx         : number of committed-prefix tokens encoded in the buffer
-    //   n_block       : number of tokens in the upcoming draft batch
-    //
-    // The buffer is copied; the caller may free target_hidden after the call.
-    LLAMA_API void llama_set_dflash_input(
-            struct llama_context * ctx,
-            const float *          target_hidden,
-            int64_t                n_features,
-            int64_t                n_ctx,
-            int64_t                n_block);
-
-    // -----------------------------------------------------------------------
     // DFlash target hidden-state capture (call on the *target* context)
     // -----------------------------------------------------------------------
     //
@@ -663,6 +649,19 @@ extern "C" {
     // The buffer is owned by the context and is valid until the next decode
     // or until llama_set_dflash_capture() is called again.
     LLAMA_API const float * llama_get_dflash_captured_features(
+            struct llama_context * ctx,
+            int64_t *              n_outputs_out);
+
+    // After llama_decode() on a *draft* context (LLM_ARCH_DFLASH), returns
+    // a pointer to the in-graph greedy argmax of the lm_head — one int32
+    // per output position. Eliminates the per-decode bs * n_vocab * 4 byte
+    // PCIe transfer of the full float-logits buffer (~9.7 MiB per block on
+    // Qwen3 vocab=151,936) in favour of a ~`bs * 4` byte int32 read-back
+    // (~64 bytes per block). Returns NULL on a non-DFlash context or if
+    // no decode has run. *n_outputs_out is filled with the number of
+    // positions covered (= n_outputs_all of the most recent decode).
+    // The buffer is owned by the context and is valid until the next decode.
+    LLAMA_API const int32_t * llama_get_dflash_draft_argmax(
             struct llama_context * ctx,
             int64_t *              n_outputs_out);
 

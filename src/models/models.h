@@ -560,14 +560,24 @@ struct llm_build_dflash : public llm_graph_context {
 // Inputs (set via the input tensors below):
 //   target_hidden_new : F32 [n_features, n_new_tokens]
 //   pos_new           : I32 [n_new_tokens]   (= absolute positions for K's RoPE)
-//   write_offset      : int (parameter; passed to the constructor)
+//   pos_idx           : I64 [n_new_tokens]   (= side-store column indices to
+//                                              write to; commonly =
+//                                              [write_offset..write_offset+n_new-1]
+//                                              but can be any permutation)
 //
-// Outputs (no `t_logits` / `t_embd`): per-layer ggml_cpy nodes that write
-// K_new and V_new into ctx_K[il] / ctx_V[il] at column offset
-// `write_offset`. Caller is responsible for bumping `ctx_filled` by
+// Outputs (no `t_logits` / `t_embd`): per-layer ggml_set_rows nodes that
+// scatter K_new and V_new into ctx_K[il] / ctx_V[il] at the columns
+// indicated by pos_idx. Caller is responsible for bumping `ctx_filled` by
 // `n_new_tokens` after compute.
+//
+// The graph topology depends ONLY on `n_new_tokens` (= the encoder
+// `n_tokens` derived from the stub ubatch in `dflash_extend`); the
+// destination columns are runtime inputs via `pos_idx`. This lets
+// `dflash_extend` cache the built graph by `n_new` and skip
+// `res->reset()` + rebuild + `ggml_backend_sched_alloc_graph` on the
+// common path where consecutive blocks have the same `n_new`
+// (e.g. all blocks with the same accept count).
 struct llm_build_dflash_encode : public llm_graph_context {
     llm_build_dflash_encode(const llama_model    & model,
-                            const llm_graph_params & params,
-                            int64_t                  write_offset);
+                            const llm_graph_params & params);
 };

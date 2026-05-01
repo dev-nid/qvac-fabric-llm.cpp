@@ -271,47 +271,6 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         return;
     }
 
-    // ----- target_hidden -----
-    // Copy the host-side target_hidden buffer into the backend tensor.
-    // If `target_hidden->buffer` is null, the scheduler has removed this
-    // input as unused (e.g. on the K/V cache reuse path the decoder
-    // graph reads K_ctx / V_ctx straight from the side store and never
-    // touches `target_hidden`). Skip the write in that case — the input
-    // is still in the graph for legacy callers but it has no backing
-    // memory to copy into.
-    if (target_hidden && target_hidden->buffer) {
-        assert(target_hidden->type == GGML_TYPE_F32);
-
-        const size_t tensor_bytes = ggml_nbytes(target_hidden);
-        const int64_t n_real      = std::min<int64_t>(dflash->n_ctx, n_ctx);
-        const size_t  copy_bytes  = (size_t) n_real * (size_t) n_features * sizeof(float);
-
-        if (n_real > 0 && !dflash->target_hidden.empty()) {
-            const size_t actual = std::min(copy_bytes, tensor_bytes);
-            ggml_backend_tensor_set(target_hidden, dflash->target_hidden.data(), 0, actual);
-
-            if (actual < tensor_bytes) {
-                // Zero-fill the unused tail (kq_mask will mask it out anyway,
-                // but keep deterministic memory for reproducibility).
-                ggml_backend_tensor_memset(target_hidden, 0, actual, tensor_bytes - actual);
-            }
-        } else {
-            ggml_backend_tensor_memset(target_hidden, 0, 0, tensor_bytes);
-        }
-    }
-
-    // ----- pos_ctx -----
-    // Position ids for K_ctx RoPE: positions [0, 1, ..., n_real - 1] for the
-    // committed-prefix tokens, then 0 for the unused tail.
-    if (pos_ctx && pos_ctx->buffer) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(pos_ctx->buffer));
-        int32_t * data = (int32_t *) pos_ctx->data;
-        const int64_t n_real = std::min<int64_t>(dflash->n_ctx, n_ctx);
-        for (int64_t i = 0; i < n_ctx; ++i) {
-            data[i] = (i < n_real) ? (int32_t) i : 0;
-        }
-    }
-
     // ----- kq_mask -----
     // Shape: [n_kv = n_ctx + n_block, n_block_pad, 1, 1] where
     //   n_block_pad = GGML_PAD(n_block, GGML_KQ_MASK_PAD).
@@ -323,6 +282,15 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
     // Rows q in [n_block, n_block_pad):  fully masked (-inf everywhere). These
     //   rows exist only to satisfy the Flash-Attention kernel's pad
     //   requirement; they have no corresponding query token.
+    //
+    // `n_real` is the number of side-store columns that actually carry
+    // committed K/V (= dflash->n_ctx, which `dflash_extend()` keeps in sync
+    // with `ctx_filled`). At graph_reserve time `n_ctx` is the worst-case
+    // value (= ctx_capacity, set in the constructor), so n_real == n_ctx
+    // and no slots are masked out. At runtime n_real may be smaller than
+    // the cached graph's n_ctx if the graph was reused across an extend
+    // (which currently isn't possible because dflash_extend invalidates
+    // the cached graph, but the masking stays as defence-in-depth).
     if (kq_mask && kq_mask->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
         float * data            = (float *) kq_mask->data;
@@ -563,10 +531,11 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
-    t_tokens      = nullptr;
-    t_logits      = nullptr;
-    t_embd        = nullptr;
-    t_embd_pooled = nullptr;
+    t_tokens         = nullptr;
+    t_logits         = nullptr;
+    t_embd           = nullptr;
+    t_embd_pooled    = nullptr;
+    t_logits_argmax  = nullptr;
 
     // The DFlash capture vector is repopulated by the graph builder on every
     // build (one entry per capture_layer_ids), so it must be cleared here
@@ -1416,12 +1385,12 @@ void llm_graph_context::build_dflash_capture(ggml_tensor * cur, int il) const {
 llm_graph_input_dflash * llm_graph_context::build_inp_dflash() const {
     GGML_ASSERT(dflash != nullptr && "build_inp_dflash() called without a llama_dflash on the context");
 
-    // n_features is the column dim of `target_hidden`. The driver sets this
-    // when it stages real input, but during graph_reserve the llama_context
-    // constructor seeds it from `model.dflash_fc->ne[0]` so this assertion
-    // holds for every code path that reaches the drafter graph.
-    const int64_t n_features = dflash->n_features;
-    const int64_t n_ctx_dft  = dflash->n_ctx;
+    // `n_ctx` is the K_ctx column count visible to attention. The
+    // llama_context constructor seeds it from `cparams.n_ctx_seq` for the
+    // graph_reserve worst-case pass, and `dflash_extend()` keeps it in
+    // sync with `ctx_filled` at runtime, so the kq_mask shape always
+    // matches the K_ctx side-store view used in the decoder.
+    const int64_t n_ctx_dft = dflash->n_ctx;
     // n_block is the proposal-window length. It must equal n_tokens (the
     // ubatch size) because the kq_mask/Q tensors are sized per-graph-build
     // from these two values and they have to agree. The DFlash drafter only
@@ -1432,20 +1401,9 @@ llm_graph_input_dflash * llm_graph_context::build_inp_dflash() const {
     // and per-decode rebuilds.
     const int64_t n_block    = (int64_t) n_tokens;
 
-    GGML_ASSERT(n_features > 0 && "DFlash: n_features must be set before building the drafter graph");
-    GGML_ASSERT(n_block    > 0 && "DFlash: n_block must be > 0");
+    GGML_ASSERT(n_block > 0 && "DFlash: n_block must be > 0");
 
-    auto inp = std::make_unique<llm_graph_input_dflash>(dflash, n_features, n_ctx_dft, n_block);
-
-    // target_hidden: [n_features, n_ctx]  (zero ctx is allowed for the very first block)
-    inp->target_hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_features, std::max<int64_t>(n_ctx_dft, 1));
-    ggml_set_input(inp->target_hidden);
-    cb(inp->target_hidden, "dflash_target_hidden", -1);
-
-    // pos_ctx: [n_ctx]  (also at least 1 to satisfy ggml's positive-shape constraint)
-    inp->pos_ctx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, std::max<int64_t>(n_ctx_dft, 1));
-    ggml_set_input(inp->pos_ctx);
-    cb(inp->pos_ctx, "dflash_pos_ctx", -1);
+    auto inp = std::make_unique<llm_graph_input_dflash>(dflash, n_ctx_dft, n_block);
 
     // kq_mask: [n_kv = n_ctx + n_block, n_block_pad, 1, 1] where
     //   n_block_pad = GGML_PAD(n_block, GGML_KQ_MASK_PAD)
