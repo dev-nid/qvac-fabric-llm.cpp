@@ -255,15 +255,20 @@ struct common_params_speculative {
                                     // to pre-DDTree). >=2 = tree mode (ggml_argsort_top_k); upstream
                                     // common_speculative_state_dflash uses the extras to build K parallel
                                     // verify chains for tree-style verify. See llama_context_params::dflash_topk.
-    bool    dflash_tree    = false; // DFlash drafter: enable DDTree Phase 2 Stage B (tree-shaped verify).
+    bool    dflash_tree    = false; // DFlash drafter: enable DDTree Phase 2 (tree-shaped verify).
                                     // When true, the spec_simple driver calls common_speculative_gen_draft_tree
-                                    // instead of common_speculative_gen_draft, installs a tree mask via
-                                    // llama_set_tree_mask before the verify decode, and uses a tree-walk
-                                    // accept + drop+re-decode KV rollback. Requires --dflash-topk >= 2
-                                    // (auto-bumped to 2 if left at the default 1). Strong-correctness
-                                    // (byte-exact greedy match against `llama-cli`) is preserved by
-                                    // construction at any tree shape — the target verifies each branch
-                                    // independently and the longest accepted chain wins.
+                                    // instead of common_speculative_gen_draft, runs a multi-seq verify
+                                    // (one seq_id per tree branch), and uses a tree-walk accept + clean
+                                    // per-branch seq_rm rollback. Requires --dflash-topk >= 2 (auto-bumped
+                                    // to 2 if left at default 1) and n_seq_max >= n_branches (auto-bumped
+                                    // via n_parallel). Strong-correctness (byte-exact match against
+                                    // llama-cli at -ub 1) is preserved by construction at any tree shape.
+    int32_t dflash_tree_budget = 0; // Stage C budget (= total tree nodes excluding root). 0 = Stage B
+                                    // shape (chain seed + 1 alt at depth 1, n_branches=2). >0 = chain
+                                    // seed (capped at block_size-1) + uniform per-depth sibling
+                                    // expansion of K-1 ranks until budget exhausted. n_branches grows
+                                    // with budget (1 + min(budget - chain_len, (K-1) * chain_len)).
+                                    // See common/speculative.h::common_speculative_params for details.
     float   p_split        =  0.1f; // speculative decoding split probability
     float   p_min          = 0.75f; // minimum speculative decoding probability (greedy)
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements

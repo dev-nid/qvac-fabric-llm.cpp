@@ -51,23 +51,34 @@ int main(int argc, char ** argv) {
     // `n_seq_max`) to at least 2 so the second seq is allocatable.
     // Chain mode is unaffected (only runs when --dflash-tree is on).
     if (params.speculative.dflash_tree) {
-        const int min_parallel_tree = 2; // 1 main + 1 alt branch (Stage B)
+        // Stage C: n_branches at runtime depends on the budget. Worst-case
+        // upper bound (= what we need n_seq_max for):
+        //   n_branches = 1 (main) + min(budget - chain_len, (K-1) * chain_len)
+        // where chain_len = min(budget, block_size - 1). For Stage B
+        // default (budget=0 -> shape with 1 alt) n_branches = 2. For
+        // budget=22, K=2: chain_len = 15, n_alts = 7, n_branches = 8.
+        // For budget=45, K=4: chain_len = 15, n_alts = 30, n_branches = 31.
+        // We don't know block_size at this point (the draft model isn't
+        // loaded yet), so we use the worst-case value max(2, budget+1).
+        // Over-allocating n_seq_max is cheap (small per-slot metadata).
+        const int budget = params.speculative.dflash_tree_budget;
+        const int min_parallel_tree = std::max(2, (budget > 0) ? budget + 1 : 2);
         if (params.n_parallel < min_parallel_tree) {
-            LOG_INF("%s: --dflash-tree: bumping n_parallel from %d to %d so ctx_tgt's "
-                    "n_seq_max fits the alt branch's KV slots\n",
-                    __func__, params.n_parallel, min_parallel_tree);
+            LOG_INF("%s: --dflash-tree (budget=%d): bumping n_parallel from %d to %d "
+                    "so ctx_tgt's n_seq_max fits all alt-branch seq_ids\n",
+                    __func__, budget, params.n_parallel, min_parallel_tree);
             params.n_parallel = min_parallel_tree;
         }
         // Tree mode requires the unified KV cache (n_stream=1): the
         // multi-seq attention mask path expects all seqs to share a
-        // single stream so a token in seq 1 can attend (via the
+        // single stream so tokens in alt seqs can attend (via the
         // standard seq-id-based mask) to KV slots written under seq 0
-        // (after `seq_cp(0 -> 1)` broadcasts the prefix). Without
+        // after `seq_cp(0 -> b)` broadcasts the prefix. Without
         // kv_unified, n_seq_max > 1 gives each seq its own stream and
         // cross-seq attention requires an actual data copy.
         if (!params.kv_unified) {
-            LOG_INF("%s: --dflash-tree: enabling kv_unified (required so seq 0 / seq 1 "
-                    "share a single stream for the multi-seq tree-verify pattern)\n",
+            LOG_INF("%s: --dflash-tree: enabling kv_unified (required for multi-seq "
+                    "tree-verify pattern)\n",
                     __func__);
             params.kv_unified = true;
         }
@@ -272,11 +283,22 @@ int main(int argc, char ** argv) {
 
     // init the speculator's per-call params
     struct common_speculative_params params_spec;
-    params_spec.n_draft = n_draft;
-    params_spec.n_reuse = llama_n_ctx(ctx_dft) - n_draft;
-    params_spec.p_min   = p_min;
+    params_spec.n_draft            = n_draft;
+    params_spec.n_reuse            = llama_n_ctx(ctx_dft) - n_draft;
+    params_spec.p_min              = p_min;
+    params_spec.dflash_tree_budget = params.speculative.dflash_tree_budget;
 
-    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+    // Tree mode multi-seq: each batch token may carry up to n_branches
+    // seq_ids (root has all branches; main-path nodes carry seq 0 plus
+    // the branches of every alt at deeper depths). Per-slot seq_id
+    // arrays are allocated by llama_batch_init at this fixed size, so
+    // we size to the worst-case n_branches up front. For chain mode and
+    // Stage B (n_branches <= 2), keep the historical size 1; for Stage
+    // C with --dflash-tree-budget B, n_branches <= 1 + budget.
+    const int batch_n_seq_max = params.speculative.dflash_tree
+        ? std::max(2, params.speculative.dflash_tree_budget + 1)
+        : 1;
+    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, batch_n_seq_max);
 
     const auto t_enc_end = ggml_time_us();
 
@@ -365,19 +387,63 @@ int main(int argc, char ** argv) {
 
                 n_past = n_past_before + 1;
             } else {
-                // Multi-seq prefix tagging: copy seq 0 -> seq 1 so the
-                // alt branch's standard attention mask reaches the
-                // shared prefix.
-                llama_memory_seq_cp(mem, 0, 1, -1, -1);
+                // Multi-seq prefix tagging: copy seq 0 -> seq b for each
+                // alt branch b in [1..n_branches-1] so each alt's standard
+                // attention mask reaches the shared prefix. `seq_cp` with
+                // `kv_unified=true` is metadata-only (just adds the dst
+                // seq_id to every existing seq-0 slot's seq list — no
+                // data copy).
+                for (int b = 1; b < tree.n_branches; ++b) {
+                    llama_memory_seq_cp(mem, 0, b, -1, -1);
+                }
 
-                // id_last is the shared root: visible from both branches.
-                common_batch_add(batch_tgt, id_last, n_past_before, { 0, 1 }, /*logits=*/true);
-
-                // Main path (seq 0) and alt nodes (seq 1).
+                // For each MAIN-PATH node at depth d, compute which alt
+                // branch seq_ids it must additionally carry: every alt at
+                // depth > d (i.e., where main_d is on the alt's ancestor
+                // chain). This is required so the KV cache's per-seq
+                // position-consistency check sees a contiguous run of
+                // positions in every alt seq from the prefix through the
+                // alt's depth. Without it, an alt at depth d=3 in seq 3
+                // would see seq 3's last position = N0 (root only), and
+                // adding a slot at N0+3 would fail the Y = X+1 invariant.
+                //
+                // For Stage C uniform expansion: alt at depth d_a sits in
+                // seq b = (alt index within depths) so we pre-bin by
+                // depth. Computed in O(n_nodes) and indexed in O(1) per
+                // main-path token.
+                std::vector<std::vector<llama_seq_id>> main_extra_seqs(tree.main_path_len);
                 for (int i = 0; i < tree.n_nodes; ++i) {
-                    const llama_seq_id sid = (i < tree.main_path_len) ? 0 : 1;
+                    if (tree.branch_ids[i] == 0) continue; // skip main
+                    const int alt_depth = tree.depths[i];
+                    const llama_seq_id alt_seq = (llama_seq_id) tree.branch_ids[i];
+                    // main_d_{1..alt_depth-1} need to be visible to alt_seq.
+                    for (int d_main = 1; d_main < alt_depth; ++d_main) {
+                        main_extra_seqs[d_main - 1].push_back(alt_seq);
+                    }
+                }
+
+                // id_last is the shared root: visible from every branch.
+                std::vector<llama_seq_id> root_seqs(tree.n_branches);
+                for (int b = 0; b < tree.n_branches; ++b) root_seqs[b] = b;
+                common_batch_add(batch_tgt, id_last, n_past_before,
+                                 root_seqs, /*logits=*/true);
+
+                // Tree nodes. Main-path nodes at depth d carry seqs
+                // {0} ∪ {alt branches at deeper depths}. Alt-leaf nodes
+                // carry just their own branch_id.
+                for (int i = 0; i < tree.n_nodes; ++i) {
+                    const int d  = tree.depths[i];
+                    const int bi = tree.branch_ids[i];
+                    std::vector<llama_seq_id> seqs;
+                    if (bi == 0) {
+                        seqs.reserve(1 + main_extra_seqs[d - 1].size());
+                        seqs.push_back(0);
+                        for (auto s : main_extra_seqs[d - 1]) seqs.push_back(s);
+                    } else {
+                        seqs.push_back((llama_seq_id) bi);
+                    }
                     common_batch_add(batch_tgt, tree.tokens[i],
-                                     n_past_before + tree.depths[i], { sid }, /*logits=*/true);
+                                     n_past_before + d, seqs, /*logits=*/true);
                 }
 
                 const int64_t t_v0 = ggml_time_us();
@@ -408,30 +474,61 @@ int main(int argc, char ** argv) {
                     n_tree_alt_taken++;
 
                     // Drop everything in seq 0 from N0 onward (id_last
-                    // + main path), and drop seq 1 entirely (alt slots
-                    // become empty; prefix's seq-1 tag is removed).
+                    // + main path) and drop every alt seq entirely
+                    // (alt slots that were tagged with that seq alone
+                    // become empty; the prefix's tags shrink back to
+                    // seq 0 only).
                     llama_memory_seq_rm(mem, 0, n_past_before, -1);
-                    llama_memory_seq_rm(mem, 1, -1, -1);
+                    for (int b = 1; b < tree.n_branches; ++b) {
+                        llama_memory_seq_rm(mem, b, -1, -1);
+                    }
 
                     // Re-decode [id_last, alt_token] in seq 0 to
                     // populate KV + captures with correct chain-prefix
-                    // hidden states.
+                    // hidden states. Stage C alts are leaves at depth
+                    // `tree.depths[commit_n - 1]` hanging off
+                    // `main_path[depth-1]`; the accept walk only ever
+                    // descends one step into an alt branch (alts have
+                    // no children in the current Stage C tree shape),
+                    // so `[id_last, alt_token]` covers the full
+                    // accepted prefix.
+                    //
+                    // For accepted alt at depth d > 1, we'd want to
+                    // re-decode [id_last, m1, ..., m_{d-1}, alt_token]
+                    // — d+1 tokens — to match the chain prefix the alt
+                    // was committed under. The accept walk's `current`
+                    // chain follows the tree.parents pointers from
+                    // `commit_n` back to the root, so we can build
+                    // the actual prefix from there.
                     common_batch_clear(batch_tgt);
                     common_batch_add(batch_tgt, id_last, n_past_before,
                                      { 0 }, /*logits=*/true);
-                    common_batch_add(batch_tgt, tree.tokens[commit_n - 1],
-                                     n_past_before + 1, { 0 }, /*logits=*/true);
+                    // Walk root -> ... -> commit_n in tree order.
+                    std::vector<int> path;
+                    for (int node = commit_n; node > 0; node = tree.parents[node]) {
+                        path.push_back(node);
+                    }
+                    std::reverse(path.begin(), path.end());
+                    for (size_t i = 0; i < path.size(); ++i) {
+                        common_batch_add(batch_tgt, tree.tokens[path[i] - 1],
+                                         n_past_before + 1 + (llama_pos) i,
+                                         { 0 }, /*logits=*/true);
+                    }
                     llama_decode(ctx_tgt, batch_tgt);
-                    n_tree_redecoded += 2;
-                    n_past = n_past_before + 2;
+                    n_tree_redecoded += (int) batch_tgt.n_tokens;
+                    n_past = n_past_before + 1 + (int) path.size();
                 } else {
                     // Main-path accept (commit_n == 0 or 1..main_path_len).
-                    // Drop the rejected main-path tail, drop seq 1 entirely.
-                    // No re-decode needed: captures at output indices [0..L]
-                    // are correct (id_last + accepted main).
+                    // Drop the rejected main-path tail, drop every alt
+                    // seq entirely. No re-decode needed: captures at
+                    // output indices [0..L] are correct (id_last +
+                    // accepted main path's tree-decode prefix is the
+                    // chain prefix at that depth).
                     const int L = (commit_n > 0) ? tree.depths[commit_n - 1] : 0;
                     llama_memory_seq_rm(mem, 0, n_past_before + 1 + L, -1);
-                    llama_memory_seq_rm(mem, 1, -1, -1);
+                    for (int b = 1; b < tree.n_branches; ++b) {
+                        llama_memory_seq_rm(mem, b, -1, -1);
+                    }
                     n_past = n_past_before + 1 + L;
                 }
                 t_redecode_total += ggml_time_us() - t_r0;

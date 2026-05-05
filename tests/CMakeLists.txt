@@ -143,6 +143,18 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
         LABEL "model"
     )
+
+    # DFlash numerics-oracle gate: cosine-similarity comparison of the C++
+    # DFlash decoder graph's post-norm hidden state against the z-lab
+    # PyTorch reference's output on a deterministic synthetic input. Catches
+    # drafter-graph precision regressions the text-level gate above can't.
+    # Skip-on-missing-config: needs DFLASH_TEST_TARGET, DFLASH_TEST_DRAFT,
+    # DFLASH_TEST_ORACLE; if any unset/unreadable, exits 0 with a yellow
+    # warning. Generate the oracle artifact via:
+    #   .venv/bin/python3 scripts/gen_dflash_oracle.py \
+    #       --model /path/to/Qwen3-4B-DFlash-b16 \
+    #       --out   /tmp/dflash_oracle/oracle.bin
+    llama_build_and_test(test-dflash-numerics.cpp LABEL "model")
 endif()
 
 if (LLAMA_LLGUIDANCE)

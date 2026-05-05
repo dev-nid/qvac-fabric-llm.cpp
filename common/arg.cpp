@@ -2923,15 +2923,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_TOPK"));
     add_opt(common_arg(
         {"--dflash-tree"},
-        "DFlash drafter: enable DDTree Phase 2 Stage B (tree-shaped verify). "
-        "The spec_simple driver builds a small tree of likely continuations from the draft's "
-        "per-position top-K (Stage B shape: chain_seed + 1 alternate at depth 1 = block_size+1 "
-        "tree nodes), runs ONE target verify pass with a tree-shaped attention mask installed "
-        "via llama_set_tree_mask, walks the accept tree to pick the longest accepted chain, "
-        "and re-decodes the accepted chain in causal mode for KV cleanup. Auto-bumps "
-        "--dflash-topk to 2 if left at the default 1 (K=2 is required for the alternate to be "
-        "buildable). Strong-correctness (byte-exact greedy match against llama-cli) is "
-        "preserved by construction. See logs/core_architecture/09_lucebox_reference.md item B.",
+        "DFlash drafter: enable DDTree Phase 2 (multi-seq tree-shaped verify). "
+        "The spec_simple driver builds a tree of likely continuations from the draft's "
+        "per-position top-K, runs ONE target verify pass with multi-seq tagging "
+        "(one seq_id per branch), walks the accept tree to pick the longest accepted "
+        "chain, and uses per-branch seq_rm rollback (no re-decode in the common case). "
+        "Default tree shape (no --dflash-tree-budget): chain seed + 1 alt at depth 1 = "
+        "block_size nodes, n_branches=2 (= Stage B). Auto-bumps --dflash-topk to 2 and "
+        "n_parallel to >= n_branches if needed. Strong-correctness (byte-exact greedy "
+        "match against llama-cli at -ub 1) is preserved by construction. "
+        "See logs/core_architecture/09_lucebox_reference.md item B.",
         [](common_params & params) {
             params.speculative.dflash_tree = true;
             if (params.speculative.dflash_topk < 2) {
@@ -2939,6 +2940,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_TREE"));
+    add_opt(common_arg(
+        {"--dflash-tree-budget"}, "B",
+        string_format(
+            "DFlash drafter (Stage C): total tree node budget excluding the implicit root "
+            "(default: %d, 0 = Stage B shape). Implies --dflash-tree. Tree composition: "
+            "chain seed of min(B, block_size-1) main-path nodes, then uniform round-robin "
+            "sibling expansion (rank 1, 2, ..., K-1 across all depths) until B nodes total. "
+            "n_branches = 1 + (B - chain_len). n_parallel is auto-bumped to >= n_branches. "
+            "Recommended budgets to try: 16 (Stage B = chain + 1 alt; ~1.05x per-iter cost), "
+            "22 (Lucebox's reported sweet spot for budget-B best-first), 30 (caterpillar "
+            "K=2; 2x per-iter cost). Higher budgets pay more per-iter overhead but get more "
+            "acceptance opportunities; the optimal value is workload-dependent and worth "
+            "benchmarking. Strong-correctness preserved at any budget.",
+            params.speculative.dflash_tree_budget),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument(
+                    string_format("invalid --dflash-tree-budget value %d (must be >= 0)", value));
+            }
+            params.speculative.dflash_tree_budget = value;
+            params.speculative.dflash_tree        = true;
+            if (params.speculative.dflash_topk < 2) {
+                params.speculative.dflash_topk = 2;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_TREE_BUDGET"));
     add_opt(common_arg(
         {"--draft-min", "--draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.n_min),

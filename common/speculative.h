@@ -14,22 +14,40 @@ struct common_speculative_params {
     int n_reuse = 256;
 
     float p_min = 0.75f; // min probability required to accept a token in the draft (DRAFT only)
+
+    // DDTree (DFlash Phase 2 Stage C): total tree node budget (excluding
+    // the implicit root). 0 = use the Stage B default (block_size = chain
+    // seed + 1 alt at depth 1, n_branches = 2). >0 = chain seed (capped
+    // at block_size-1 nodes) + uniform per-depth sibling expansion of
+    // K-1 alternates per depth round-robin until the budget is exhausted.
+    // Each alt is a leaf hanging off the main chain at its depth and gets
+    // a unique branch_id (= seq_id 1..n_alts) so the spec-simple driver
+    // can tag the verify batch with multi-seq for clean rollback. Capped
+    // by the context's `n_seq_max` (driver bumps `n_parallel` to at least
+    // `1 + n_alts` before context creation).
+    int dflash_tree_budget = 0;
 };
 
-// DDTree (DFlash Phase 2 Stage B): tree of likely continuations the DFlash
-// drafter emits in a single forward pass, used to feed a tree-shaped target
-// verify batch (one decode = up to L+1 accepted tokens for L tree depth).
+// DDTree (DFlash Phase 2): tree of likely continuations the DFlash drafter
+// emits in a single forward pass, used to feed a tree-shaped target verify
+// batch (one decode = up to L+1 accepted tokens for L tree depth).
 //
 // Indexing convention (mirrors buun fork's representation; written from
 // scratch):
 //   * Index 0 is the implicit root (id_last). It carries no entry in
-//     `tokens` / `depths` (only in `parents` and `child_maps` so the
-//     accept walk can start there).
+//     `tokens` / `depths` / `branch_ids` (only in `parents` and
+//     `child_maps` so the accept walk can start there).
 //   * Indices 1..n_nodes are the real tree nodes:
 //       tokens[i-1]      = the draft token at index i
 //       parents[i]       = the parent index (0 = root, j = node j)
 //       depths[i-1]      = 1-based depth from the root (depth 1 = direct
 //                          child of root; depth 2 = grandchild; ...)
+//       branch_ids[i-1]  = which branch this node belongs to (= which
+//                          seq_id the spec-simple driver should tag it
+//                          with). 0 = main path; 1..n_branches-1 = alt
+//                          branches. Each alt branch is a single LEAF
+//                          hanging off the main chain (no chained
+//                          extensions in the current Stage C tree shape).
 //       child_maps[i]    = token → child-node-index map at node i (used by
 //                          the accept walk for O(1) "does target's argmax
 //                          match a child of `current`?" lookup)
@@ -37,17 +55,25 @@ struct common_speculative_params {
 //   * `visibility` is a row-major `(n_nodes + 1)²` byte matrix:
 //       visibility[i*(n+1) + j] = 1 iff node i is allowed to attend to
 //                                       node j (parent-pointer reachability)
-//     This is what `llama_set_tree_mask` consumes verbatim.
-//   * `main_path_len` is the length of the chain seed (= number of nodes on
-//     the top-1 chain from depth 1). Useful for telemetry; not load-bearing.
+//     This is consumed verbatim by `llama_set_tree_mask` (Stage A's
+//     fallback path; UNUSED by the shipped multi-seq Stage B/C code).
+//   * `main_path_len` is the length of the chain seed (= number of nodes
+//     on the top-1 chain from depth 1).
+//   * `n_branches` is the number of distinct seq_ids in `branch_ids`
+//     (>= 1; 1 = chain-only, no alts). Used by spec-simple to size the
+//     `seq_cp(0 -> b)` prefix-broadcast loop and the cleanup `seq_rm(b)`
+//     loop. Capped by the context's `n_seq_max` (which the driver bumps
+//     to at least `n_branches` before context creation).
 struct common_speculative_tree {
     std::vector<llama_token> tokens;
     std::vector<int>         parents;
     std::vector<int>         depths;
+    std::vector<int>         branch_ids;  // [n_nodes] — Stage C addition
     std::vector<std::unordered_map<llama_token, int>> child_maps;
     std::vector<uint8_t>     visibility;
     int                      n_nodes       = 0;
     int                      main_path_len = 0;
+    int                      n_branches    = 1;  // Stage C addition
 };
 
 // Initialise a speculative decoder using the AUTO algorithm picker:

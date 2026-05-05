@@ -613,55 +613,86 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return tree;
         }
 
-        build_medusa_k2_tree(draft_topk, block_size, topk_K, tree);
+        // Resolve the tree budget. budget == 0 (default when --dflash-tree
+        // is set without --dflash-tree-budget B) → Stage B default (chain
+        // seed + 1 alt at depth 1 = block_size nodes).
+        const int budget = (params.dflash_tree_budget > 0)
+                         ? params.dflash_tree_budget
+                         : block_size;
+        build_ddtree_tree(draft_topk, block_size, topk_K, budget, tree);
 
         crop_kv_cache(ctx_dft, /*pos_min=*/0);
         return tree;
     }
 
 private:
-    // Stage B tree shape: chain seed (block_size - 1 main-path nodes,
-    // top-1 at draft positions [1..block_size-1]) + 1 alternate at depth 1
-    // (top-2 at draft position 1; only added when K >= 2 and the alt token
-    // is distinct from the main-path top-1).
+    // Stage C tree shape: chain seed (top-1 at depths 1..bs-1, capped at
+    // budget) + uniform round-robin sibling expansion (rank 1, 2, ...,
+    // K-1 across all depths) until budget is exhausted. Each alt is a
+    // LEAF hanging off the main chain at its depth (parent = main path
+    // node at depth-1) and gets a unique branch_id starting at 1; the
+    // main chain is branch_id 0.
     //
-    // Node indexing (0 = root):
-    //   0           : implicit root (id_last); parents[0] = -1.
-    //   1..bs-1     : main path. parents[i] = i-1, depths[i-1] = i.
-    //   bs (if K>=2): alternate at depth 1. parents[bs] = 0.
+    // Indexing (0 = implicit root):
+    //   0                  : root (id_last); parents[0] = -1; branch=N/A.
+    //   1..main_path_len   : main chain. parents[i] = i-1, depth = i,
+    //                        branch_id = 0.
+    //   main_path_len+1..  : alt leaves. Each alt at depth d has
+    //                        parent = main path's depth-(d-1) node
+    //                        = index d-1; branch_id = 1, 2, ...
     //
-    // Total tree size including root = block_size + (alt added ? 1 : 0).
-    // For block_size=16 with K>=2: 17 nodes, visibility = 17×17 = 289 bytes.
+    // Round-robin order is rank-major then depth-major: rank 1 across all
+    // depths first, then rank 2 across all depths, etc. Same effective
+    // shape as buun's "uniform K alts per depth" fallback, just expressed
+    // as a sequence of single-leaf insertions so we can stop exactly at
+    // budget instead of always growing in K-1 chunks.
     //
-    // Visibility: each non-root node inherits its parent's row and adds
-    // self. Root sees only itself. Standard parent-pointer reachability.
-    static void build_medusa_k2_tree(const int32_t * draft_topk,
-                                     int             block_size,
-                                     uint32_t        topk_K,
-                                     common_speculative_tree & tree) {
+    // For Stage B equivalence (budget = block_size = 16 on the b16
+    // checkpoint): chain seed of 15 nodes + 1 alt at depth 1 = 16 nodes,
+    // n_branches = 2. Identical to the Stage B builder this replaces.
+    //
+    // Visibility matrix is computed for compatibility with Stage A's
+    // tree-mask path even though the shipped multi-seq Stage B/C path
+    // doesn't use it.
+    static void build_ddtree_tree(const int32_t * draft_topk,
+                                  int             block_size,
+                                  uint32_t        topk_K,
+                                  int             budget,
+                                  common_speculative_tree & tree) {
         tree.tokens.clear();
         tree.parents.clear();
         tree.depths.clear();
+        tree.branch_ids.clear();
         tree.child_maps.clear();
         tree.visibility.clear();
         tree.n_nodes       = 0;
         tree.main_path_len = 0;
+        tree.n_branches    = 1; // main only; bumped as alts get added
+
+        if (budget <= 0 || block_size <= 1) {
+            // Degenerate: return the empty tree (just the implicit root).
+            tree.parents.push_back(-1);
+            tree.child_maps.emplace_back();
+            tree.visibility.assign(1, 1); // root sees itself
+            return;
+        }
 
         // Root.
         tree.parents.push_back(-1);
         tree.child_maps.emplace_back();
 
-        // Chain seed: top-1 at each intra-block position 1..block_size-1.
-        // Position 0 is id_last itself (the anchor); positions 1..bs-1 are
-        // the per-step draft predictions.
+        // ----- chain seed (main path) -----
+        // top-1 at each draft position 1..bs-1, capped at budget.
+        const int chain_target = std::min(block_size - 1, budget);
         {
             int parent = 0;
-            for (int d = 1; d < block_size; ++d) {
+            for (int d = 1; d <= chain_target; ++d) {
                 const llama_token tok = (llama_token) draft_topk[(size_t) d * topk_K + 0];
                 const int idx = tree.n_nodes + 1;
                 tree.tokens.push_back(tok);
                 tree.parents.push_back(parent);
                 tree.depths.push_back(d);
+                tree.branch_ids.push_back(0); // main branch
                 tree.child_maps.emplace_back();
                 tree.child_maps[parent][tok] = idx;
                 tree.n_nodes++;
@@ -670,28 +701,42 @@ private:
             tree.main_path_len = tree.n_nodes;
         }
 
-        // One alternate at depth 1 (top-2 at draft position 1).
-        // Only added when K >= 2 AND the alt token is distinct from the
-        // main-path top-1 at the same depth (else the child_maps insert
-        // would collide and the accept walk wouldn't be able to
-        // distinguish).
-        if (topk_K >= 2 && block_size >= 2) {
-            const int d = 1;
-            const int alt_parent = 0; // root (sibling of main_d1)
-            const llama_token alt_tok = (llama_token) draft_topk[(size_t) d * topk_K + 1];
-            if (alt_tok >= 0 && tree.child_maps[alt_parent].count(alt_tok) == 0) {
-                const int idx = tree.n_nodes + 1;
-                tree.tokens.push_back(alt_tok);
-                tree.parents.push_back(alt_parent);
-                tree.depths.push_back(d);
-                tree.child_maps.emplace_back();
-                tree.child_maps[alt_parent][alt_tok] = idx;
-                tree.n_nodes++;
+        // ----- alt leaves (Stage C uniform expansion) -----
+        // Round-robin add ranks 1..K-1 across depths 1..main_path_len
+        // until budget is reached. Each alt is a leaf, parent =
+        // main_path[d-1] (= node index d-1 in our 0=root indexing).
+        //
+        // Skip alts whose token would collide with an existing child of
+        // the same parent (== that parent already has this token in the
+        // tree at this depth — happens when top-K has duplicates or when
+        // top-rank > 0 happens to equal top-0). The check keeps the
+        // child_maps insert one-to-one so the accept walk can lookup the
+        // unique child by token.
+        if (topk_K >= 2 && tree.n_nodes < budget) {
+            int next_branch = 1;
+            for (uint32_t rank = 1; rank < topk_K && tree.n_nodes < budget; ++rank) {
+                for (int d = 1; d <= chain_target && tree.n_nodes < budget; ++d) {
+                    const int alt_parent_idx = d - 1; // root or main_path[d-1]
+                    const llama_token alt_tok =
+                        (llama_token) draft_topk[(size_t) d * topk_K + rank];
+                    if (alt_tok < 0) continue;
+                    if (tree.child_maps[alt_parent_idx].count(alt_tok)) continue;
+
+                    const int idx = tree.n_nodes + 1;
+                    tree.tokens.push_back(alt_tok);
+                    tree.parents.push_back(alt_parent_idx);
+                    tree.depths.push_back(d);
+                    tree.branch_ids.push_back(next_branch);
+                    tree.child_maps.emplace_back();
+                    tree.child_maps[alt_parent_idx][alt_tok] = idx;
+                    tree.n_nodes++;
+                    next_branch++;
+                }
             }
+            tree.n_branches = next_branch;
         }
 
-        // Visibility matrix [(n_nodes+1) × (n_nodes+1)] row-major.
-        // Each non-root row inherits its parent's row + sets self.
+        // ----- visibility matrix (Stage A tree-mask compatibility) -----
         const int n = tree.n_nodes + 1;
         tree.visibility.assign((size_t) n * n, 0);
         tree.visibility[0 * n + 0] = 1; // root sees itself
