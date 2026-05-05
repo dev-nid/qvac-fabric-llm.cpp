@@ -124,6 +124,26 @@ struct llama_context {
     // dflash.ctx_capacity. Returns true on success.
     bool dflash_slide_left(int64_t n_drop);
 
+    // -----------------------------------------------------------------------
+    // DDTree (DFlash Phase 2): tree-shaped attention mask
+    // -----------------------------------------------------------------------
+    // Stage A scope: enable callers to install a custom [n × n] visibility
+    // matrix that overrides the seq-id-based attention mask for the next
+    // verification decode. The override is performed in
+    // `llm_graph_input_attn_kv::set_input` AFTER the standard mask has been
+    // written, so prefix tokens already in the KV cache get the regular
+    // causal/seq-id treatment and only the new tokens (the tree itself)
+    // are patched. When no tree mask is installed (the default), the
+    // override block is a no-op and behaviour is bit-identical to the
+    // pre-Phase-2 code.
+    //
+    // The actual tree builder, the tree-aware accept walk, and the
+    // per-branch KV rollback live in `common/speculative.cpp` and ship in
+    // Stages B and C — see `logs/core_architecture/09_lucebox_reference.md`
+    // item B Phase 2 notes.
+    void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
+    void clear_tree_mask();
+
     void attach_threadpool(
             ggml_threadpool_t threadpool,
             ggml_threadpool_t threadpool_batch);
@@ -339,6 +359,13 @@ private:
     // by llm_graph_input_dflash via the llama_dflash * forwarded
     // through llm_graph_params.
     llama_dflash dflash;
+
+    // DDTree custom attention mask. Inactive (active==false) by default;
+    // `set_tree_mask` flips active and copies the visibility matrix.
+    // `graph_params()` forwards `tree_mask.active ? &tree_mask : nullptr`
+    // into `llm_graph_params.tree_mask`, which the attention input class
+    // picks up at construction. See `set_tree_mask` doc above.
+    llama_tree_mask tree_mask;
 
     // ggml contexts + backend buffers backing the DFlash K/V side store.
     // One context per buffer-type (== one per device when the model is

@@ -1150,6 +1150,41 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
     return 0;
 }
 
+void llama_context::set_tree_mask(const uint8_t * visibility, int n_tree_tokens) {
+    GGML_ASSERT(visibility != nullptr);
+    GGML_ASSERT(n_tree_tokens > 0);
+
+    tree_mask.active        = true;
+    tree_mask.n_tree_tokens = n_tree_tokens;
+    const size_t n2         = (size_t) n_tree_tokens * (size_t) n_tree_tokens;
+    tree_mask.visibility.assign(visibility, visibility + n2);
+
+    // Toggling the tree-mask pointer flips llm_graph_params.tree_mask
+    // between nullptr and &tree_mask, so any cached graph built under the
+    // previous setting must be invalidated. (`allow_reuse` checks
+    // `tree_mask` pointer equality; nullptr <-> &tree_mask is a hard
+    // invalidation, but two consecutive activations both pass &tree_mask
+    // and would reuse a stale cached visibility — so we reset gf_res_prev
+    // unconditionally on every activation toggle.)
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+}
+
+void llama_context::clear_tree_mask() {
+    if (!tree_mask.active && tree_mask.visibility.empty()) {
+        return;
+    }
+
+    tree_mask.active        = false;
+    tree_mask.n_tree_tokens = 0;
+    tree_mask.visibility.clear();
+
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+}
+
 void llama_context::attach_threadpool(
            ggml_threadpool_t threadpool,
            ggml_threadpool_t threadpool_batch) {
@@ -2101,6 +2136,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.dflash      =*/ &dflash,
+        /*.tree_mask   =*/ tree_mask.active ? &tree_mask : nullptr,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3349,6 +3385,16 @@ int32_t llama_dflash_extend(llama_context * ctx,
 
 void llama_dflash_reset_ctx_kv(llama_context * ctx) {
     ctx->dflash_reset_ctx_kv();
+}
+
+void llama_set_tree_mask(llama_context * ctx,
+                         const uint8_t * visibility,
+                         int             n_tree_tokens) {
+    ctx->set_tree_mask(visibility, n_tree_tokens);
+}
+
+void llama_clear_tree_mask(llama_context * ctx) {
+    ctx->clear_tree_mask();
 }
 
 // llama adapter API

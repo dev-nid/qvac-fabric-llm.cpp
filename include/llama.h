@@ -716,6 +716,39 @@ extern "C" {
     // backing buffer; subsequent llama_dflash_extend() calls reuse it.
     LLAMA_API void llama_dflash_reset_ctx_kv(struct llama_context * ctx);
 
+    // -----------------------------------------------------------------------
+    // DDTree (DFlash Phase 2): tree-shaped attention mask
+    // -----------------------------------------------------------------------
+    // Install a tree-shaped attention mask for the next decode(s). Intended
+    // for tree-verify speculative decoding (DFlash Phase 2 / DDTree per
+    // Ringel & Romano, arXiv:2604.12989, 2026): a single target forward
+    // verifies up to N tree nodes whose pairwise visibility is given by the
+    // [n_tree_tokens × n_tree_tokens] row-major boolean matrix
+    // `visibility[i*n + j] = 1` iff tree node i is allowed to attend to
+    // tree node j (parent-pointer reachability).
+    //
+    // While installed, the standard seq-id-based attention mask is computed
+    // as usual (so prefix tokens already in the KV cache get the regular
+    // causal/seq-id treatment), then the [n × n] block corresponding to the
+    // current ubatch's tokens is overwritten with the visibility matrix.
+    // Caller invariants:
+    //   * The next decode's batch must contain exactly `n_tree_tokens`
+    //     tokens, all in `seq_id = {0}`, with positions equal to
+    //     `n_past - 1 + tree.depths[i]`.
+    //   * `visibility` is row-major `n_tree_tokens²` with values 0 or 1.
+    //
+    // Stage A scope: this API installs the mask. The tree builder, the
+    // tree-aware accept walk, and the per-branch KV rollback live in
+    // `common/speculative.cpp` and ship in later stages.
+    LLAMA_API void llama_set_tree_mask(
+            struct llama_context * ctx,
+            const uint8_t        * visibility,
+            int                    n_tree_tokens);
+
+    // Clear the tree mask (no-op if no mask is active). After this call
+    // subsequent decodes use the standard seq-id-based attention mask.
+    LLAMA_API void llama_clear_tree_mask(struct llama_context * ctx);
+
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
 

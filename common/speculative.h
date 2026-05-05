@@ -3,6 +3,10 @@
 #include "llama.h"
 #include "common.h"
 
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
 struct common_speculative;
 
 struct common_speculative_params {
@@ -10,6 +14,40 @@ struct common_speculative_params {
     int n_reuse = 256;
 
     float p_min = 0.75f; // min probability required to accept a token in the draft (DRAFT only)
+};
+
+// DDTree (DFlash Phase 2 Stage B): tree of likely continuations the DFlash
+// drafter emits in a single forward pass, used to feed a tree-shaped target
+// verify batch (one decode = up to L+1 accepted tokens for L tree depth).
+//
+// Indexing convention (mirrors buun fork's representation; written from
+// scratch):
+//   * Index 0 is the implicit root (id_last). It carries no entry in
+//     `tokens` / `depths` (only in `parents` and `child_maps` so the
+//     accept walk can start there).
+//   * Indices 1..n_nodes are the real tree nodes:
+//       tokens[i-1]      = the draft token at index i
+//       parents[i]       = the parent index (0 = root, j = node j)
+//       depths[i-1]      = 1-based depth from the root (depth 1 = direct
+//                          child of root; depth 2 = grandchild; ...)
+//       child_maps[i]    = token → child-node-index map at node i (used by
+//                          the accept walk for O(1) "does target's argmax
+//                          match a child of `current`?" lookup)
+//   * `parents[0]` is set to -1 by construction.
+//   * `visibility` is a row-major `(n_nodes + 1)²` byte matrix:
+//       visibility[i*(n+1) + j] = 1 iff node i is allowed to attend to
+//                                       node j (parent-pointer reachability)
+//     This is what `llama_set_tree_mask` consumes verbatim.
+//   * `main_path_len` is the length of the chain seed (= number of nodes on
+//     the top-1 chain from depth 1). Useful for telemetry; not load-bearing.
+struct common_speculative_tree {
+    std::vector<llama_token> tokens;
+    std::vector<int>         parents;
+    std::vector<int>         depths;
+    std::vector<std::unordered_map<llama_token, int>> child_maps;
+    std::vector<uint8_t>     visibility;
+    int                      n_nodes       = 0;
+    int                      main_path_len = 0;
 };
 
 // Initialise a speculative decoder using the AUTO algorithm picker:
@@ -76,6 +114,29 @@ enum common_speculative_type common_speculative_get_type(
 //             then prepend `id_last` and decode all `block_size` positions
 //             on the target.
 llama_tokens common_speculative_gen_draft(
+               struct common_speculative * spec,
+        struct common_speculative_params   params,
+                      const llama_tokens & prompt,
+                             llama_token   id_last);
+
+// DDTree (DFlash Phase 2 Stage B): tree-shaped variant of
+// common_speculative_gen_draft. Runs the draft once (same compute as
+// gen_draft, same K/V side store extend) and returns a tree of candidate
+// continuations built from the draft's per-position top-K. The caller is
+// responsible for installing the resulting visibility matrix via
+// `llama_set_tree_mask` before the verify decode and clearing it after,
+// for the tree-walk accept logic, and for the post-verify KV rollback
+// (drop verify slots + re-decode the accepted chain in causal mode).
+//
+// Returns an empty tree (n_nodes == 0) on any failure path or for
+// non-DFlash speculative states. The caller should fall back to
+// chain-mode in that case.
+//
+// Stage B scope: tree shape is "main path (top-1 at each depth) + one
+// alternate at depth 1 (top-2 at draft position 1)" — total n_nodes =
+// block_size, total visibility size = (block_size + 1)² bytes. Stage C
+// will generalise the shape via a budget parameter.
+common_speculative_tree common_speculative_gen_draft_tree(
                struct common_speculative * spec,
         struct common_speculative_params   params,
                       const llama_tokens & prompt,

@@ -177,6 +177,40 @@ struct llama_dflash {
     int64_t ctx_pos_base = 0;
 };
 
+// DDTree (DFlash Phase 2): custom attention mask for tree-shaped verification
+// batches. Stage A scope = the libllama plumbing only; the tree builder, the
+// tree-aware accept walk, and the per-branch KV rollback all live in
+// `common/speculative.cpp` and ship in later stages (B, C — see
+// `logs/core_architecture/09_lucebox_reference.md` item B).
+//
+// When `active == false` (the default and the only state Stage A constructs),
+// `llm_graph_input_attn_kv::set_input` runs the standard seq-id based mask
+// path unchanged — i.e. a no-op for every existing graph build.
+//
+// When `active == true`, the standard mask runs first (so the prefix tokens
+// already in the KV cache get the regular causal/seq-id treatment), then
+// the top-left `n_tree_tokens × n_tree_tokens` block of the freshly written
+// mask is overwritten with `visibility[i*n+j] ? 0.0f : -INFINITY`. This
+// pattern (override the tree block AFTER the standard mask) was lifted as a
+// design idea from `alternate/buun-llama-cpp/src/llama-graph.cpp:455-468`;
+// no code is copied. Caller invariants:
+//   * All `n_tree_tokens` tree nodes are submitted in a single ubatch with
+//     `seq_id = {0}`, positions = `n_past - 1 + tree.depths[i]`.
+//   * `visibility` is row-major `n_tree_tokens²`; `visibility[i*n+j]` means
+//     "tree node i is allowed to attend to tree node j" (parent-pointer
+//     reachability).
+//   * `n_tree_tokens == ubatch->n_tokens` is asserted in `set_input`.
+//
+// The struct lives on `llama_context` (one per context); the C API
+// (`llama_set_tree_mask` / `llama_clear_tree_mask`) is the only way to
+// toggle `active`. Memory ownership: `visibility` owns its bytes; the
+// caller's pointer is copied at `set_tree_mask` time.
+struct llama_tree_mask {
+    bool                 active        = false;
+    int                  n_tree_tokens = 0;
+    std::vector<uint8_t> visibility;
+};
+
 struct llm_graph_params;
 
 //
@@ -405,10 +439,12 @@ public:
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_context * mctx) :
+            const llama_kv_cache_context * mctx,
+            const llama_tree_mask * tree_mask = nullptr) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        tree_mask(tree_mask) {
     }
     ~llm_graph_input_attn_kv() = default;
 
@@ -434,6 +470,14 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+
+    // DDTree: when non-null AND `tree_mask->active`, set_input overwrites
+    // the [n_tree_tokens × n_tree_tokens] block of the freshly written
+    // attention mask with `visibility[i*n+j] ? 0.0f : -INFINITY`. Pointer
+    // borrowed from llama_context::tree_mask (which owns the storage); the
+    // pointer's address is stable across decode() calls. nullptr (the
+    // default) means "no override — Stage A no-op".
+    const llama_tree_mask * tree_mask = nullptr;
 };
 
 class llm_graph_input_attn_kv_iswa : public llm_graph_input_i {
@@ -545,7 +589,8 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_dflash           * dflash; // DFlash drafter state (capture, K/V side store)
+    const llama_dflash           * dflash;    // DFlash drafter state (capture, K/V side store)
+    const llama_tree_mask        * tree_mask; // DDTree custom attention mask (nullptr = no override)
 
     uint32_t n_outputs;
 
@@ -595,6 +640,7 @@ struct llm_graph_params {
             loras     == other.loras &&
             cross     == other.cross &&
             dflash    == other.dflash &&
+            tree_mask == other.tree_mask &&
             n_outputs == other.n_outputs;
     }
 };
@@ -729,7 +775,8 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_dflash           * dflash; // DFlash drafter context
+    const llama_dflash           * dflash;    // DFlash drafter context
+    const llama_tree_mask        * tree_mask; // DDTree custom attention mask (nullptr = no override)
 
     const llm_graph_cb & cb_func;
 

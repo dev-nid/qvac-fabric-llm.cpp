@@ -255,6 +255,15 @@ struct common_params_speculative {
                                     // to pre-DDTree). >=2 = tree mode (ggml_argsort_top_k); upstream
                                     // common_speculative_state_dflash uses the extras to build K parallel
                                     // verify chains for tree-style verify. See llama_context_params::dflash_topk.
+    bool    dflash_tree    = false; // DFlash drafter: enable DDTree Phase 2 Stage B (tree-shaped verify).
+                                    // When true, the spec_simple driver calls common_speculative_gen_draft_tree
+                                    // instead of common_speculative_gen_draft, installs a tree mask via
+                                    // llama_set_tree_mask before the verify decode, and uses a tree-walk
+                                    // accept + drop+re-decode KV rollback. Requires --dflash-topk >= 2
+                                    // (auto-bumped to 2 if left at the default 1). Strong-correctness
+                                    // (byte-exact greedy match against `llama-cli`) is preserved by
+                                    // construction at any tree shape — the target verifies each branch
+                                    // independently and the longest accepted chain wins.
     float   p_split        =  0.1f; // speculative decoding split probability
     float   p_min          = 0.75f; // minimum speculative decoding probability (greedy)
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements

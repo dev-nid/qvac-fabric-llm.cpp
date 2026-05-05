@@ -44,6 +44,19 @@ struct common_speculative_state {
             const common_speculative_params & params,
             const llama_tokens &              prompt_tgt,
             llama_token                       id_last) = 0;
+
+    // DDTree (DFlash Phase 2 Stage B): tree-shaped variant of gen_draft.
+    // Default impl returns an empty tree (= "tree mode unsupported on this
+    // speculative state"). Overridden by COMMON_SPECULATIVE_TYPE_DFLASH.
+    virtual common_speculative_tree gen_draft_tree(
+            const common_speculative_params & params,
+            const llama_tokens &              prompt_tgt,
+            llama_token                       id_last) {
+        (void) params;
+        (void) prompt_tgt;
+        (void) id_last;
+        return {};
+    }
 };
 
 // =============================================================================
@@ -533,7 +546,164 @@ struct common_speculative_state_dflash : public common_speculative_state {
         return result;
     }
 
+    // DDTree Phase 2 Stage B: produce a tree of likely continuations
+    // built from the draft's per-position top-K. Same draft compute as
+    // gen_draft (one DFlash forward pass over [id_last, MASK*15]); only
+    // the post-processing differs (tree builder consumes draft_topk
+    // directly, doesn't flatten to a chain).
+    common_speculative_tree gen_draft_tree(
+            const common_speculative_params & params,
+            const llama_tokens &              prompt_tgt,
+            llama_token                       id_last) override {
+        common_speculative_tree tree;
+        if (target_layer_ids.empty()) {
+            LOG_ERR("%s: draft has no target_layer_ids — cannot run DFlash speculation\n", __func__);
+            return tree;
+        }
+
+        const int block_size = resolve_block_size(params.n_draft);
+        if (block_size <= 1) {
+            return tree;
+        }
+
+        // Bring the K/V side store up to date with whatever was committed
+        // since the previous gen_draft / gen_draft_tree call. Mirrors the
+        // first half of gen_draft (above) verbatim — same invariants, same
+        // error reporting.
+        const int64_t n_committed_after = (int64_t) prompt_tgt.size();
+        const int64_t n_to_extend       = n_committed_after - n_committed_total;
+        if (n_to_extend < 0) {
+            LOG_ERR("%s: prompt_tgt shrank below n_committed_total (%lld < %lld)\n",
+                    __func__, (long long) n_committed_after, (long long) n_committed_total);
+            return tree;
+        }
+        if (n_to_extend > 0) {
+            if (!extend_side_store(n_to_extend, /*pos_start=*/n_committed_total)) {
+                return tree;
+            }
+            n_committed_total = n_committed_after;
+        }
+
+        // Run the draft once on [id_last, MASK, ..., MASK].
+        crop_kv_cache(ctx_dft, /*pos_min=*/0);
+
+        const llama_pos pos_block_start = (llama_pos) n_committed_total;
+        common_batch_clear(batch_dft);
+        for (int i = 0; i < block_size; ++i) {
+            const llama_token tok = (i == 0) ? id_last : mask_token_id;
+            common_batch_add(batch_dft, tok, pos_block_start + i, { 0 }, /*logits=*/true);
+        }
+        if (llama_decode(ctx_dft, batch_dft) != 0) {
+            LOG_ERR("%s: draft llama_decode failed\n", __func__);
+            return tree;
+        }
+
+        // Read the top-K candidates per draft position. K must be >= 2 for
+        // any tree shape with alternates to be buildable; if the caller
+        // forgot to set --dflash-topk we still return a degenerate
+        // chain-only tree (which the spec-simple branch will then verify
+        // exactly like chain mode, just with the tree-mask plumbing
+        // exercised).
+        int64_t  n_topk_outputs = 0;
+        uint32_t topk_K         = 0;
+        const int32_t * draft_topk = llama_get_dflash_draft_topk(ctx_dft, &n_topk_outputs, &topk_K);
+        if (draft_topk == nullptr || n_topk_outputs < block_size || topk_K < 1) {
+            LOG_ERR("%s: draft top-K buffer missing or too small (got n=%lld K=%u, need n>=%d K>=1)\n",
+                    __func__, (long long) n_topk_outputs, topk_K, block_size);
+            return tree;
+        }
+
+        build_medusa_k2_tree(draft_topk, block_size, topk_K, tree);
+
+        crop_kv_cache(ctx_dft, /*pos_min=*/0);
+        return tree;
+    }
+
 private:
+    // Stage B tree shape: chain seed (block_size - 1 main-path nodes,
+    // top-1 at draft positions [1..block_size-1]) + 1 alternate at depth 1
+    // (top-2 at draft position 1; only added when K >= 2 and the alt token
+    // is distinct from the main-path top-1).
+    //
+    // Node indexing (0 = root):
+    //   0           : implicit root (id_last); parents[0] = -1.
+    //   1..bs-1     : main path. parents[i] = i-1, depths[i-1] = i.
+    //   bs (if K>=2): alternate at depth 1. parents[bs] = 0.
+    //
+    // Total tree size including root = block_size + (alt added ? 1 : 0).
+    // For block_size=16 with K>=2: 17 nodes, visibility = 17×17 = 289 bytes.
+    //
+    // Visibility: each non-root node inherits its parent's row and adds
+    // self. Root sees only itself. Standard parent-pointer reachability.
+    static void build_medusa_k2_tree(const int32_t * draft_topk,
+                                     int             block_size,
+                                     uint32_t        topk_K,
+                                     common_speculative_tree & tree) {
+        tree.tokens.clear();
+        tree.parents.clear();
+        tree.depths.clear();
+        tree.child_maps.clear();
+        tree.visibility.clear();
+        tree.n_nodes       = 0;
+        tree.main_path_len = 0;
+
+        // Root.
+        tree.parents.push_back(-1);
+        tree.child_maps.emplace_back();
+
+        // Chain seed: top-1 at each intra-block position 1..block_size-1.
+        // Position 0 is id_last itself (the anchor); positions 1..bs-1 are
+        // the per-step draft predictions.
+        {
+            int parent = 0;
+            for (int d = 1; d < block_size; ++d) {
+                const llama_token tok = (llama_token) draft_topk[(size_t) d * topk_K + 0];
+                const int idx = tree.n_nodes + 1;
+                tree.tokens.push_back(tok);
+                tree.parents.push_back(parent);
+                tree.depths.push_back(d);
+                tree.child_maps.emplace_back();
+                tree.child_maps[parent][tok] = idx;
+                tree.n_nodes++;
+                parent = idx;
+            }
+            tree.main_path_len = tree.n_nodes;
+        }
+
+        // One alternate at depth 1 (top-2 at draft position 1).
+        // Only added when K >= 2 AND the alt token is distinct from the
+        // main-path top-1 at the same depth (else the child_maps insert
+        // would collide and the accept walk wouldn't be able to
+        // distinguish).
+        if (topk_K >= 2 && block_size >= 2) {
+            const int d = 1;
+            const int alt_parent = 0; // root (sibling of main_d1)
+            const llama_token alt_tok = (llama_token) draft_topk[(size_t) d * topk_K + 1];
+            if (alt_tok >= 0 && tree.child_maps[alt_parent].count(alt_tok) == 0) {
+                const int idx = tree.n_nodes + 1;
+                tree.tokens.push_back(alt_tok);
+                tree.parents.push_back(alt_parent);
+                tree.depths.push_back(d);
+                tree.child_maps.emplace_back();
+                tree.child_maps[alt_parent][alt_tok] = idx;
+                tree.n_nodes++;
+            }
+        }
+
+        // Visibility matrix [(n_nodes+1) × (n_nodes+1)] row-major.
+        // Each non-root row inherits its parent's row + sets self.
+        const int n = tree.n_nodes + 1;
+        tree.visibility.assign((size_t) n * n, 0);
+        tree.visibility[0 * n + 0] = 1; // root sees itself
+        for (int i = 1; i < n; ++i) {
+            const int parent = tree.parents[i];
+            for (int j = 0; j < i; ++j) {
+                tree.visibility[(size_t) i * n + j] = tree.visibility[(size_t) parent * n + j];
+            }
+            tree.visibility[(size_t) i * n + i] = 1;
+        }
+    }
+
     // Clamp the user-requested block_size against the draft's trained value.
     // Per paper §5.4.4 we refuse `inference_block_size > trained_block_size`
     // (the un-generalisable direction).
@@ -775,4 +945,13 @@ llama_tokens common_speculative_gen_draft(
         llama_token id_last) {
     GGML_ASSERT(spec != nullptr && spec->state != nullptr);
     return spec->state->gen_draft(params, prompt_tgt_main_model, id_last);
+}
+
+common_speculative_tree common_speculative_gen_draft_tree(
+        struct common_speculative * spec,
+        struct common_speculative_params params,
+        const llama_tokens & prompt_tgt_main_model,
+        llama_token id_last) {
+    GGML_ASSERT(spec != nullptr && spec->state != nullptr);
+    return spec->state->gen_draft_tree(params, prompt_tgt_main_model, id_last);
 }

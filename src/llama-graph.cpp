@@ -422,6 +422,47 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+    // DDTree (Phase 2 prep): if a tree mask is active, overwrite the
+    // [n × n] tree block of the freshly written attention mask with
+    // `visibility[i*n+j] ? 0.0f : -INFINITY`. The standard mask path
+    // above already handled the prefix tokens already in the KV cache;
+    // we only patch the new tokens (the tree itself). When tree_mask
+    // is null or inactive, this block is a no-op and Stage A is
+    // bit-identical to the pre-tree-mask behaviour. Design pattern
+    // adapted from buun fork (alternate/buun-llama-cpp/src/llama-
+    // graph.cpp:455-468); no code copied.
+    if (tree_mask && tree_mask->active) {
+        GGML_ASSERT(self_kq_mask != nullptr);
+        GGML_ASSERT(self_k_idxs  != nullptr);
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_k_idxs->buffer));
+
+        // Tree-mask requires a single-stream KV (kv_unified=true); the row
+        // index `i * n_kv` below assumes the n_stream axis is 1, matching
+        // the API contract that all tree nodes are submitted with
+        // seq_id={0} (which collapses to a single stream when n_seqs_unq=1
+        // OR cparams.kv_unified=true). Fail loudly if a future caller
+        // installs a tree mask under multi-stream KV — the wrong rows
+        // would otherwise be silently overwritten.
+        GGML_ASSERT(self_kq_mask->ne[3] == 1 && "tree-mask requires single-stream KV (kv_unified=true)");
+
+        float   * mask_data = (float *)   self_kq_mask->data;
+        int64_t * k_idxs    = (int64_t *) self_k_idxs->data;
+
+        const int     n    = tree_mask->n_tree_tokens;
+        const int64_t n_kv = self_kq_mask->ne[0];
+
+        GGML_ASSERT((int) ubatch->n_tokens == n);
+        GGML_ASSERT((int) tree_mask->visibility.size() == n * n);
+
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                const float val = tree_mask->visibility[i * n + j] ? 0.0f : -INFINITY;
+                mask_data[i * n_kv + k_idxs[j]] = val;
+            }
+        }
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -649,6 +690,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     dflash           (params.dflash),
+    tree_mask        (params.tree_mask),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -1682,9 +1724,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+    const llama_tree_mask * tree_mask = nullptr) {
 
-    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
+    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur, tree_mask);
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
@@ -1708,7 +1751,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, tree_mask);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }

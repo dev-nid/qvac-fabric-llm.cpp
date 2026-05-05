@@ -289,7 +289,30 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
         topk = ggml_argmax(ctx0, logits);
         cb(topk, "result_output_argmax", -1);
     } else {
-        topk = ggml_argsort_top_k(ctx0, logits, (int) K);
+        // ggml_argsort_top_k returns a VIEW with ne[0] shrunk to K but
+        // the underlying argsort buffer's row stride (nb[1]) is still
+        // sized for the full vocab (~607 KiB per row at vocab=151,936).
+        // The flat-byte read-back in llama_context::decode does a single
+        // ggml_backend_tensor_get_async for K * n_outputs * 4 bytes
+        // starting at offset 0 — which would read row 0's argsort tail
+        // (= the lowest-ranked tokens) as if they were rows 1..n-1's
+        // top-K, totally garbage. Wrap with ggml_cont to materialise a
+        // compact [K, n_outputs] tensor whose row stride is K*4 bytes;
+        // a single contiguous read-back then yields the correct top-K
+        // for every output position.
+        //
+        // Cost: one extra GPU memcpy of K*n_outputs int32s per draft
+        // step (~64 bytes for K=2, bs=16; ~256 bytes for K=4). Negligible
+        // vs the ~9.7 MiB float-logits transfer the in-graph top-K
+        // already eliminates.
+        //
+        // (This fix supersedes the pre-existing K>=2 layout bug from
+        // commit 25; the byte-exact test that gated commit 25 passed
+        // for the wrong reason — drafts at K>=2 were silently garbage
+        // and target's argmax always wins, so output text matched even
+        // though acceptance dropped to ~1%. Stage B in commit 29 needs
+        // K>=2 to function, so the fix lands here as a precondition.)
+        topk = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, logits, (int) K));
         cb(topk, "result_output_topk", -1);
     }
     res->t_logits      = nullptr;

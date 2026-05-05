@@ -5,6 +5,7 @@
 #include "log.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -28,6 +29,48 @@ int main(int argc, char ** argv) {
     if (params.speculative.model.path.empty()) {
         LOG_ERR("%s: --model-draft is required\n", __func__);
         return 1;
+    }
+
+    // DDTree Phase 2 Stage B (Option C: multi-seq storage):
+    //
+    // Tree-mode verify uses TWO sequence IDs on ctx_tgt — seq 0 holds
+    // the "main path" branch (= the chain prediction at each draft
+    // depth), seq 1 holds the "alternate" branch (= a single top-2
+    // node at depth 1 for Stage B; up to n_seq_max-1 branches in
+    // future Stage C). The standard seq-id-based attention mask in
+    // `set_input_kq_mask` then handles cross-branch isolation
+    // automatically — no tree-mask override needed for our shape, no
+    // n_ubatch bump needed (works at -ub 1, including the canonical
+    // gate's -ub 1 invocation), no per-iter re-decode needed for
+    // main-path-accepted iters (the verify-decode captures at output
+    // indices [0..L] are mathematically equivalent to chain-mode
+    // captures because the seq-id mask gives main path nodes the
+    // same prefix as a chain decode would).
+    //
+    // We bump `params.n_parallel` (which becomes ctx_tgt's
+    // `n_seq_max`) to at least 2 so the second seq is allocatable.
+    // Chain mode is unaffected (only runs when --dflash-tree is on).
+    if (params.speculative.dflash_tree) {
+        const int min_parallel_tree = 2; // 1 main + 1 alt branch (Stage B)
+        if (params.n_parallel < min_parallel_tree) {
+            LOG_INF("%s: --dflash-tree: bumping n_parallel from %d to %d so ctx_tgt's "
+                    "n_seq_max fits the alt branch's KV slots\n",
+                    __func__, params.n_parallel, min_parallel_tree);
+            params.n_parallel = min_parallel_tree;
+        }
+        // Tree mode requires the unified KV cache (n_stream=1): the
+        // multi-seq attention mask path expects all seqs to share a
+        // single stream so a token in seq 1 can attend (via the
+        // standard seq-id-based mask) to KV slots written under seq 0
+        // (after `seq_cp(0 -> 1)` broadcasts the prefix). Without
+        // kv_unified, n_seq_max > 1 gives each seq its own stream and
+        // cross-seq attention requires an actual data copy.
+        if (!params.kv_unified) {
+            LOG_INF("%s: --dflash-tree: enabling kv_unified (required so seq 0 / seq 1 "
+                    "share a single stream for the multi-seq tree-verify pattern)\n",
+                    __func__);
+            params.kv_unified = true;
+        }
     }
 
     // init llama.cpp
@@ -84,6 +127,12 @@ int main(int argc, char ** argv) {
         // already does the equivalent plumbing.
         params.cache_type_k    = params.speculative.cache_type_k;
         params.cache_type_v    = params.speculative.cache_type_v;
+        // DDTree Phase 2 Stage B: when --dflash-tree is set, the
+        // single-iteration loop below installs a tree mask before the
+        // target's verify decode and uses a tree-walk accept. The mask
+        // installation API is on ctx_tgt (no draft-context plumbing
+        // needed); we surface the flag here as a convenience for the
+        // dflash_topk auto-bump (already applied in arg.cpp).
 
         if (params.speculative.cpuparams.n_threads > 0) {
             params.cpuparams.n_threads = params.speculative.cpuparams.n_threads;
@@ -150,6 +199,18 @@ int main(int argc, char ** argv) {
     int n_predict = 0;
     int n_drafted = 0;
     int n_accept  = 0;
+
+    // DDTree Phase 2 Stage B counters (only meaningful in tree mode):
+    int n_tree_iters     = 0; // # verify iterations that took the tree path
+    int n_tree_alt_taken = 0; // # iterations where the alternate branch was accepted
+    int n_tree_redecoded = 0; // total # tokens re-decoded in causal mode for KV cleanup
+
+    // Per-phase wall-clock timing (microseconds; both modes accumulate).
+    int64_t t_draft_total    = 0;  // gen_draft / gen_draft_tree
+    int64_t t_verify_total   = 0;  // ctx_tgt verify decode
+    int64_t t_accept_total   = 0;  // sample-and-accept (chain or tree-walk)
+    int64_t t_redecode_total = 0;  // tree-mode re-decode + seq_rm rollback
+    int64_t t_iter_total     = 0;  // sum of per-iter wall-clock
 
     // used to determine end of generation
     bool has_eos = false;
@@ -221,54 +282,217 @@ int main(int argc, char ** argv) {
 
     const auto t_dec_start = ggml_time_us();
 
+    const bool use_tree = is_dflash && params.speculative.dflash_tree;
+
     while (true) {
-        // optionally, generate draft tokens that can be appended to the target batch
-        //
-        // this is the most important part of the speculation. the more probable tokens that are provided here
-        // the better the performance will be. in theory, this computation can be performed asynchronously and even
-        // offloaded to a remote device. it doesn't even have to be based on an LLM. instead, it can provide tokens
-        // from a cache or lookup tables.
-        //
-        llama_tokens draft = common_speculative_gen_draft(spec, params_spec, prompt_tgt, id_last);
+        llama_tokens             ids;
+        size_t                   n_drafted_this_iter = 0;
+        common_speculative_tree  tree;
 
-        //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
+        const int64_t t_iter_start = ggml_time_us();
+        if (use_tree) {
+            // ============================================================
+            // DDTree Phase 2 Stage B (Option C: multi-seq storage)
+            // ============================================================
+            // 1. Build a small tree from the draft's per-position top-K
+            //    (Stage B shape: chain seed = bs-1 main-path nodes at
+            //    depths 1..bs-1, plus 1 alternate at depth 1 = total
+            //    bs+1 tree nodes including the implicit root).
+            //
+            // 2. Multi-seq batch construction:
+            //    a. seq_cp(0 -> 1, -1, -1) broadcasts the prefix into
+            //       seq 1 so alt-branch nodes can attend to it via the
+            //       standard seq-id-based mask.
+            //    b. id_last is added with seq_id={0, 1} (visible from
+            //       both branches; carries no draft information of its
+            //       own, just the anchor).
+            //    c. Main-path nodes get seq_id={0}; alt nodes (indices
+            //       > main_path_len) get seq_id={1}. Positions are
+            //       depth-based as before — siblings at the same tree
+            //       depth share a position, but they live in DIFFERENT
+            //       seqs so the standard mask separates them.
+            //
+            // 3. Decode (NO tree mask — the seq-id-based mask handles
+            //    every cross-branch separation correctly because each
+            //    branch's nodes only have its own branch's seq_id).
+            //    At -ub 1 each token gets its own ubatch and the
+            //    standard mask runs per ubatch; at larger -ub the
+            //    same per-row seq-id check runs on the batched mask.
+            //
+            // 4. Tree-walk accept (unchanged from chain-mode behavior:
+            //    walk root -> ... -> commit_n following target argmax).
+            //
+            // 5. Rollback (clean, no re-decode for main-path accepts):
+            //    - For commit_n == 0 (bonus only): seq_rm(0, N0+1, -1)
+            //      drops m1..m15 from seq 0; seq_rm(1, -1, -1) drops
+            //      seq 1 from everywhere (un-tags prefix + id_last,
+            //      drops alt slot entirely). id_last stays in seq 0.
+            //      No re-decode. Captures[0] is id_last's correct
+            //      hidden state.
+            //    - For main-accepted L tokens (commit_n in 1..main_path_len):
+            //      seq_rm(0, N0+L+1, -1) drops m_{L+1}..m_15;
+            //      seq_rm(1, -1, -1) drops seq 1. Cache has prefix +
+            //      id_last + m1..m_L. Captures[0..L] are correct (main
+            //      path's tree-decode prefix is the chain prefix).
+            //      No re-decode.
+            //    - For alt-accepted (commit_n > main_path_len): drop
+            //      everything in seq 0 from N0 onward AND drop seq 1,
+            //      then RE-DECODE [id_last, alt] in seq 0 to populate
+            //      KV + captures correctly. Re-decode is 2 tokens; this
+            //      branch fires only when target's argmax at root is
+            //      the alt token (~5-15% of iters in our prompt grid).
+            const int64_t t_d0 = ggml_time_us();
+            tree = common_speculative_gen_draft_tree(spec, params_spec, prompt_tgt, id_last);
+            t_draft_total += ggml_time_us() - t_d0;
 
-        // always have a token to evaluate from before - id_last
-        common_batch_clear(batch_tgt);
-        common_batch_add  (batch_tgt, id_last, n_past++, { 0 }, true);
+            const int n_past_before = n_past;
+            auto * mem = llama_get_memory(ctx_tgt);
 
-        // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
-        {
-            // do not waste time on small drafts (DRAFT only — DFlash blocks
-            // are always exactly block_size-1 tokens by construction)
-            if (draft.size() < (size_t) n_draft_min) {
-                draft.clear();
+            common_batch_clear(batch_tgt);
+            if (tree.n_nodes == 0) {
+                // Drafter failed (no top-K data or trivial). Decode
+                // just id_last in seq 0 and emit the bonus.
+                common_batch_add(batch_tgt, id_last, n_past_before, { 0 }, /*logits=*/true);
+                const int64_t t_v0 = ggml_time_us();
+                llama_decode(ctx_tgt, batch_tgt);
+                t_verify_total += ggml_time_us() - t_v0;
+
+                const int64_t t_a0 = ggml_time_us();
+                const llama_token bonus = common_sampler_sample(smpl, ctx_tgt, 0);
+                common_sampler_accept(smpl, bonus, true);
+                ids.push_back(bonus);
+                t_accept_total += ggml_time_us() - t_a0;
+
+                n_past = n_past_before + 1;
+            } else {
+                // Multi-seq prefix tagging: copy seq 0 -> seq 1 so the
+                // alt branch's standard attention mask reaches the
+                // shared prefix.
+                llama_memory_seq_cp(mem, 0, 1, -1, -1);
+
+                // id_last is the shared root: visible from both branches.
+                common_batch_add(batch_tgt, id_last, n_past_before, { 0, 1 }, /*logits=*/true);
+
+                // Main path (seq 0) and alt nodes (seq 1).
+                for (int i = 0; i < tree.n_nodes; ++i) {
+                    const llama_seq_id sid = (i < tree.main_path_len) ? 0 : 1;
+                    common_batch_add(batch_tgt, tree.tokens[i],
+                                     n_past_before + tree.depths[i], { sid }, /*logits=*/true);
+                }
+
+                const int64_t t_v0 = ggml_time_us();
+                llama_decode(ctx_tgt, batch_tgt);
+                t_verify_total += ggml_time_us() - t_v0;
+
+                const int64_t t_a0 = ggml_time_us();
+                int current  = 0; // root (= id_last in tree indexing)
+                int commit_n = 0;
+                while (true) {
+                    const llama_token target_token = common_sampler_sample(smpl, ctx_tgt, current);
+                    common_sampler_accept(smpl, target_token, true);
+                    ids.push_back(target_token);
+
+                    auto it = tree.child_maps[current].find(target_token);
+                    if (it == tree.child_maps[current].end()) {
+                        break; // bonus token
+                    }
+                    current  = it->second;
+                    commit_n = current;
+                }
+                t_accept_total += ggml_time_us() - t_a0;
+
+                const int64_t t_r0 = ggml_time_us();
+                const bool alt_accepted = (commit_n > tree.main_path_len);
+
+                if (alt_accepted) {
+                    n_tree_alt_taken++;
+
+                    // Drop everything in seq 0 from N0 onward (id_last
+                    // + main path), and drop seq 1 entirely (alt slots
+                    // become empty; prefix's seq-1 tag is removed).
+                    llama_memory_seq_rm(mem, 0, n_past_before, -1);
+                    llama_memory_seq_rm(mem, 1, -1, -1);
+
+                    // Re-decode [id_last, alt_token] in seq 0 to
+                    // populate KV + captures with correct chain-prefix
+                    // hidden states.
+                    common_batch_clear(batch_tgt);
+                    common_batch_add(batch_tgt, id_last, n_past_before,
+                                     { 0 }, /*logits=*/true);
+                    common_batch_add(batch_tgt, tree.tokens[commit_n - 1],
+                                     n_past_before + 1, { 0 }, /*logits=*/true);
+                    llama_decode(ctx_tgt, batch_tgt);
+                    n_tree_redecoded += 2;
+                    n_past = n_past_before + 2;
+                } else {
+                    // Main-path accept (commit_n == 0 or 1..main_path_len).
+                    // Drop the rejected main-path tail, drop seq 1 entirely.
+                    // No re-decode needed: captures at output indices [0..L]
+                    // are correct (id_last + accepted main).
+                    const int L = (commit_n > 0) ? tree.depths[commit_n - 1] : 0;
+                    llama_memory_seq_rm(mem, 0, n_past_before + 1 + L, -1);
+                    llama_memory_seq_rm(mem, 1, -1, -1);
+                    n_past = n_past_before + 1 + L;
+                }
+                t_redecode_total += ggml_time_us() - t_r0;
             }
 
-            for (size_t i = 0; i < draft.size(); ++i) {
-                common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
+            n_tree_iters++;
+            n_drafted_this_iter = (size_t) tree.n_nodes;
+        } else {
+            // ============================================================
+            // Chain mode (unchanged from pre-Stage-B behaviour)
+            // ============================================================
+            const int64_t t_d0 = ggml_time_us();
+            llama_tokens draft = common_speculative_gen_draft(spec, params_spec, prompt_tgt, id_last);
+            t_draft_total += ggml_time_us() - t_d0;
+
+            //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
+
+            // always have a token to evaluate from before - id_last
+            common_batch_clear(batch_tgt);
+            common_batch_add  (batch_tgt, id_last, n_past++, { 0 }, true);
+
+            // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
+            const int64_t t_v0 = ggml_time_us();
+            {
+                // do not waste time on small drafts (DRAFT only — DFlash blocks
+                // are always exactly block_size-1 tokens by construction)
+                if (draft.size() < (size_t) n_draft_min) {
+                    draft.clear();
+                }
+
+                for (size_t i = 0; i < draft.size(); ++i) {
+                    common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
+                }
+
+                //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
+
+                llama_decode(ctx_tgt, batch_tgt);
             }
+            t_verify_total += ggml_time_us() - t_v0;
 
-            //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
+            // sample from the full target batch and return the accepted tokens based on the target sampler
+            //
+            // for each token to be accepted, the sampler would have to sample that same token
+            // in such cases, instead of decoding the sampled token as we normally do, we simply continue with the
+            // available logits from the batch and sample the next token until we run out of logits or the sampler
+            // disagrees with the draft
+            //
+            const int64_t t_a0 = ggml_time_us();
+            ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+            t_accept_total += ggml_time_us() - t_a0;
 
-            llama_decode(ctx_tgt, batch_tgt);
+            //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
+
+            n_past += ids.size() - 1;
+            n_drafted_this_iter = draft.size();
         }
-
-        // sample from the full target batch and return the accepted tokens based on the target sampler
-        //
-        // for each token to be accepted, the sampler would have to sample that same token
-        // in such cases, instead of decoding the sampled token as we normally do, we simply continue with the
-        // available logits from the batch and sample the next token until we run out of logits or the sampler
-        // disagrees with the draft
-        //
-        const auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
-
-        //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
+        t_iter_total += ggml_time_us() - t_iter_start;
 
         GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
 
-        n_past    += ids.size() - 1;
-        n_drafted += draft.size(); // note: we ignore the discarded small drafts
+        n_drafted += n_drafted_this_iter; // note: we ignore the discarded small drafts
         n_accept  += ids.size() - 1;
 
         // process the accepted tokens and update contexts
@@ -309,11 +533,17 @@ int main(int argc, char ** argv) {
             }
         }
 
-        LOG_DBG("accepted %d/%d draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, (int) draft.size(), id_last);
+        LOG_DBG("accepted %d/%zu draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, n_drafted_this_iter, id_last);
 
         {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
 
+            // In tree mode the per-iteration KV rollback (drop tree + re-decode
+            // accepted chain) already left seq 0 with exactly n_past slots, so
+            // this seq_rm is a no-op there. In chain mode it trims any
+            // unconsumed draft slots beyond n_past. Keeping the call
+            // unconditional matches the pre-Stage-B behaviour for chain mode
+            // and is harmless for tree mode.
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
         }
 
@@ -332,12 +562,37 @@ int main(int argc, char ** argv) {
     LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));
 
     LOG_INF("\n");
-    LOG_INF("draft-type = %s\n", is_dflash ? "dflash" : "draft");
+    LOG_INF("draft-type = %s%s\n", is_dflash ? "dflash" : "draft",
+            use_tree ? " (tree, Stage B)" : "");
     LOG_INF("n_draft   = %d%s\n", n_draft, is_dflash ? " (block_size)" : "");
     LOG_INF("n_predict = %d\n", n_predict);
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", n_drafted > 0 ? 100.0f * n_accept / n_drafted : 0.0f);
+    if (use_tree) {
+        LOG_INF("tree iters       = %d\n", n_tree_iters);
+        LOG_INF("tree alt taken   = %d (%.1f%%)\n", n_tree_alt_taken,
+                n_tree_iters > 0 ? 100.0f * n_tree_alt_taken / n_tree_iters : 0.0f);
+        LOG_INF("tree re-decoded  = %d tokens (%.2f/iter avg)\n", n_tree_redecoded,
+                n_tree_iters > 0 ? (float) n_tree_redecoded / n_tree_iters : 0.0f);
+    }
+    {
+        const int64_t accounted = t_draft_total + t_verify_total + t_accept_total + t_redecode_total;
+        const int64_t other     = t_iter_total > accounted ? t_iter_total - accounted : 0;
+        LOG_INF("\nper-phase timing (loop only):\n");
+        LOG_INF("  draft     = %8.2f ms (%5.1f%%)\n", t_draft_total / 1e3,
+                t_iter_total > 0 ? 100.0 * t_draft_total / t_iter_total : 0.0);
+        LOG_INF("  verify    = %8.2f ms (%5.1f%%)\n", t_verify_total / 1e3,
+                t_iter_total > 0 ? 100.0 * t_verify_total / t_iter_total : 0.0);
+        LOG_INF("  accept    = %8.2f ms (%5.1f%%)\n", t_accept_total / 1e3,
+                t_iter_total > 0 ? 100.0 * t_accept_total / t_iter_total : 0.0);
+        LOG_INF("  re-decode = %8.2f ms (%5.1f%%)  %s\n", t_redecode_total / 1e3,
+                t_iter_total > 0 ? 100.0 * t_redecode_total / t_iter_total : 0.0,
+                use_tree ? "(tree mode only)" : "(chain mode = 0)");
+        LOG_INF("  other     = %8.2f ms (%5.1f%%)\n", other / 1e3,
+                t_iter_total > 0 ? 100.0 * other / t_iter_total : 0.0);
+        LOG_INF("  TOTAL     = %8.2f ms\n", t_iter_total / 1e3);
+    }
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");

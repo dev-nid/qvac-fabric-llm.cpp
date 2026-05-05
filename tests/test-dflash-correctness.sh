@@ -191,7 +191,7 @@ fi
 # (commit 25). The order matters: "default" first so a regression in the
 # common path surfaces immediately, then the variants.
 if [ "$matrix_mode" = "1" ]; then
-    active_configs=("default" "kv-q4" "topk-4" "kv-q4-topk-4")
+    active_configs=("default" "kv-q4" "topk-4" "kv-q4-topk-4" "tree-medusa-k2")
 else
     active_configs=("default")
 fi
@@ -202,10 +202,11 @@ fi
 # zero argv tokens (correct).
 spec_args_for_config() {
     case "$1" in
-        default)        echo "" ;;
-        kv-q4)          echo "-ctkd q4_0 -ctvd q4_0" ;;
-        topk-4)         echo "--dflash-topk 4" ;;
-        kv-q4-topk-4)   echo "-ctkd q4_0 -ctvd q4_0 --dflash-topk 4" ;;
+        default)         echo "" ;;
+        kv-q4)           echo "-ctkd q4_0 -ctvd q4_0" ;;
+        topk-4)          echo "--dflash-topk 4" ;;
+        kv-q4-topk-4)    echo "-ctkd q4_0 -ctvd q4_0 --dflash-topk 4" ;;
+        tree-medusa-k2)  echo "--dflash-tree" ;;
         *)
             printf '\033[31mERROR: unknown config name: %s\033[0m\n' "$1" >&2
             exit 2
