@@ -372,6 +372,17 @@ extern "C" {
                                  // this cap, dflash_extend() slides the side store left by the overflow amount and bumps
                                  // ctx_pos_base, dropping the oldest captures. Default 4096 (matches buun fork's
                                  // GGML_DFLASH_MAX_CTX). Ignored for non-DFlash drafts.
+
+        uint32_t dflash_topk;    // number of top-K candidate tokens the DFlash drafter emits per output position.
+                                 // 1 = chain mode (single argmax token per position; byte-exact-equivalent to the
+                                 // pre-DDTree behavior). >=2 = tree mode (top-K via ggml_argsort_top_k); the
+                                 // upstream speculative driver (common_speculative_state_dflash) uses the extra
+                                 // candidates to build K parallel chains for tree-style verify, recovering ~10-15%
+                                 // additional throughput at K=4 on Qwen3-4B-DFlash. Default 1 for backward-compat.
+                                 // K=1 stays on the cheaper ggml_argmax kernel (single-pass max over the vocab);
+                                 // K>=2 switches to ggml_argsort_top_k which is O(vocab log vocab) but only emits
+                                 // K*n_outputs int32s over PCIe (still ~negligible vs. full-logits read-back).
+                                 // Ignored for non-DFlash drafts.
     };
 
     // model quantization parameters
@@ -656,14 +667,22 @@ extern "C" {
     // a pointer to the in-graph greedy argmax of the lm_head — one int32
     // per output position. Eliminates the per-decode bs * n_vocab * 4 byte
     // PCIe transfer of the full float-logits buffer (~9.7 MiB per block on
-    // Qwen3 vocab=151,936) in favour of a ~`bs * 4` byte int32 read-back
-    // (~64 bytes per block). Returns NULL on a non-DFlash context or if
-    // no decode has run. *n_outputs_out is filled with the number of
-    // positions covered (= n_outputs_all of the most recent decode).
-    // The buffer is owned by the context and is valid until the next decode.
-    LLAMA_API const int32_t * llama_get_dflash_draft_argmax(
+    // Qwen3 vocab=151,936) in favour of a `K * bs * 4` byte int32 read-back
+    // (~64 bytes per block at K=1, ~256 bytes at K=4). Returns NULL on a
+    // non-DFlash context or if no decode has run. The buffer is row-major
+    // [K, n_outputs], i.e. the K candidate token IDs for output position i
+    // live at indices [i*K .. i*K+K-1]. For K=1 this is bit-identical to
+    // the pre-DDTree single-argmax layout. For K>=2 the candidates are
+    // sorted in descending order of logit (topk[i*K+0] is the argmax).
+    //
+    // *n_outputs_out is filled with the number of positions covered
+    // (= n_outputs_all of the most recent decode). *topk_out is filled
+    // with K (the value of cparams.dflash_topk at decode time). The
+    // buffer is owned by the context and is valid until the next decode.
+    LLAMA_API const int32_t * llama_get_dflash_draft_topk(
             struct llama_context * ctx,
-            int64_t *              n_outputs_out);
+            int64_t *              n_outputs_out,
+            uint32_t *             topk_out);
 
     // -----------------------------------------------------------------------
     // DFlash K/V cache reuse (paper §4.1) — call on the *draft* context

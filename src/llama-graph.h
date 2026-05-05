@@ -137,16 +137,25 @@ struct llama_dflash {
     // negligible vs even one async-get's submission overhead.
     std::vector<std::vector<float>> capture_staging;
 
-    // ---------- (a') drafter inline argmax read-back ----------
+    // ---------- (a') drafter inline top-K read-back ----------
     // After each decode on a draft context whose graph emitted
-    // `res->t_logits_argmax` (i.e. LLM_ARCH_DFLASH; see
-    // `src/models/dflash.cpp::llm_build_dflash`), this holds the I32
-    // greedy top-1 token id per output position. Sized to `n_outputs_all`
-    // by the post-decode loop in llama_context::decode(). When
-    // `t_logits_argmax` was nullptr (e.g. on the target context), this
-    // stays empty and `draft_argmax_n_outputs` stays 0.
-    std::vector<int32_t> draft_argmax;
-    int64_t              draft_argmax_n_outputs = 0;
+    // `res->t_dflash_topk` (i.e. LLM_ARCH_DFLASH; see
+    // `src/models/dflash.cpp::llm_build_dflash`), this holds the K
+    // candidate token ids per output position. Row-major
+    // `[draft_topk_n_outputs, draft_topk_K]` int32: position i's
+    // candidates live at indices [i*K .. i*K+K-1], sorted descending by
+    // logit (so [i*K+0] is the argmax). For K=1 (default; chain mode)
+    // the storage shape is [n_outputs] and is bit-identical to the
+    // pre-DDTree single-argmax layout. For K>=2 (tree mode) the
+    // graph emits `ggml_argsort_top_k(lm_head, K)` instead of
+    // `ggml_argmax`. Sized by the post-decode loop in
+    // llama_context::decode(). When `t_dflash_topk` was nullptr
+    // (e.g. on the target context), this stays empty and
+    // `draft_topk_n_outputs` stays 0. `draft_topk_K` mirrors
+    // `cparams.dflash_topk` at decode time.
+    std::vector<int32_t> draft_topk;
+    int64_t              draft_topk_n_outputs = 0;
+    uint32_t             draft_topk_K         = 0;
 
     // ---------- (c) per-layer K/V side store (paper §4.1 reuse) ----------
     // Persistent per-layer K_ctx and V_ctx tensors, allocated as backend
@@ -627,15 +636,17 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
 
-    // DFlash drafter: in-graph argmax of the per-position lm_head logits.
-    // Shape: I32 [n_outputs] (one int32 per draft position == greedy
-    // top-1 token id). When this is non-null, llm_build_dflash sets
-    // t_logits = nullptr — the float-logits read-back is intentionally
-    // skipped to eliminate the bs * n_vocab * 4 byte PCIe transfer per
-    // block. llama_context::decode() copies the int32s into the
-    // dflash.draft_argmax host buffer; the speculative-decoding driver
-    // reads them back via llama_get_dflash_draft_argmax().
-    ggml_tensor * t_logits_argmax = nullptr;
+    // DFlash drafter: in-graph top-K candidate token IDs of the per-position
+    // lm_head logits. Shape:
+    //   K=1 (default): I32 [n_outputs]      (ggml_argmax — single-pass max)
+    //   K>=2:          I32 [K, n_outputs]   (ggml_argsort_top_k — sorted desc)
+    // When this is non-null, llm_build_dflash sets t_logits = nullptr — the
+    // float-logits read-back is intentionally skipped to eliminate the
+    // bs * n_vocab * 4 byte PCIe transfer per block (replaced by a
+    // K * bs * 4 byte int32 read-back). llama_context::decode() copies the
+    // int32s into the dflash.draft_topk host buffer; the speculative-
+    // decoding driver reads them back via llama_get_dflash_draft_topk().
+    ggml_tensor * t_dflash_topk = nullptr;
 
     // DFlash target hidden-state captures, one per entry in
     // dflash->capture_layer_ids (parallel order). Each tensor has shape

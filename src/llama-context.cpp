@@ -132,6 +132,7 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.dflash_max_ctx = params.dflash_max_ctx;
+    cparams.dflash_topk    = params.dflash_topk == 0 ? 1 : params.dflash_topk;
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -841,14 +842,17 @@ const float * llama_context::get_dflash_captured_features(int64_t * n_outputs_ou
     return dflash.captured_features.data();
 }
 
-const int32_t * llama_context::get_dflash_draft_argmax(int64_t * n_outputs_out) const {
+const int32_t * llama_context::get_dflash_draft_topk(int64_t * n_outputs_out, uint32_t * topk_out) const {
     if (n_outputs_out) {
-        *n_outputs_out = dflash.draft_argmax_n_outputs;
+        *n_outputs_out = dflash.draft_topk_n_outputs;
     }
-    if (dflash.draft_argmax.empty()) {
+    if (topk_out) {
+        *topk_out = dflash.draft_topk_K;
+    }
+    if (dflash.draft_topk.empty()) {
         return nullptr;
     }
-    return dflash.draft_argmax.data();
+    return dflash.draft_topk.data();
 }
 
 const llama_dflash * llama_context::get_dflash() const {
@@ -1598,18 +1602,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
         dflash.capture_staging.clear();
     }
 
-    // DFlash drafter: pre-allocate the inline-argmax read-back buffer for
+    // DFlash drafter: pre-allocate the inline top-K read-back buffer for
     // the full batch. The post-decode loop (further down) populates this
-    // when the graph emitted `res->t_logits_argmax` — i.e. on a draft
-    // context built from an LLM_ARCH_DFLASH model. Always reset to 0 here
-    // so a target-side decode doesn't see stale data from a previous
-    // draft-side decode (and vice versa).
+    // when the graph emitted `res->t_dflash_topk` — i.e. on a draft
+    // context built from an LLM_ARCH_DFLASH model. Storage is row-major
+    // [n_outputs_all, K] int32. Always reset to 0 here so a target-side
+    // decode doesn't see stale data from a previous draft-side decode
+    // (and vice versa). The K=1 fast path produces a flat [n_outputs]
+    // layout (semantically [n_outputs, 1]) — bit-identical to the
+    // pre-DDTree single-argmax storage.
     if (model.arch == LLM_ARCH_DFLASH) {
-        dflash.draft_argmax.assign((size_t) n_outputs_all, 0);
-        dflash.draft_argmax_n_outputs = n_outputs_all;
+        const uint32_t K = std::max<uint32_t>(1, cparams.dflash_topk);
+        dflash.draft_topk.assign((size_t) n_outputs_all * K, 0);
+        dflash.draft_topk_n_outputs = n_outputs_all;
+        dflash.draft_topk_K         = K;
     } else {
-        dflash.draft_argmax.clear();
-        dflash.draft_argmax_n_outputs = 0;
+        dflash.draft_topk.clear();
+        dflash.draft_topk_n_outputs = 0;
+        dflash.draft_topk_K         = 0;
     }
 
     int64_t n_outputs_prev = 0;
@@ -1694,21 +1704,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        // DFlash drafter: extract the in-graph argmax. The decoder graph
-        // (llm_build_dflash) emits `t_logits_argmax = ggml_argmax(lm_head)`
-        // and intentionally sets `t_logits = nullptr` so the float
-        // read-back above is skipped — for Qwen3 vocab=151,936 and
-        // bs=16 that saves ~9.7 MiB of PCIe traffic per draft step,
-        // replacing it with this ~64-byte int32 read-back.
-        if (auto * t_argmax = res->t_logits_argmax) {
+        // DFlash drafter: extract the in-graph top-K. The decoder graph
+        // (llm_build_dflash) emits `t_dflash_topk` (= ggml_argmax for K=1
+        // / ggml_argsort_top_k for K>=2) and intentionally sets
+        // `t_logits = nullptr` so the float read-back above is skipped —
+        // for Qwen3 vocab=151,936 and bs=16 that saves ~9.7 MiB of PCIe
+        // traffic per draft step, replacing it with a `K * bs * 4` byte
+        // int32 read-back (~64 bytes at K=1, ~256 at K=4). Storage layout
+        // is row-major [n_outputs, K]: position p's K candidates live at
+        // [p*K .. p*K+K-1].
+        if (auto * t_topk = res->t_dflash_topk) {
             if (n_outputs > 0) {
-                ggml_backend_t backend_argmax = ggml_backend_sched_get_tensor_backend(sched.get(), t_argmax);
-                GGML_ASSERT(backend_argmax != nullptr);
-                GGML_ASSERT(t_argmax->type == GGML_TYPE_I32);
-                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                GGML_ASSERT((size_t)(n_outputs_prev + n_outputs) <= dflash.draft_argmax.size());
-                int32_t * argmax_out = dflash.draft_argmax.data() + n_outputs_prev;
-                ggml_backend_tensor_get_async(backend_argmax, t_argmax, argmax_out, 0, n_outputs * sizeof(int32_t));
+                const uint32_t K = dflash.draft_topk_K;
+                GGML_ASSERT(K >= 1);
+                ggml_backend_t backend_topk = ggml_backend_sched_get_tensor_backend(sched.get(), t_topk);
+                GGML_ASSERT(backend_topk != nullptr);
+                GGML_ASSERT(t_topk->type == GGML_TYPE_I32);
+                GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
+                GGML_ASSERT((size_t)((n_outputs_prev + n_outputs) * K) <= dflash.draft_topk.size());
+                int32_t * topk_out = dflash.draft_topk.data() + (size_t) n_outputs_prev * K;
+                ggml_backend_tensor_get_async(backend_topk, t_topk, topk_out, 0, (size_t) n_outputs * K * sizeof(int32_t));
             }
         }
 
@@ -3127,6 +3142,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.training                    =*/ false,
         /*.dflash_max_ctx              =*/ 4096,
+        /*.dflash_topk                 =*/ 1,
     };
 
     return result;
@@ -3319,9 +3335,9 @@ const float * llama_get_dflash_captured_features(llama_context * ctx, int64_t * 
     return ctx->get_dflash_captured_features(n_outputs_out);
 }
 
-const int32_t * llama_get_dflash_draft_argmax(llama_context * ctx, int64_t * n_outputs_out) {
+const int32_t * llama_get_dflash_draft_topk(llama_context * ctx, int64_t * n_outputs_out, uint32_t * topk_out) {
     ctx->synchronize();
-    return ctx->get_dflash_draft_argmax(n_outputs_out);
+    return ctx->get_dflash_draft_topk(n_outputs_out, topk_out);
 }
 
 int32_t llama_dflash_extend(llama_context * ctx,

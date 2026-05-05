@@ -2903,6 +2903,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_MAX_CTX"));
     add_opt(common_arg(
+        {"--dflash-topk"}, "K",
+        string_format(
+            "DFlash drafter: number of top-K candidate tokens emitted per draft position (default: %d). "
+            "1 = chain mode (cheap argmax kernel; bit-identical to pre-DDTree behavior). "
+            ">=2 = tree mode (ggml_argsort_top_k); the speculative driver uses the extras to build "
+            "K parallel verify chains for tree-style verify (see arXiv:2604.12989, Ringel & Romano). "
+            "Recommended K=4 for ~10-15%% extra throughput on Qwen3-4B-DFlash; K=2 for a smaller "
+            "verify-batch footprint. Strong-correctness (byte-exact greedy match against the "
+            "target alone) is preserved at any K because the target verifies each chain.",
+            params.speculative.dflash_topk),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument(
+                    string_format("invalid --dflash-topk value %d (must be >= 1)", value));
+            }
+            params.speculative.dflash_topk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_TOPK"));
+    add_opt(common_arg(
         {"--draft-min", "--draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.n_min),
         [](common_params & params, int value) {

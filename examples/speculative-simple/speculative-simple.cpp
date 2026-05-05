@@ -75,6 +75,15 @@ int main(int argc, char ** argv) {
         // Forward the speculative.dflash_max_ctx into the top-level params so
         // common_context_params_to_llama() picks it up for the draft context.
         params.dflash_max_ctx  = params.speculative.dflash_max_ctx;
+        params.dflash_topk     = params.speculative.dflash_topk;
+        // Forward the per-draft KV-cache quantisation flags (-ctkd / -ctvd)
+        // so common_context_params_to_llama() applies them to the draft
+        // context (it copies into cparams.type_k / type_v at common.cpp:1306).
+        // Without this, -ctkd / -ctvd are silently ignored on this binary
+        // even though the server path (tools/server/server-context.cpp)
+        // already does the equivalent plumbing.
+        params.cache_type_k    = params.speculative.cache_type_k;
+        params.cache_type_v    = params.speculative.cache_type_v;
 
         if (params.speculative.cpuparams.n_threads > 0) {
             params.cpuparams.n_threads = params.speculative.cpuparams.n_threads;

@@ -258,26 +258,44 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
     ggml_tensor * logits = build_lora_mm(lm_head_use, cur);
     cb(logits, "result_output", -1);
 
-    // In-graph argmax (paper §3 + buun fork's GGML_DFLASH_INLINE_ARGMAX).
-    // The DFlash speculative driver only ever needs the greedy top-1 token
-    // per draft position, never the full vocab distribution. Doing the
-    // argmax inside the graph and reading back I32 [n_outputs] (~64 bytes
-    // per block) instead of F32 [n_outputs * n_vocab] (~9.7 MB per block
-    // for Qwen3 vocab=151,936 and bs=16) eliminates the dominant draft-
-    // side PCIe transfer.
+    // In-graph top-K (extends paper §3 + buun fork's GGML_DFLASH_INLINE_ARGMAX
+    // for DDTree-style tree verify). The DFlash speculative driver needs
+    // either the greedy top-1 token (chain mode, K=1) or the top-K candidates
+    // (DDTree mode, K>=2) per draft position; we never need the full vocab
+    // distribution. Doing the selection inside the graph and reading back
+    // I32 [n_outputs * K] instead of F32 [n_outputs * n_vocab] (~9.7 MB per
+    // block for Qwen3 vocab=151,936 and bs=16) eliminates the dominant
+    // draft-side PCIe transfer.
     //
-    // Note that we deliberately set `res->t_logits = nullptr` so the
+    // K=1 fast path: ggml_argmax — single-pass max over the vocab, the
+    //   cheapest possible kernel. Output shape: I32 [n_outputs]. This is
+    //   the original (paper §3) chain-mode behavior; bit-identical to the
+    //   pre-DDTree implementation when cparams.dflash_topk is 1.
+    //
+    // K>=2 path: ggml_argsort_top_k(logits, K) — argsort + view, O(vocab
+    //   log vocab). Output shape: I32 [K, n_outputs] row-major. Sorted
+    //   descending so [i*K+0] is still the argmax. Used by
+    //   common_speculative_state_dflash to build K parallel verify chains.
+    //
+    // We deliberately set `res->t_logits = nullptr` in either case so the
     // generic logits read-back path in llama_context::decode() skips the
     // float copy entirely — the lm_head matmul still computes, but its
     // output is a graph-internal intermediate (no ggml_set_output) and
-    // ggml-alloc is free to reuse the storage as soon as ggml_argmax is
+    // ggml-alloc is free to reuse the storage as soon as the topk op is
     // done with it.
-    ggml_tensor * argmax = ggml_argmax(ctx0, logits);
-    cb(argmax, "result_output_argmax", -1);
-    res->t_logits        = nullptr;
-    res->t_logits_argmax = argmax;
+    const uint32_t K = cparams.dflash_topk == 0 ? 1 : cparams.dflash_topk;
+    ggml_tensor * topk;
+    if (K == 1) {
+        topk = ggml_argmax(ctx0, logits);
+        cb(topk, "result_output_argmax", -1);
+    } else {
+        topk = ggml_argsort_top_k(ctx0, logits, (int) K);
+        cb(topk, "result_output_topk", -1);
+    }
+    res->t_logits      = nullptr;
+    res->t_dflash_topk = topk;
 
-    ggml_build_forward_expand(gf, argmax);
+    ggml_build_forward_expand(gf, topk);
 }
 
 // =================================================================

@@ -581,6 +581,7 @@ struct server_context_impl {
             // Forward the speculative.dflash_max_ctx into the top-level params so
             // common_context_params_to_llama() picks it up for the draft context.
             params_dft.dflash_max_ctx = params_base.speculative.dflash_max_ctx;
+            params_dft.dflash_topk    = params_base.speculative.dflash_topk;
 
             params_dft.cpuparams.n_threads = params_base.speculative.cpuparams.n_threads;
             params_dft.cpuparams_batch.n_threads = params_base.speculative.cpuparams_batch.n_threads;

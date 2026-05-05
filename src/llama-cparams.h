@@ -43,6 +43,13 @@ struct llama_cparams {
     // llama_context_params::dflash_max_ctx for full semantics.
     uint32_t dflash_max_ctx;
 
+    // Number of top-K candidate tokens the DFlash drafter emits per output
+    // position. 1 = chain mode (cheap argmax kernel; byte-exact-equivalent
+    // to the pre-DDTree behavior). >=2 = tree mode (ggml_argsort_top_k);
+    // consumed by the speculative driver to build K parallel verify chains.
+    // See llama_context_params::dflash_topk for full semantics.
+    uint32_t dflash_topk;
+
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 };

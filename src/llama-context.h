@@ -82,15 +82,18 @@ struct llama_context {
     const float * get_dflash_captured_features(int64_t * n_outputs_out) const;
 
     // After decode on a draft context (LLM_ARCH_DFLASH), returns the
-    // greedy top-1 token id per output position from the in-graph argmax
-    // (= ggml_argmax of lm_head, emitted by llm_build_dflash). Saves the
-    // per-decode `bs * n_vocab * 4` byte float-logits PCIe transfer
-    // (~9.7 MiB per block on Qwen3 vocab=151,936) in favour of a
-    // ~`bs * 4` byte int32 read-back (~64 bytes per block). Returns
-    // nullptr on a non-DFlash context. *n_outputs_out is filled with the
-    // number of positions covered (= n_outputs_all of the most recent
-    // decode).
-    const int32_t * get_dflash_draft_argmax(int64_t * n_outputs_out) const;
+    // K candidate token IDs per output position from the in-graph top-K
+    // (= ggml_argmax for K=1 / ggml_argsort_top_k for K>=2 over lm_head,
+    // emitted by llm_build_dflash). Saves the per-decode
+    // `bs * n_vocab * 4` byte float-logits PCIe transfer (~9.7 MiB per
+    // block on Qwen3 vocab=151,936) in favour of a `K * bs * 4` byte
+    // int32 read-back (~64 bytes per block at K=1, ~256 at K=4).
+    // Returns nullptr on a non-DFlash context. The buffer is row-major
+    // [n_outputs, K]: position i's K candidates live at indices
+    // [i*K .. i*K+K-1], sorted descending by logit. *n_outputs_out is
+    // filled with the number of positions covered (= n_outputs_all of
+    // the most recent decode); *topk_out is filled with K.
+    const int32_t * get_dflash_draft_topk(int64_t * n_outputs_out, uint32_t * topk_out) const;
 
     // Read access for the graph builders (passed via llm_graph_params.dflash).
     const llama_dflash * get_dflash() const;

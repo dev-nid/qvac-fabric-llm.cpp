@@ -503,21 +503,28 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // and verify batches) and our spec-simple integration is therefore
         // absorbed into the indexing here.
         //
-        // We read the predictions from the in-graph greedy argmax exposed
-        // by `llama_get_dflash_draft_argmax(ctx_dft)` (one int32 per draft
-        // position). The decoder graph (`llm_build_dflash`) intentionally
-        // skips the float-logits read-back, so `llama_get_logits_ith()`
-        // would return nullptr here.
-        int64_t n_argmax_outputs = 0;
-        const int32_t * draft_argmax = llama_get_dflash_draft_argmax(ctx_dft, &n_argmax_outputs);
-        if (draft_argmax == nullptr || n_argmax_outputs < block_size) {
-            LOG_ERR("%s: draft argmax buffer missing or too small (got %lld, need >= %d)\n",
-                    __func__, (long long) n_argmax_outputs, block_size);
+        // We read the predictions from the in-graph top-K exposed by
+        // `llama_get_dflash_draft_topk(ctx_dft, &n, &K)` (K int32s per
+        // draft position, sorted descending so [i*K+0] is the argmax).
+        // The decoder graph (`llm_build_dflash`) intentionally skips the
+        // float-logits read-back, so `llama_get_logits_ith()` would return
+        // nullptr here.
+        //
+        // For Phase 1 (this commit) we only consume the [i*K+0] column
+        // (the argmax) regardless of K, so chain-mode behavior is bit-
+        // identical to before. Phase 2 (DDTree) will use the K-1 alternate
+        // candidates per position to build K parallel verify chains.
+        int64_t  n_topk_outputs = 0;
+        uint32_t topk_K         = 0;
+        const int32_t * draft_topk = llama_get_dflash_draft_topk(ctx_dft, &n_topk_outputs, &topk_K);
+        if (draft_topk == nullptr || n_topk_outputs < block_size || topk_K < 1) {
+            LOG_ERR("%s: draft top-K buffer missing or too small (got n=%lld K=%u, need n>=%d K>=1)\n",
+                    __func__, (long long) n_topk_outputs, topk_K, block_size);
             return result;
         }
         result.reserve(block_size - 1);
         for (int i = 1; i < block_size; ++i) {
-            result.push_back((llama_token) draft_argmax[i]);
+            result.push_back((llama_token) draft_topk[(size_t) i * topk_K + 0]);
         }
 
         // Reset the draft cache so the next iteration starts from a clean

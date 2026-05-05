@@ -250,6 +250,11 @@ struct common_params_speculative {
     int32_t n_gpu_layers   =    -1; // number of layers to store in VRAM for the draft model (-1 - use default)
     int32_t dflash_max_ctx =  4096; // sliding-window cap on the DFlash draft K/V side store (0 = uncapped).
                                     // see llama_context_params::dflash_max_ctx for full semantics.
+    int32_t dflash_topk    =     1; // number of top-K candidate tokens the DFlash drafter emits per
+                                    // output position. 1 = chain mode (cheap argmax kernel; bit-identical
+                                    // to pre-DDTree). >=2 = tree mode (ggml_argsort_top_k); upstream
+                                    // common_speculative_state_dflash uses the extras to build K parallel
+                                    // verify chains for tree-style verify. See llama_context_params::dflash_topk.
     float   p_split        =  0.1f; // speculative decoding split probability
     float   p_min          = 0.75f; // minimum speculative decoding probability (greedy)
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
@@ -446,6 +451,8 @@ struct common_params {
     int32_t dflash_max_ctx = 4096; // sliding-window cap on the DFlash drafter K/V side store
                                    // (forwarded to llama_context_params::dflash_max_ctx; ignored
                                    // for non-DFlash drafts). 0 = uncapped (uses n_ctx_seq).
+    int32_t dflash_topk    =    1; // top-K mirror of llama_context_params::dflash_topk (forwarded
+                                   // through to the draft context; ignored for non-DFlash drafts).
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

@@ -535,7 +535,7 @@ void llm_graph_result::reset() {
     t_logits         = nullptr;
     t_embd           = nullptr;
     t_embd_pooled    = nullptr;
-    t_logits_argmax  = nullptr;
+    t_dflash_topk    = nullptr;
 
     // The DFlash capture vector is repopulated by the graph builder on every
     // build (one entry per capture_layer_ids), so it must be cleared here
