@@ -349,9 +349,28 @@ llama_context::llama_context(
             //   to ctx_filled per accepted block (always <= ctx_capacity,
             //   so the rebuilt decoder graph fits inside the worst-case
             //   compute buffer).
-            const int64_t ctx_capacity_seed = (cparams.dflash_max_ctx > 0)
-                ? std::min<int64_t>((int64_t) cparams.n_ctx_seq, (int64_t) cparams.dflash_max_ctx)
-                : (int64_t) cparams.n_ctx_seq;
+            //
+            // dflash_max_ctx semantics (mirrors the allocation site below):
+            //   == -1 (default): auto-scale = clamp(n_ctx_seq/4, 512, 1024),
+            //                    then capped to n_ctx_seq. The 1024 ceiling is
+            //                    the empirical sweet spot for typical
+            //                    workloads — see the comment block at the
+            //                    allocation site below for the calibration
+            //                    rationale (and why we don't use the draft's
+            //                    n_ctx_seq directly: it defaults to the
+            //                    model's full n_ctx_train, often 40k+).
+            //   ==  0          : uncapped, use full n_ctx_seq.
+            //   >   0          : explicit cap, capped to n_ctx_seq.
+            int64_t ctx_capacity_seed;
+            if (cparams.dflash_max_ctx == -1) {
+                const int64_t scaled = (int64_t) cparams.n_ctx_seq / 4;
+                ctx_capacity_seed = std::min<int64_t>(std::max<int64_t>(scaled, 512), 1024);
+            } else if (cparams.dflash_max_ctx > 0) {
+                ctx_capacity_seed = (int64_t) cparams.dflash_max_ctx;
+            } else {
+                ctx_capacity_seed = (int64_t) cparams.n_ctx_seq;
+            }
+            ctx_capacity_seed = std::min<int64_t>(ctx_capacity_seed, (int64_t) cparams.n_ctx_seq);
             dflash.n_ctx      = ctx_capacity_seed;
 
             // ---------- DFlash K/V side store (paper §4.1 reuse) ----------
@@ -370,17 +389,49 @@ llama_context::llama_context(
                 const int64_t  n_embd_v_gqa   = hparams.n_embd_v_gqa();
                 const ggml_type type_k        = params.type_k;
                 const ggml_type type_v        = params.type_v;
-                // Sliding-window cap on the side store. With the default
-                // dflash_max_ctx=4096 and a Qwen3-4B-DFlash-b16 draft on
-                // n_ctx_seq=40960 this drops the side store from ~800 MiB
-                // to ~80 MiB across both GPUs without measurable acceptance
-                // loss for prompts that generate <= 4096 tokens (the slide
-                // never engages); for longer generations the oldest
-                // captures roll out via dflash_extend()'s sliding logic and
-                // ctx_pos_base advances accordingly.
-                const int64_t  ctx_capacity   = (cparams.dflash_max_ctx > 0)
-                    ? std::min<int64_t>((int64_t) cparams.n_ctx_seq, (int64_t) cparams.dflash_max_ctx)
-                    : (int64_t) cparams.n_ctx_seq;
+                // Sliding-window cap on the side store. The default
+                // (dflash_max_ctx == -1) auto-scales to
+                //     clamp(n_ctx_seq / 4, 512, 1024)
+                // and is then capped to n_ctx_seq. Calibration:
+                //   * Profile (logs/core_architecture/10_optimization_plan.md
+                //     M1a) showed typical workloads use 1-12% of the
+                //     historical 4096-column allocation. 1024 columns is
+                //     enough for ~1024 generated tokens at block_size 16
+                //     (= 64 spec iters), which covers the vast majority
+                //     of generation lengths.
+                //   * Why not n_ctx_seq itself: the DRAFT's n_ctx_seq
+                //     defaults to the model's n_ctx_train (often 40k+),
+                //     not the target's n_ctx — so a naive scale of
+                //     n_ctx_seq/4 still hits the upper clamp. The 1024
+                //     ceiling is the actual cap-shrinker.
+                //   * The lower bound of 512 keeps very small contexts
+                //     workable (block_size=16 → ~32 iters of headroom).
+                // Saves 75% of side-store memory at default config
+                // (80 MiB → 20 MiB on Qwen3-4B-DFlash-b16) without
+                // measurable acceptance loss, because:
+                //   * For gens <= 1024 tokens: cap is never hit; behavior
+                //     is bit-identical to the old 4096 default.
+                //   * For gens > 1024 tokens: dflash_extend()'s sliding-
+                //     window logic (commit 15+) rolls out the oldest
+                //     captures and bumps ctx_pos_base. Bit-exact greedy
+                //     output is preserved (target rebuilds the chain
+                //     from its KV cache, not the draft side store).
+                // Users with long-running generations who want to
+                // disable sliding entirely can pass `0` (uncapped, use
+                // full n_ctx_seq) or any explicit `>0` cap to override.
+                int64_t ctx_capacity;
+                if (cparams.dflash_max_ctx == -1) {
+                    const int64_t scaled = (int64_t) cparams.n_ctx_seq / 4;
+                    ctx_capacity = std::min<int64_t>(std::max<int64_t>(scaled, 512), 1024);
+                } else if (cparams.dflash_max_ctx > 0) {
+                    ctx_capacity = (int64_t) cparams.dflash_max_ctx;
+                } else {
+                    ctx_capacity = (int64_t) cparams.n_ctx_seq;
+                }
+                // Always cap to n_ctx_seq — even auto-scale's lower bound
+                // of 512 mustn't exceed it, and an explicit cap > n_ctx_seq
+                // would be a meaningless waste of allocation.
+                ctx_capacity = std::min<int64_t>(ctx_capacity, (int64_t) cparams.n_ctx_seq);
 
                 struct ggml_backend_buft_comparator {
                     bool operator()(const ggml_backend_buffer_type_t & lhs,
@@ -3266,7 +3317,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.training                    =*/ false,
-        /*.dflash_max_ctx              =*/ 4096,
+        /*.dflash_max_ctx              =*/ -1,  // auto-scale: clamp(n_ctx_seq/4, 512, 1024)
         /*.dflash_topk                 =*/ 1,
     };
 
@@ -3489,6 +3540,39 @@ void llama_set_tree_mask(llama_context * ctx,
 
 void llama_clear_tree_mask(llama_context * ctx) {
     ctx->clear_tree_mask();
+}
+
+void llama_dflash_memory_breakdown(
+        const llama_context *                ctx,
+        struct llama_dflash_memory_buckets * out) {
+    if (out == nullptr) return;
+    *out = {};
+    if (ctx == nullptr) return;
+
+    const llama_dflash * d = ctx->get_dflash();
+    if (d == nullptr) return;
+
+    out->n_layers     = (int) d->ctx_K.size();
+    out->ctx_capacity = d->ctx_capacity;
+    out->ctx_filled   = d->ctx_filled;
+
+    // Side store K/V — these are backend tensors; ggml_nbytes() gives the
+    // physical byte size including per-row stride padding.
+    for (auto * t : d->ctx_K) {
+        if (t != nullptr) out->side_store_K_total += ggml_nbytes(t);
+    }
+    for (auto * t : d->ctx_V) {
+        if (t != nullptr) out->side_store_V_total += ggml_nbytes(t);
+    }
+
+    // Host-side buffers — capacity() (not size()) reflects the actual
+    // allocation that won't shrink between decodes.
+    out->captured_features_bytes  = d->captured_features.capacity() * sizeof(float);
+    for (const auto & v : d->capture_staging) {
+        out->capture_staging_bytes += v.capacity() * sizeof(float);
+    }
+    out->draft_topk_bytes         = d->draft_topk.capacity()        * sizeof(int32_t);
+    out->draft_topk_argmax_bytes  = d->draft_topk_argmax.capacity() * sizeof(int32_t);
 }
 
 // llama adapter API

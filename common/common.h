@@ -248,8 +248,11 @@ struct common_params_speculative {
     int32_t n_max          =    16; // maximum number of tokens to draft during speculative decoding
     int32_t n_min          =     0; // minimum number of draft tokens to use for speculative decoding
     int32_t n_gpu_layers   =    -1; // number of layers to store in VRAM for the draft model (-1 - use default)
-    int32_t dflash_max_ctx =  4096; // sliding-window cap on the DFlash draft K/V side store (0 = uncapped).
-                                    // see llama_context_params::dflash_max_ctx for full semantics.
+    int32_t dflash_max_ctx =    -1; // sliding-window cap on the DFlash draft K/V side store.
+                                    // -1 = auto-scale (clamp(n_ctx_seq/4, 512, 1024); the default).
+                                    //  0 = uncapped (use full n_ctx_seq).
+                                    // >0 = explicit cap (capped to n_ctx_seq).
+                                    // See llama_context_params::dflash_max_ctx for full semantics.
     int32_t dflash_topk    =     1; // number of top-K candidate tokens the DFlash drafter emits per
                                     // output position. 1 = chain mode (cheap argmax kernel; bit-identical
                                     // to pre-DDTree). >=2 = tree mode (ggml_argsort_top_k); upstream
@@ -462,9 +465,11 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
-    int32_t dflash_max_ctx = 4096; // sliding-window cap on the DFlash drafter K/V side store
+    int32_t dflash_max_ctx =   -1; // sliding-window cap on the DFlash drafter K/V side store
                                    // (forwarded to llama_context_params::dflash_max_ctx; ignored
-                                   // for non-DFlash drafts). 0 = uncapped (uses n_ctx_seq).
+                                   // for non-DFlash drafts). -1 = auto-scale (default;
+                                   // clamp(n_ctx_seq/4, 512, 1024)). 0 = uncapped (n_ctx_seq).
+                                   // >0 = explicit cap.
     int32_t dflash_topk    =    1; // top-K mirror of llama_context_params::dflash_topk (forwarded
                                    // through to the draft context; ignored for non-DFlash drafts).
 

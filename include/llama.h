@@ -365,13 +365,23 @@ extern "C" {
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool training;    // if true, we're in training mode (affects LoRA K/V gradient flow)
 
-        uint32_t dflash_max_ctx; // sliding-window cap on the DFlash drafter's per-layer K/V side store.
-                                 // 0 = uncapped (uses cparams.n_ctx_seq, the same value as the regular KV cache).
-                                 // For long-running generation this dominates draft-side VRAM (Qwen3-4B-DFlash-b16 with
-                                 // n_ctx_seq=40960 allocates ~800 MiB across both GPUs). When ctx_filled + n_new exceeds
-                                 // this cap, dflash_extend() slides the side store left by the overflow amount and bumps
-                                 // ctx_pos_base, dropping the oldest captures. Default 4096 (matches buun fork's
-                                 // GGML_DFLASH_MAX_CTX). Ignored for non-DFlash drafts.
+        int32_t dflash_max_ctx;  // sliding-window cap on the DFlash drafter's per-layer K/V side store.
+                                 // -1 = auto-scale (the default): cap = clamp(cparams.n_ctx_seq / 4, 512, 1024),
+                                 //      then capped to n_ctx_seq. The 1024 ceiling is the empirical sweet spot
+                                 //      from the M1a memory profile (logs/core_architecture/10_optimization_plan.md):
+                                 //      typical workloads use 1-12% of the historical 4096-column allocation, and
+                                 //      1024 columns covers gen lengths up to ~1024 tokens at block_size=16 without
+                                 //      sliding. Saves ~75% of side-store memory at default config (80 → 20 MiB
+                                 //      on Qwen3-4B-DFlash-b16). For longer gens the sliding logic rolls out the
+                                 //      oldest captures (commit 15+); bit-exact greedy output is preserved because
+                                 //      the target rebuilds chain state from its own KV cache, not the side store.
+                                 //  0 = uncapped: use the full cparams.n_ctx_seq (same value as the regular KV cache).
+                                 //      For long-running generation this dominates draft-side VRAM (Qwen3-4B-DFlash-b16
+                                 //      with n_ctx_seq=40960 allocates ~800 MiB across both GPUs).
+                                 // >0 = explicit cap: capped to cparams.n_ctx_seq. When ctx_filled + n_new exceeds
+                                 //      this cap, dflash_extend() slides the side store left by the overflow amount
+                                 //      and bumps ctx_pos_base, dropping the oldest captures.
+                                 // Ignored for non-DFlash drafts.
 
         uint32_t dflash_topk;    // number of top-K candidate tokens the DFlash drafter emits per output position.
                                  // 1 = chain mode (single argmax token per position; byte-exact-equivalent to the
@@ -748,6 +758,63 @@ extern "C" {
     // Clear the tree mask (no-op if no mask is active). After this call
     // subsequent decodes use the standard seq-id-based attention mask.
     LLAMA_API void llama_clear_tree_mask(struct llama_context * ctx);
+
+    // -----------------------------------------------------------------------
+    // DFlash memory accounting
+    // -----------------------------------------------------------------------
+    //
+    // Per-bucket byte sizes for DFlash-specific allocations on a context.
+    // The standard `llama_memory_breakdown_print()` covers model weights,
+    // generic KV cache, and compute graph buffers — but DFlash's per-layer
+    // K/V side store and host-side capture buffers are NOT included in that
+    // breakdown. Use this to enumerate them.
+    //
+    // All sizes are in bytes. Counts and capacities are intended for tooling
+    // / profiling (e.g. common/dflash-profile); the values reflect the
+    // current state at call time (capacities can grow on subsequent decodes
+    // if n_outputs grows).
+    //
+    // For a non-DFlash context (or one where the side store hasn't been
+    // allocated yet), all fields are 0.
+    struct llama_dflash_memory_buckets {
+        // Per-layer side-store K projections (post wk + k_norm + RoPE). Sum
+        // across layers; per-layer = ggml_nbytes(ctx_K[il]) which depends
+        // on type_k (default F16) and ctx_capacity (resolved from
+        // cparams.dflash_max_ctx — see its docstring; -1 → auto-scale,
+        //  0 → uncapped, >0 → explicit cap; always capped to n_ctx_seq).
+        size_t side_store_K_total;
+
+        // Per-layer side-store V projections (post wv only). Same shape /
+        // dtype rules as side_store_K_total.
+        size_t side_store_V_total;
+
+        // Host buffer for target-side per-layer hidden-state captures, used
+        // as the encoder's input on the next dflash_extend(). Sized to
+        // n_outputs_all * n_features at most-recent decode.
+        size_t captured_features_bytes;
+
+        // Per-layer staging buffers for the batched D2H capture transfer
+        // (see commit 19). Sum across captured layers.
+        size_t capture_staging_bytes;
+
+        // Host buffer holding the in-graph top-K candidate token IDs from
+        // the most recent draft decode. Layout: [n_outputs_all, K] int32.
+        size_t draft_topk_bytes;
+
+        // Companion host buffer for the K>=2 swap pass (commit 33).
+        // Layout: [n_outputs_all] int32. Empty for K=1.
+        size_t draft_topk_argmax_bytes;
+
+        // For context (not bytes; descriptive metadata about side-store
+        // sizing decisions made at context-creation time).
+        int64_t ctx_capacity;   // total side-store columns reserved
+        int64_t ctx_filled;     // currently used columns
+        int     n_layers;       // number of layers in the side store
+    };
+
+    LLAMA_API void llama_dflash_memory_breakdown(
+            const struct llama_context *         ctx,
+            struct llama_dflash_memory_buckets * out);
 
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);

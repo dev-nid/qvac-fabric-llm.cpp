@@ -30,6 +30,10 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <vector>
+
+// Forward-declared instead of #include "llama.h" to keep this header light.
+struct llama_context;
 
 namespace dflash_prof {
 
@@ -101,5 +105,94 @@ struct prof_env_config {
 };
 
 prof_env_config read_env_config();
+
+// ===========================================================================
+// Memory profiler — opt-in via DFLASH_MEM=1
+// ===========================================================================
+//
+// Companion to the per-op (timing) profiler. Where the per-op profiler logs
+// time per ggml op, this logs BYTES per DFlash-specific allocation bucket
+// + process-level RSS / VRAM. Used to find memory-optimization candidates
+// (M1-M4 in logs/core_architecture/10_optimization_plan.md).
+//
+// Coverage:
+//   * DFlash buckets via the public C API `llama_dflash_memory_breakdown`:
+//     side store K/V (per-layer ggml backend tensors), captured_features
+//     and capture_staging (host buffers), draft_topk and draft_topk_argmax.
+//   * Process RSS via /proc/self/status (Linux only).
+//   * VRAM via ggml_backend_dev_memory() if a device is present.
+//
+// Coverage gap (relies on existing tools, not this profiler):
+//   * Generic llama allocations (model weights, context KV cache, compute
+//     graph) — those are covered by `llama_memory_breakdown_print()` which
+//     speculative-simple already prints.
+//
+// Snapshot pattern: take a snapshot at well-defined points in the lifecycle
+// (e.g. "after_warmup", "after_5_iters", "exit"). The dump compares them
+// side-by-side to surface allocation churn vs. steady-state usage.
+
+struct mem_snapshot {
+    std::string label;
+
+    // From llama_dflash_memory_breakdown — sums for the draft context (the
+    // primary DFlash consumer; target context's dflash buckets are 0 since
+    // it doesn't have a side store).
+    size_t side_store_K_bytes        = 0;
+    size_t side_store_V_bytes        = 0;
+    size_t captured_features_bytes   = 0;
+    size_t capture_staging_bytes     = 0;
+    size_t draft_topk_bytes          = 0;
+    size_t draft_topk_argmax_bytes   = 0;
+    int64_t ctx_capacity             = 0;
+    int64_t ctx_filled               = 0;
+    int     n_layers                 = 0;
+
+    // Process-level. RSS is total resident in physical memory; VRAM_used is
+    // sum across present GPU devices (if any).
+    size_t rss_bytes      = 0;
+    size_t vram_used_bytes = 0;
+    size_t vram_free_bytes = 0;
+};
+
+class memory_profiler {
+public:
+    static memory_profiler & instance();
+
+    bool enabled() const { return enabled_; }
+    void set_enabled(bool e) { enabled_ = e; }
+
+    // Take a snapshot, optionally walking the DFlash struct on each context.
+    // The DFlash buckets are split across contexts:
+    //   draft_ctx:  side_store_K/V, draft_topk, draft_topk_argmax
+    //   target_ctx: captured_features, capture_staging
+    // Pass either as nullptr to skip that side (e.g. nullptr for both on a
+    // "before-load" snapshot, or only draft_ctx on a chain-only run).
+    void snapshot(const std::string & label,
+                  const struct llama_context * draft_ctx,
+                  const struct llama_context * target_ctx);
+
+    // Dump all collected snapshots side-by-side.
+    void dump(FILE * out = nullptr) const;
+
+    // Reset.
+    void reset();
+
+    // Helpers (public for testing / direct use):
+    static size_t process_rss_bytes();   // 0 on non-Linux
+    static void   query_vram(size_t * used_out, size_t * free_out);
+
+private:
+    memory_profiler() = default;
+
+    bool                       enabled_ = false;
+    std::vector<mem_snapshot>  snapshots_;
+};
+
+struct mem_env_config {
+    bool        enabled = false;
+    std::string out_file;   // empty -> stderr
+};
+
+mem_env_config read_mem_env_config();
 
 }  // namespace dflash_prof

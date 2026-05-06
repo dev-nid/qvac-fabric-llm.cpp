@@ -52,6 +52,19 @@ int main(int argc, char ** argv) {
                 "single-node compute distorts absolute throughput)\n", __func__);
     }
 
+    // Companion memory profiler (opt-in via DFLASH_MEM=1). Snapshots DFlash-
+    // specific allocations + process RSS + VRAM at well-defined lifecycle
+    // points; dump at exit. Independent of DFLASH_PROF (different signal:
+    // bytes, not time).
+    const auto dflash_mem_cfg = dflash_prof::read_mem_env_config();
+    if (dflash_mem_cfg.enabled) {
+        dflash_prof::memory_profiler::instance().set_enabled(true);
+        // Take a "before model load" snapshot now (no contexts yet — RSS +
+        // VRAM only). Subsequent snapshots after model + ctx + warm-up + exit.
+        dflash_prof::memory_profiler::instance().snapshot("before_load", nullptr, nullptr);
+        LOG_INF("%s: DFLASH_MEM=1: memory profiling enabled\n", __func__);
+    }
+
     if (params.speculative.model.path.empty()) {
         LOG_ERR("%s: --model-draft is required\n", __func__);
         return 1;
@@ -289,6 +302,13 @@ int main(int argc, char ** argv) {
                 __func__, n_draft);
     }
 
+    // Memory snapshot: post-context-init, pre-decode. Captures the
+    // baseline DFlash side-store reservation + RSS / VRAM after the model
+    // is loaded into both the target and draft contexts.
+    if (dflash_mem_cfg.enabled) {
+        dflash_prof::memory_profiler::instance().snapshot("after_init", ctx_dft, ctx_tgt);
+    }
+
     // Run the prompt prefill on the target context. For DRAFT this is the
     // legacy llama_decode(batch_get_one(prompt[0..n-1])); for DFLASH it
     // also pushes the prompt-wide captures through the encoder so the
@@ -297,6 +317,12 @@ int main(int argc, char ** argv) {
     if (!common_speculative_target_prefill(spec, inp)) {
         LOG_ERR("%s: target prompt prefill failed\n", __func__);
         return 1;
+    }
+
+    // Memory snapshot: after the prompt prefill (which extended the
+    // side store with prompt-wide captures + populated some KV state).
+    if (dflash_mem_cfg.enabled) {
+        dflash_prof::memory_profiler::instance().snapshot("after_prefill", ctx_dft, ctx_tgt);
     }
 
     // note: keep the last token separate!
@@ -770,6 +796,26 @@ int main(int argc, char ** argv) {
         prof.dump_phase_summary(out);
         prof.dump_op_summary(out);
         prof.dump(out, dflash_prof_cfg.top_n);
+        if (out != stderr) fclose(out);
+    }
+
+    if (dflash_mem_cfg.enabled) {
+        // Final snapshot: after generation, before any teardown. Captures
+        // the steady-state DFlash buffer sizes (which may have grown if
+        // captures buffer expanded mid-run) and the peak process RSS.
+        dflash_prof::memory_profiler::instance().snapshot("after_gen", ctx_dft, ctx_tgt);
+
+        FILE * out = stderr;
+        if (!dflash_mem_cfg.out_file.empty()) {
+            FILE * f = fopen(dflash_mem_cfg.out_file.c_str(), "w");
+            if (f) {
+                out = f;
+            } else {
+                LOG_ERR("%s: DFLASH_MEM_FILE='%s' open failed; falling back to stderr\n",
+                        __func__, dflash_mem_cfg.out_file.c_str());
+            }
+        }
+        dflash_prof::memory_profiler::instance().dump(out);
         if (out != stderr) fclose(out);
     }
 

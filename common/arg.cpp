@@ -2888,16 +2888,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--dflash-max-ctx"}, "N",
         string_format(
             "DFlash drafter: sliding-window cap on the per-layer K/V side store (default: %d). "
-            "0 = uncapped (use the full --ctx-size-draft / n_ctx_seq for the draft). "
-            "Caps the worst-case draft VRAM (e.g. ~80 MiB at the default 4096 vs ~800 MiB at "
-            "uncapped n_ctx_seq=40960 on Qwen3-4B-DFlash-b16). For generations longer than the "
-            "cap, the oldest captures roll out via in-place left-shift inside dflash_extend(); "
-            "the target's bit-exact greedy output is unaffected.",
+            "-1 = auto-scale (clamp(n_ctx_seq/4, 512, 1024); the new default). "
+            " 0 = uncapped (use the full --ctx-size-draft / n_ctx_seq for the draft). "
+            ">0 = explicit cap. Caps the worst-case draft VRAM (e.g. ~20 MiB on auto-scale "
+            "vs ~800 MiB uncapped on Qwen3-4B-DFlash-b16 with n_ctx_seq=40960). "
+            "For generations longer than the cap, the oldest captures roll out via in-place "
+            "left-shift inside dflash_extend(); the target's bit-exact greedy output is unaffected.",
             params.speculative.dflash_max_ctx),
         [](common_params & params, int value) {
-            if (value < 0) {
+            if (value < -1) {
                 throw std::invalid_argument(
-                    string_format("invalid --dflash-max-ctx value %d (must be >= 0)", value));
+                    string_format("invalid --dflash-max-ctx value %d (must be >= -1; "
+                                  "-1 = auto-scale, 0 = uncapped, >0 = explicit cap)", value));
             }
             params.speculative.dflash_max_ctx = value;
         }

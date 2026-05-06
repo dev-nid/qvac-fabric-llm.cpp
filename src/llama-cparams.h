@@ -39,9 +39,12 @@ struct llama_cparams {
     enum llama_pooling_type pooling_type;
 
     // Sliding-window cap on the DFlash drafter's per-layer K/V side store
-    // (ignored for non-DFlash drafts). 0 = uncapped. See the docstring on
+    // (ignored for non-DFlash drafts). -1 = auto-scale (default), 0 = uncapped,
+    // >0 = explicit cap. Resolved at side-store allocation time in
+    // llama-context.cpp. Signed so the -1 sentinel survives forwarding from
+    // the public `llama_context_params::dflash_max_ctx`. See the docstring on
     // llama_context_params::dflash_max_ctx for full semantics.
-    uint32_t dflash_max_ctx;
+    int32_t dflash_max_ctx;
 
     // Number of top-K candidate tokens the DFlash drafter emits per output
     // position. 1 = chain mode (cheap argmax kernel; byte-exact-equivalent

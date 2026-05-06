@@ -73,6 +73,12 @@ quick=0
 # tile ONCE, not 17 times. Set --ub 1 explicitly to reproduce the
 # correctness-gate timing if needed.
 ubatch=""
+# Backend offload (-ngl / -ngld). Defaults to 0/0 = CPU-only (matches the
+# original script intent + works against build-cpu/). Override with --ngl 99
+# --ngld 99 for full GPU offload against a Vulkan/CUDA-built bin-dir
+# (e.g., --bin-dir build/bin).
+ngl=0
+ngld=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -86,6 +92,8 @@ while [ $# -gt 0 ]; do
         --prompts) prompts_filter="$2"; shift 2 ;;
         --prof)    prof_mode=1; shift ;;
         --ub)      ubatch="$2"; shift 2 ;;
+        --ngl)     ngl="$2"; shift 2 ;;
+        --ngld)    ngld="$2"; shift 2 ;;
         -v|--verbose) verbose=1; shift ;;
         -h|--help)
             sed -n '3,55p' "$0" | sed 's/^# \{0,1\}//'
@@ -380,6 +388,8 @@ printf '  draft         : %s\n' "$draft_model"
 printf '  n_predict     : %d\n' "$n_predict"
 printf '  threads       : %s\n' "$threads"
 printf '  ubatch        : %s\n' "${ubatch:-default}"
+printf '  ngl / ngld    : %s / %s%s\n' "$ngl" "$ngld" \
+    "$([ "$ngl" -gt 0 ] && echo " (GPU)" || echo " (CPU)")"
 printf '  seed          : %s\n' "$seed"
 printf '  configs       : %s\n' "${active_configs[*]}"
 printf '  prompts       : %s\n' "${active_prompts[*]}"
@@ -418,7 +428,7 @@ for prompt_name in "${active_prompts[@]}"; do
             "${prof_env_args[@]}" "$llama_cli" \
                 -m "$target_model" \
                 -p "$prompt" --n-predict "$n_predict" --temp 0 --seed "$seed" \
-                -no-cnv --no-display-prompt -ngl 0 "${ub_arg[@]}" -t "$threads" \
+                -no-cnv --no-display-prompt -ngl "$ngl" "${ub_arg[@]}" -t "$threads" \
                 > /dev/null 2> "$log_path"
             rc=$?
         else
@@ -430,7 +440,7 @@ for prompt_name in "${active_prompts[@]}"; do
                 --draft-type dflash \
                 $extra_args \
                 -p "$prompt" --n-predict "$n_predict" --temp 0 --seed "$seed" \
-                -ngl 0 -ngld 0 "${ub_arg[@]}" -t "$threads" \
+                -ngl "$ngl" -ngld "$ngld" "${ub_arg[@]}" -t "$threads" \
                 > /dev/null 2> "$log_path"
             rc=$?
         fi
