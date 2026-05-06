@@ -572,11 +572,12 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
-    t_tokens         = nullptr;
-    t_logits         = nullptr;
-    t_embd           = nullptr;
-    t_embd_pooled    = nullptr;
-    t_dflash_topk    = nullptr;
+    t_tokens              = nullptr;
+    t_logits              = nullptr;
+    t_embd                = nullptr;
+    t_embd_pooled         = nullptr;
+    t_dflash_topk         = nullptr;
+    t_dflash_topk_argmax  = nullptr;
 
     // The DFlash capture vector is repopulated by the graph builder on every
     // build (one entry per capture_layer_ids), so it must be cleared here

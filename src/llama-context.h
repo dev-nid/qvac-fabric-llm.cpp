@@ -95,6 +95,22 @@ struct llama_context {
     // the most recent decode); *topk_out is filled with K.
     const int32_t * get_dflash_draft_topk(int64_t * n_outputs_out, uint32_t * topk_out) const;
 
+    // Commit-33 helper: ggml_top_k returns the K largest indices in
+    // unspecified order. Our consumers expect dflash.draft_topk[i*K+0]
+    // to be the argmax. The decoder graph also emits a companion
+    // ggml_argmax into dflash.draft_topk_argmax; this method runs a
+    // tiny O(n_outputs * K) in-place pass to swap the argmax into slot
+    // 0 of each row. No-op when K==1 (the K=1 fast path is plain
+    // ggml_argmax — already at slot 0). Idempotent: calling it twice
+    // performs only no-op swaps the second time around.
+    //
+    // Called from the public `llama_get_dflash_draft_topk` C wrapper
+    // immediately after the existing `synchronize()` call, so the
+    // async readbacks queued in `decode()` are guaranteed complete
+    // before the swap runs. CPU-bound work (pointer chasing in a small
+    // [n_outputs * K] array); ~microseconds even for K=4 + bs=16.
+    void dflash_finalize_draft_topk();
+
     // Read access for the graph builders (passed via llm_graph_params.dflash).
     const llama_dflash * get_dflash() const;
 

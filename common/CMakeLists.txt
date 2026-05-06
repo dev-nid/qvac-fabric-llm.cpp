@@ -51,6 +51,7 @@ set(${TARGET}_HEADERS
   chat.h
   common.h
   console.h
+  dflash-profile.h
   json-partial.h
   json-schema-to-grammar.h
   log.h
@@ -72,6 +73,7 @@ add_library(${TARGET} STATIC
     common.cpp
     console.cpp
     console.h
+    dflash-profile.cpp
     download.cpp
     download.h
     http.h

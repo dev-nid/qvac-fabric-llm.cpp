@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "dflash-profile.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "log.h"
@@ -25,6 +26,31 @@ int main(int argc, char ** argv) {
     }
 
     common_init();
+
+    // ----------------------------------------------------------------------
+    // DFlash per-op profiler (opt-in via env, see common/dflash-profile.h).
+    // When DFLASH_PROF=1, install the eval_callback as `cb_eval` on the
+    // common_params so every llama_context this driver creates (target +
+    // draft) gets it on its sched. The phase tag is updated below at each
+    // major loop step ("prompt" / "draft" / "verify" / "redecode") so the
+    // dump groups ops by what part of spec-decoding produced them.
+    //
+    // The profiler returns true from ask=true, which forces the scheduler to
+    // compute one node at a time with explicit ggml_backend_synchronize() —
+    // accurate for CPU, distorting for GPU. Treat as CPU-only.
+    // ----------------------------------------------------------------------
+    const auto dflash_prof_cfg = dflash_prof::read_env_config();
+    if (dflash_prof_cfg.enabled) {
+        auto & prof = dflash_prof::profiler::instance();
+        prof.set_enabled(true);
+        params.cb_eval           = dflash_prof::profiler::eval_callback;
+        params.cb_eval_user_data = &prof;
+        // Skip the warmup decode so the baseline tally isn't polluted by a
+        // one-shot all-ops-cold call. Mirrors the eval-callback example.
+        params.warmup            = false;
+        LOG_INF("%s: DFLASH_PROF=1: per-op profiling enabled (CPU-only; "
+                "single-node compute distorts absolute throughput)\n", __func__);
+    }
 
     if (params.speculative.model.path.empty()) {
         LOG_ERR("%s: --model-draft is required\n", __func__);
@@ -267,6 +293,7 @@ int main(int argc, char ** argv) {
     // legacy llama_decode(batch_get_one(prompt[0..n-1])); for DFLASH it
     // also pushes the prompt-wide captures through the encoder so the
     // first gen_draft has a populated K/V side store.
+    if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("prompt");
     if (!common_speculative_target_prefill(spec, inp)) {
         LOG_ERR("%s: target prompt prefill failed\n", __func__);
         return 1;
@@ -357,12 +384,20 @@ int main(int argc, char ** argv) {
             //      id_last + m1..m_L. Captures[0..L] are correct (main
             //      path's tree-decode prefix is the chain prefix).
             //      No re-decode.
-            //    - For alt-accepted (commit_n > main_path_len): drop
-            //      everything in seq 0 from N0 onward AND drop seq 1,
-            //      then RE-DECODE [id_last, alt] in seq 0 to populate
-            //      KV + captures correctly. Re-decode is 2 tokens; this
-            //      branch fires only when target's argmax at root is
-            //      the alt token (~5-15% of iters in our prompt grid).
+            //    - For alt-accepted (commit_n > main_path_len): commit-35
+            //      replaced the previous "redecode [id_last, m_1, ...,
+            //      m_{d-1}, alt_token] in seq 0" round-trip with KV
+            //      surgery (metadata-only seq_rm/seq_cp under kv_unified)
+            //      plus a captures-buffer remap hint for the next
+            //      gen_draft_tree → extend_side_store. The alt's
+            //      pre-projected hidden state at output index commit_n
+            //      from the ORIGINAL tree decode is reused; the
+            //      `record_alt_accept(commit_n, d)` tells the spec state
+            //      to use it in place of m_d's rejected capture when it
+            //      next extends the draft K/V side store. Saves the
+            //      d+1-token re-decode that fires on every alt-accept
+            //      (~25% of iters in tree-budget-18 / math).
+            if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("draft");
             const int64_t t_d0 = ggml_time_us();
             tree = common_speculative_gen_draft_tree(spec, params_spec, prompt_tgt, id_last);
             t_draft_total += ggml_time_us() - t_d0;
@@ -375,6 +410,7 @@ int main(int argc, char ** argv) {
                 // Drafter failed (no top-K data or trivial). Decode
                 // just id_last in seq 0 and emit the bonus.
                 common_batch_add(batch_tgt, id_last, n_past_before, { 0 }, /*logits=*/true);
+                if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("verify");
                 const int64_t t_v0 = ggml_time_us();
                 llama_decode(ctx_tgt, batch_tgt);
                 t_verify_total += ggml_time_us() - t_v0;
@@ -446,6 +482,7 @@ int main(int argc, char ** argv) {
                                      n_past_before + d, seqs, /*logits=*/true);
                 }
 
+                if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("verify");
                 const int64_t t_v0 = ggml_time_us();
                 llama_decode(ctx_tgt, batch_tgt);
                 t_verify_total += ggml_time_us() - t_v0;
@@ -473,50 +510,66 @@ int main(int argc, char ** argv) {
                 if (alt_accepted) {
                     n_tree_alt_taken++;
 
-                    // Drop everything in seq 0 from N0 onward (id_last
-                    // + main path) and drop every alt seq entirely
-                    // (alt slots that were tagged with that seq alone
-                    // become empty; the prefix's tags shrink back to
-                    // seq 0 only).
-                    llama_memory_seq_rm(mem, 0, n_past_before, -1);
+                    // ===========================================
+                    // Stage C alt-accept: KV surgery (no compute)
+                    // ===========================================
+                    // commit-35: replace the previous "redecode
+                    // [id_last, m_1, ..., m_{d-1}, alt_token] in
+                    // seq 0" round-trip with three metadata-only
+                    // KV cache ops + a captures-buffer remap hint
+                    // for the next gen_draft_tree → extend_side_store.
+                    //
+                    // Why this works: under kv_unified=true every
+                    // seq lives in the same stream, so seq_cp /
+                    // seq_rm only touch per-cell seq-id sets (no
+                    // data copy). The alt slot at position N0+d in
+                    // seq alt_branch already holds the correct
+                    // pre-projected hidden state from the original
+                    // tree decode; we just need to (a) drop the
+                    // rejected main-path tail in seq 0, (b) tag the
+                    // alt's slot with seq 0 so it survives the
+                    // alt-seq purge, (c) drop every alt seq, and
+                    // (d) tell the spec state to remap the
+                    // captures-buffer offsets when it next extends
+                    // the draft's K/V side store.
+                    //
+                    // Saves ~250 ms / iteration in the canonical
+                    // tree-budget-18 / math benchmark (vs c34).
+                    const int          d          = tree.depths[commit_n - 1];
+                    const llama_seq_id alt_branch = (llama_seq_id) tree.branch_ids[commit_n - 1];
+
+                    // (a) Drop main-path nodes m_d..m_main_path_len from seq 0.
+                    //     `seq_rm` filters by seq tag, so the alt slot at the
+                    //     same position N0+d in seq alt_branch is untouched
+                    //     here (it doesn't carry seq 0). m_1..m_{d-1} are at
+                    //     positions < N0+d, also untouched.
+                    llama_memory_seq_rm(mem, 0, n_past_before + d, -1);
+
+                    // (b) Promote the alt's slot at N0+d into seq 0. With
+                    //     kv_unified, this is just a metadata add — no data
+                    //     copy. After this, the alt slot has both seq 0 and
+                    //     seq alt_branch tags.
+                    llama_memory_seq_cp(mem, alt_branch, 0,
+                                        n_past_before + d,
+                                        n_past_before + d + 1);
+
+                    // (c) Drop every alt seq from every cell. The accepted
+                    //     alt's slot survives because seq 0 was just added
+                    //     to it; all other alt-only slots become empty (=
+                    //     dropped); the prefix and id_last lose their alt
+                    //     seq tags but retain seq 0.
                     for (int b = 1; b < tree.n_branches; ++b) {
                         llama_memory_seq_rm(mem, b, -1, -1);
                     }
 
-                    // Re-decode [id_last, alt_token] in seq 0 to
-                    // populate KV + captures with correct chain-prefix
-                    // hidden states. Stage C alts are leaves at depth
-                    // `tree.depths[commit_n - 1]` hanging off
-                    // `main_path[depth-1]`; the accept walk only ever
-                    // descends one step into an alt branch (alts have
-                    // no children in the current Stage C tree shape),
-                    // so `[id_last, alt_token]` covers the full
-                    // accepted prefix.
-                    //
-                    // For accepted alt at depth d > 1, we'd want to
-                    // re-decode [id_last, m1, ..., m_{d-1}, alt_token]
-                    // — d+1 tokens — to match the chain prefix the alt
-                    // was committed under. The accept walk's `current`
-                    // chain follows the tree.parents pointers from
-                    // `commit_n` back to the root, so we can build
-                    // the actual prefix from there.
-                    common_batch_clear(batch_tgt);
-                    common_batch_add(batch_tgt, id_last, n_past_before,
-                                     { 0 }, /*logits=*/true);
-                    // Walk root -> ... -> commit_n in tree order.
-                    std::vector<int> path;
-                    for (int node = commit_n; node > 0; node = tree.parents[node]) {
-                        path.push_back(node);
-                    }
-                    std::reverse(path.begin(), path.end());
-                    for (size_t i = 0; i < path.size(); ++i) {
-                        common_batch_add(batch_tgt, tree.tokens[path[i] - 1],
-                                         n_past_before + 1 + (llama_pos) i,
-                                         { 0 }, /*logits=*/true);
-                    }
-                    llama_decode(ctx_tgt, batch_tgt);
-                    n_tree_redecoded += (int) batch_tgt.n_tokens;
-                    n_past = n_past_before + 1 + (int) path.size();
+                    // (d) Hint the spec state so the next gen_draft_tree
+                    //     extends the side store from captures
+                    //     [0, 1, ..., d-1, commit_n] (replacing m_d's
+                    //     capture with the alt's at output index commit_n).
+                    common_speculative_record_alt_accept(spec, /*alt_capture_idx=*/commit_n,
+                                                          /*alt_depth=*/d);
+
+                    n_past = n_past_before + d + 1;
                 } else {
                     // Main-path accept (commit_n == 0 or 1..main_path_len).
                     // Drop the rejected main-path tail, drop every alt
@@ -540,6 +593,7 @@ int main(int argc, char ** argv) {
             // ============================================================
             // Chain mode (unchanged from pre-Stage-B behaviour)
             // ============================================================
+            if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("draft");
             const int64_t t_d0 = ggml_time_us();
             llama_tokens draft = common_speculative_gen_draft(spec, params_spec, prompt_tgt, id_last);
             t_draft_total += ggml_time_us() - t_d0;
@@ -565,6 +619,7 @@ int main(int argc, char ** argv) {
 
                 //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
+                if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("verify");
                 llama_decode(ctx_tgt, batch_tgt);
             }
             t_verify_total += ggml_time_us() - t_v0;
@@ -699,6 +754,24 @@ int main(int argc, char ** argv) {
     LOG_INF("\n");
     LOG_INF("target:\n\n");
     common_perf_print(ctx_tgt, smpl);
+
+    if (dflash_prof_cfg.enabled) {
+        FILE * out = stderr;
+        if (!dflash_prof_cfg.out_file.empty()) {
+            FILE * f = fopen(dflash_prof_cfg.out_file.c_str(), "w");
+            if (f) {
+                out = f;
+            } else {
+                LOG_ERR("%s: DFLASH_PROF_FILE='%s' open failed; falling back to stderr\n",
+                        __func__, dflash_prof_cfg.out_file.c_str());
+            }
+        }
+        const auto & prof = dflash_prof::profiler::instance();
+        prof.dump_phase_summary(out);
+        prof.dump_op_summary(out);
+        prof.dump(out, dflash_prof_cfg.top_n);
+        if (out != stderr) fclose(out);
+    }
 
     common_sampler_free(smpl);
     common_speculative_free(spec);

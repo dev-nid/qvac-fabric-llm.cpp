@@ -57,6 +57,15 @@ struct common_speculative_state {
         (void) id_last;
         return {};
     }
+
+    // DDTree Phase 2 Stage C — alt-accept fast path (commit 35).
+    // Default impl is a no-op (only DFLASH overrides). See public C wrapper
+    // `common_speculative_record_alt_accept` in `speculative.h` for full
+    // documentation.
+    virtual void record_alt_accept(int alt_capture_idx, int alt_depth) {
+        (void) alt_capture_idx;
+        (void) alt_depth;
+    }
 };
 
 // =============================================================================
@@ -625,6 +634,23 @@ struct common_speculative_state_dflash : public common_speculative_state {
         return tree;
     }
 
+    // DDTree Phase 2 Stage C — alt-accept fast path (commit 35).
+    //
+    // Stash the (capture_idx, depth) hint for the next extend_side_store
+    // so it can remap captures `[0..d-1, capture_idx]` instead of the
+    // linear `[0..d]` slice. See speculative.h for the rationale.
+    //
+    // Idempotent overwrite: if a hint is already pending (the previous
+    // iteration didn't consume it via gen_draft_tree → extend_side_store),
+    // the new one wins. In the standard driver flow each tree iteration
+    // calls gen_draft_tree → extend_side_store at the start, so the hint
+    // set at the end of the previous iter is consumed before any new one
+    // could be set; the override branch is defensive only.
+    void record_alt_accept(int alt_capture_idx, int alt_depth) override {
+        pending_alt_capture_idx = alt_capture_idx;
+        pending_alt_depth       = alt_depth;
+    }
+
 private:
     // Stage C tree shape: chain seed (top-1 at depths 1..bs-1, capped at
     // budget) + uniform round-robin sibling expansion (rank 1, 2, ...,
@@ -770,6 +796,15 @@ private:
     // Read freshly-captured target features from ctx_tgt and push the first
     // `n_keep` of them into the draft's per-layer K/V side store at offset
     // `pos_start`. Wraps llama_dflash_extend with a friendlier error path.
+    //
+    // Stage C alt-accept fast path (commit 35): when a `record_alt_accept`
+    // hint is pending, the captures buffer holds the previous tree-decode
+    // outputs at indices [0..main_path_len, alt_1, ..., alt_n] but we want
+    // to push `[0, 1, ..., d-1, alt_capture_idx]` into the side store
+    // (= replace the rejected m_d capture with the accepted alt's at
+    // depth d). The remap is done host-side into a small scratch buffer
+    // before the llama_dflash_extend call. After consumption, the hint is
+    // cleared so subsequent extends use the linear (chain-style) path.
     bool extend_side_store(int64_t n_keep, int64_t pos_start) {
         int64_t n_outputs = 0;
         const float * captures = llama_get_dflash_captured_features(ctx_tgt, &n_outputs);
@@ -782,7 +817,60 @@ private:
                     __func__, (long long) n_keep, (long long) n_outputs);
             return false;
         }
-        const int32_t rc = llama_dflash_extend(ctx_dft, captures, n_keep, pos_start);
+
+        const float * extend_buf = captures;
+
+        if (pending_alt_capture_idx >= 0) {
+            // The hint says: replace row (alt_depth) of the linear range
+            // with row (alt_capture_idx) from the captures buffer. The
+            // first alt_depth rows ([0..d-1]) stay as the chain prefix
+            // [id_last, m_1, ..., m_{d-1}].
+            const int     d                = pending_alt_depth;
+            const int     alt_idx          = pending_alt_capture_idx;
+            const int64_t expected_n_keep  = (int64_t) d + 1;
+            const size_t  row_floats       = (size_t) n_features;
+
+            if (n_keep != expected_n_keep) {
+                LOG_ERR("%s: alt-accept remap: n_keep=%lld but alt_depth+1=%lld (out of sync; "
+                        "driver must not call extend_side_store with non-matching n_keep "
+                        "after record_alt_accept)\n",
+                        __func__, (long long) n_keep, (long long) expected_n_keep);
+                return false;
+            }
+            if (alt_idx >= n_outputs) {
+                LOG_ERR("%s: alt-accept remap: alt_capture_idx=%d but only %lld outputs in "
+                        "captures buffer\n", __func__, alt_idx, (long long) n_outputs);
+                return false;
+            }
+            if (row_floats == 0) {
+                LOG_ERR("%s: alt-accept remap: n_features=0 (capture not installed?)\n", __func__);
+                return false;
+            }
+
+            const size_t buf_size = (size_t) (d + 1) * row_floats;
+            if (alt_remap_buf.size() < buf_size) {
+                alt_remap_buf.resize(buf_size);
+            }
+
+            if (d > 0) {
+                std::memcpy(
+                    alt_remap_buf.data(),
+                    captures,
+                    (size_t) d * row_floats * sizeof(float));
+            }
+            std::memcpy(
+                alt_remap_buf.data() + (size_t) d * row_floats,
+                captures + (size_t) alt_idx * row_floats,
+                row_floats * sizeof(float));
+
+            extend_buf = alt_remap_buf.data();
+
+            // Consume the hint: subsequent extend calls use the linear path.
+            pending_alt_capture_idx = -1;
+            pending_alt_depth       = 0;
+        }
+
+        const int32_t rc = llama_dflash_extend(ctx_dft, extend_buf, n_keep, pos_start);
         if (rc != 0) {
             LOG_ERR("%s: llama_dflash_extend failed (rc=%d)\n", __func__, rc);
             return false;
@@ -810,6 +898,24 @@ private:
     // the DFlash encoder into the draft's per-layer K/V side store. Equal
     // to `prompt_tgt.size()` after each successful gen_draft.
     int64_t               n_committed_total  = 0;
+
+    // DDTree Phase 2 Stage C — alt-accept fast path (commit 35).
+    //
+    // When the driver's tree-verify accept walk descends into an alt
+    // branch, it calls `record_alt_accept(alt_capture_idx, alt_depth)`
+    // INSTEAD OF redecoding `[id_last, m_1, ..., m_{d-1}, alt_token]` in
+    // seq 0 to repopulate KV+captures. The fields below stash the hint;
+    // the next gen_draft_tree → extend_side_store consumes them by
+    // remapping the captures buffer offsets. -1 means "no hint pending"
+    // (the linear chain-prefix path applies). See extend_side_store for
+    // the consumption logic.
+    int                   pending_alt_capture_idx = -1;
+    int                   pending_alt_depth       = 0;
+
+    // Scratch buffer used by extend_side_store to materialise the
+    // remapped captures rows for an alt-accept extend. Sized lazily to
+    // `(alt_depth + 1) * n_features` floats; reused across iterations.
+    std::vector<float>    alt_remap_buf;
 };
 
 // =============================================================================
@@ -999,4 +1105,12 @@ common_speculative_tree common_speculative_gen_draft_tree(
         llama_token id_last) {
     GGML_ASSERT(spec != nullptr && spec->state != nullptr);
     return spec->state->gen_draft_tree(params, prompt_tgt_main_model, id_last);
+}
+
+void common_speculative_record_alt_accept(
+        struct common_speculative * spec,
+        int                          alt_capture_idx,
+        int                          alt_depth) {
+    GGML_ASSERT(spec != nullptr && spec->state != nullptr);
+    spec->state->record_alt_accept(alt_capture_idx, alt_depth);
 }

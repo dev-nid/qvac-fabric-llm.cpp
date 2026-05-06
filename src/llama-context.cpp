@@ -855,6 +855,56 @@ const int32_t * llama_context::get_dflash_draft_topk(int64_t * n_outputs_out, ui
     return dflash.draft_topk.data();
 }
 
+void llama_context::dflash_finalize_draft_topk() {
+    const uint32_t K = dflash.draft_topk_K;
+    if (K < 2) {
+        // K=1 fast path: the graph emits ggml_argmax directly into
+        // draft_topk[i] — slot 0 is the argmax by construction, no
+        // swap needed. Also covers non-DFlash contexts (K stays 0).
+        return;
+    }
+    if (dflash.draft_topk.empty() || dflash.draft_topk_argmax.empty()) {
+        // No decode in flight, or the K>=2 graph somehow didn't produce
+        // a companion argmax. The latter shouldn't happen — the
+        // dflash.cpp graph builder always pairs the two for K>=2 — but
+        // be defensive on partially-initialised contexts.
+        return;
+    }
+
+    const int64_t n = dflash.draft_topk_n_outputs;
+    GGML_ASSERT((size_t) n * K == dflash.draft_topk.size()
+            && "draft_topk size mismatch — decode and finalize out of sync");
+    GGML_ASSERT((size_t) n     == dflash.draft_topk_argmax.size()
+            && "draft_topk_argmax size mismatch — decode and finalize out of sync");
+
+    for (int64_t i = 0; i < n; ++i) {
+        int32_t * slots  = dflash.draft_topk.data() + (size_t) i * K;
+        const int32_t am = dflash.draft_topk_argmax[i];
+
+        // Find which of the K slots holds the argmax index. Linear scan
+        // over K (typically 2-4) is faster than any data-structure for
+        // such small K. If found at slot k>0, swap into slot 0. If
+        // found at slot 0, that's the no-op fast path that makes this
+        // routine idempotent.
+        for (uint32_t k = 0; k < K; ++k) {
+            if (slots[k] == am) {
+                if (k != 0) {
+                    std::swap(slots[0], slots[k]);
+                }
+                goto next_pos;
+            }
+        }
+        // Fallthrough: argmax not in top-K. Numerical edge case (e.g.,
+        // ggml_argmax and ggml_top_k disagree on a tie) — leave the
+        // slots as-is. The driver will use slots[0] as if it were the
+        // argmax; spec decoding handles the resulting one-token
+        // mispredict gracefully (target rejects → fallback to bonus).
+    next_pos: ;
+    }
+}
+
+
+
 const llama_dflash * llama_context::get_dflash() const {
     return &dflash;
 }
@@ -1651,10 +1701,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
         dflash.draft_topk.assign((size_t) n_outputs_all * K, 0);
         dflash.draft_topk_n_outputs = n_outputs_all;
         dflash.draft_topk_K         = K;
+        // Companion argmax buffer for the K>=2 swap pass (commit 33).
+        // Sized to n_outputs_all (one int32 per position). Stays empty
+        // for K=1 — the fast path is plain ggml_argmax and writes the
+        // argmax directly into draft_topk; no swap needed.
+        if (K >= 2) {
+            dflash.draft_topk_argmax.assign((size_t) n_outputs_all, 0);
+        } else {
+            dflash.draft_topk_argmax.clear();
+        }
     } else {
         dflash.draft_topk.clear();
         dflash.draft_topk_n_outputs = 0;
         dflash.draft_topk_K         = 0;
+        dflash.draft_topk_argmax.clear();
     }
 
     int64_t n_outputs_prev = 0;
@@ -1740,14 +1800,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // DFlash drafter: extract the in-graph top-K. The decoder graph
-        // (llm_build_dflash) emits `t_dflash_topk` (= ggml_argmax for K=1
-        // / ggml_argsort_top_k for K>=2) and intentionally sets
-        // `t_logits = nullptr` so the float read-back above is skipped —
-        // for Qwen3 vocab=151,936 and bs=16 that saves ~9.7 MiB of PCIe
-        // traffic per draft step, replacing it with a `K * bs * 4` byte
-        // int32 read-back (~64 bytes at K=1, ~256 at K=4). Storage layout
-        // is row-major [n_outputs, K]: position p's K candidates live at
+        // (llm_build_dflash) emits `t_dflash_topk` (= ggml_top_k(K=1) for
+        // K=1 / ggml_top_k(K) for K>=2) and intentionally sets `t_logits =
+        // nullptr` so the float read-back above is skipped — for Qwen3
+        // vocab=151,936 and bs=16 that saves ~9.7 MiB of PCIe traffic per
+        // draft step, replacing it with a `K * bs * 4` byte int32 read-
+        // back (~64 bytes at K=1, ~256 at K=4). Storage layout is row-
+        // major [n_outputs, K]: position p's K candidates live at
         // [p*K .. p*K+K-1].
+        //
+        // For K>=2: ggml_top_k's output is unsorted within each row (the
+        // CPU kernel deliberately swaps positions 0/1 — see
+        // ggml-cpu/ops.cpp::ggml_compute_forward_top_k_f32). The graph
+        // also emits `t_dflash_topk_argmax` (= ggml_top_k(logits, 1) since
+        // commit 34, was ggml_argmax in commit 33) which we read back here.
+        // After all DECODE-PHASE readbacks complete (below the do {}
+        // while), we run a tiny O(n_outputs * K) swap-pass to put the
+        // argmax at slot [i*K+0] — preserving the consumer invariant that
+        // the pre-commit-33 argsort_top_k path had for free. The swap is
+        // run once per ubatch (here) so multi-ubatch decodes accumulate
+        // into draft_topk before the final consumer sees it; safe to do
+        // it slot-by-slot in-place.
         if (auto * t_topk = res->t_dflash_topk) {
             if (n_outputs > 0) {
                 const uint32_t K = dflash.draft_topk_K;
@@ -1759,6 +1832,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT((size_t)((n_outputs_prev + n_outputs) * K) <= dflash.draft_topk.size());
                 int32_t * topk_out = dflash.draft_topk.data() + (size_t) n_outputs_prev * K;
                 ggml_backend_tensor_get_async(backend_topk, t_topk, topk_out, 0, (size_t) n_outputs * K * sizeof(int32_t));
+
+                // K>=2 companion argmax (always paired with t_dflash_topk
+                // for K>=2; nullptr for K=1). Read into the parallel
+                // dflash.draft_topk_argmax buffer; the swap pass below
+                // (after the async reads complete) consumes both.
+                if (K >= 2) {
+                    auto * t_topk_argmax = res->t_dflash_topk_argmax;
+                    GGML_ASSERT(t_topk_argmax != nullptr
+                            && "K>=2 graph must emit t_dflash_topk_argmax (commit 33)");
+                    GGML_ASSERT(t_topk_argmax->type == GGML_TYPE_I32);
+                    GGML_ASSERT((size_t)(n_outputs_prev + n_outputs) <= dflash.draft_topk_argmax.size());
+                    ggml_backend_t backend_argmax = ggml_backend_sched_get_tensor_backend(sched.get(), t_topk_argmax);
+                    GGML_ASSERT(backend_argmax != nullptr);
+                    int32_t * argmax_out = dflash.draft_topk_argmax.data() + (size_t) n_outputs_prev;
+                    ggml_backend_tensor_get_async(backend_argmax, t_topk_argmax, argmax_out, 0, (size_t) n_outputs * sizeof(int32_t));
+                }
             }
         }
 
@@ -3373,6 +3462,11 @@ const float * llama_get_dflash_captured_features(llama_context * ctx, int64_t * 
 
 const int32_t * llama_get_dflash_draft_topk(llama_context * ctx, int64_t * n_outputs_out, uint32_t * topk_out) {
     ctx->synchronize();
+    // Commit-33: ggml_top_k returns the K candidate indices in unspecified
+    // order. Run the swap pass so dflash.draft_topk[i*K+0] is the argmax
+    // (the layout the consumers in common/speculative.cpp depend on).
+    // Idempotent + no-op for K==1, so safe to call unconditionally here.
+    ctx->dflash_finalize_draft_topk();
     return ctx->get_dflash_draft_topk(n_outputs_out, topk_out);
 }
 

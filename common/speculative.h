@@ -167,3 +167,32 @@ common_speculative_tree common_speculative_gen_draft_tree(
         struct common_speculative_params   params,
                       const llama_tokens & prompt,
                              llama_token   id_last);
+
+// DDTree Phase 2 Stage C — alt-accept fast path (commit 35):
+//
+// Tells the speculative state that the most recent tree-verify decode's
+// accept walk descended into an alt branch at tree index `alt_capture_idx`
+// (= the alt's output index in the tree-decode batch == tree node index in
+// the 0=root indexing) and tree depth `alt_depth` (1-based). The next
+// `gen_draft_tree` call's side-store extend MUST pull captures
+// `[0, 1, ..., alt_depth - 1, alt_capture_idx]` instead of the linear
+// `[0..alt_depth]` slice, so the alt's pre-projected K/V replaces the
+// rejected main-path-at-depth-d capture. This eliminates the
+// "redecode `[id_last, m_1, ..., m_{d-1}, alt_token]` in seq 0" round-trip
+// the driver used to do — the alt's hidden state is already in ctx_tgt's
+// captures buffer at output index `alt_capture_idx`; we just need to
+// remap the offsets when we push them to the draft's side store.
+//
+// The hint is consumed (and cleared) by the very next call to
+// gen_draft_tree's internal `extend_side_store`. Calling this function
+// while a hint is already pending overrides it (the previous tree
+// iteration's hint was never consumed because the next iteration didn't
+// run a side-store extend before the new alt-accept fired — should not
+// happen in the standard driver flow).
+//
+// Default impl is a no-op (DRAFT speculative state has no captures
+// buffer to remap; chain-mode DFlash never enters this code path).
+void common_speculative_record_alt_accept(
+        struct common_speculative * spec,
+        int                          alt_capture_idx,
+        int                          alt_depth);

@@ -143,19 +143,39 @@ struct llama_dflash {
     // `src/models/dflash.cpp::llm_build_dflash`), this holds the K
     // candidate token ids per output position. Row-major
     // `[draft_topk_n_outputs, draft_topk_K]` int32: position i's
-    // candidates live at indices [i*K .. i*K+K-1], sorted descending by
-    // logit (so [i*K+0] is the argmax). For K=1 (default; chain mode)
-    // the storage shape is [n_outputs] and is bit-identical to the
-    // pre-DDTree single-argmax layout. For K>=2 (tree mode) the
-    // graph emits `ggml_argsort_top_k(lm_head, K)` instead of
-    // `ggml_argmax`. Sized by the post-decode loop in
-    // llama_context::decode(). When `t_dflash_topk` was nullptr
-    // (e.g. on the target context), this stays empty and
-    // `draft_topk_n_outputs` stays 0. `draft_topk_K` mirrors
-    // `cparams.dflash_topk` at decode time.
+    // candidates live at indices [i*K .. i*K+K-1]. The slot `[i*K+0]` is
+    // always the argmax — for K>=2 the graph emits both `ggml_top_k(K)`
+    // (the K candidates, in unspecified order) and `ggml_top_k(1)` (the
+    // argmax) and a tiny O(n_outputs * K) post-pass in
+    // llama_context::decode swaps whichever top-K slot matches the
+    // argmax into position 0. For K=1 (default; chain mode) the graph
+    // emits a single `ggml_top_k(1)` whose output IS the argmax at slot
+    // 0 — no swap needed. Sized by the post-decode loop in
+    // llama_context::decode(). When `t_dflash_topk` was nullptr (e.g. on
+    // the target context), this stays empty and `draft_topk_n_outputs`
+    // stays 0. `draft_topk_K` mirrors `cparams.dflash_topk` at decode
+    // time.
+    //
+    // History:
+    //  * Pre-commit-33 the K>=2 graph used ggml_argsort_top_k (full
+    //    O(V·log V) sort, 9.1% of total time on CPU at K=2).
+    //  * Pre-commit-34 the K=1 path AND the K>=2 companion used
+    //    ggml_argmax (single-threaded CPU kernel — see
+    //    ggml/src/ggml-cpu/ops.cpp::ggml_compute_forward_argmax_f32:1567,
+    //    `if (params->ith != 0) return;`). Both replaced with
+    //    ggml_top_k, which parallelizes across the n_outputs rows.
     std::vector<int32_t> draft_topk;
     int64_t              draft_topk_n_outputs = 0;
     uint32_t             draft_topk_K         = 0;
+
+    // Companion to draft_topk for the K>=2 path (commit 33; in commit 34
+    // its source op changed from ggml_argmax to ggml_top_k(K=1)). Holds
+    // the argmax of each position's logits so the post-decode swap pass
+    // can restore the "draft_topk[i*K+0] is the argmax" invariant.
+    // Layout: [draft_topk_n_outputs] int32. Empty (and unused) when K=1
+    // because that fast path's draft_topk already IS the argmax —
+    // no swap needed.
+    std::vector<int32_t> draft_topk_argmax;
 
     // ---------- (c) per-layer K/V side store (paper §4.1 reuse) ----------
     // Persistent per-layer K_ctx and V_ctx tensors, allocated as backend
@@ -684,15 +704,38 @@ public:
 
     // DFlash drafter: in-graph top-K candidate token IDs of the per-position
     // lm_head logits. Shape:
-    //   K=1 (default): I32 [n_outputs]      (ggml_argmax — single-pass max)
-    //   K>=2:          I32 [K, n_outputs]   (ggml_argsort_top_k — sorted desc)
+    //   K=1 (default): I32 [1, n_outputs]   (ggml_top_k(K=1) — argmax)
+    //   K>=2:          I32 [K, n_outputs]   (ggml_top_k    — UNSORTED, see below)
+    // Both shapes are n_outputs * K contiguous int32s in memory, drop-in
+    // compatible for the flat byte-stride readback path.
+    //
     // When this is non-null, llm_build_dflash sets t_logits = nullptr — the
     // float-logits read-back is intentionally skipped to eliminate the
     // bs * n_vocab * 4 byte PCIe transfer per block (replaced by a
     // K * bs * 4 byte int32 read-back). llama_context::decode() copies the
     // int32s into the dflash.draft_topk host buffer; the speculative-
     // decoding driver reads them back via llama_get_dflash_draft_topk().
-    ggml_tensor * t_dflash_topk = nullptr;
+    //
+    // K>=2 ordering note: `ggml_top_k` returns the K largest indices in
+    // **unspecified order** (the CPU kernel deliberately swaps positions
+    // 0 and 1 to discourage callers from relying on order — see
+    // `ggml/src/ggml-cpu/ops.cpp::ggml_compute_forward_top_k_f32`). Our
+    // consumer (common/speculative.cpp) expects index [i*K+0] to be the
+    // argmax. To preserve that invariant without paying for a full
+    // O(V·log V) argsort, llm_build_dflash also emits `t_dflash_topk_argmax`
+    // (= ggml_top_k(logits, 1)) for the K>=2 path; llama_context::decode()
+    // performs an O(n_outputs * K) post-pass to swap whichever top-K slot
+    // matches the argmax into position 0. K is small (typically 2-4) so
+    // this pass is negligible.
+    //
+    // History: pre-commit-33 the K>=2 path used `ggml_argsort_top_k`
+    // (full O(V·log V) sort, 9% of total time on CPU at K=2). Pre-
+    // commit-34 the K=1 path AND the K>=2 companion used `ggml_argmax`
+    // (single-threaded CPU kernel, ~17 ms wasted per 32-token gen across
+    // 7 idle cores). Both now use `ggml_top_k`, which parallelizes
+    // across rows.
+    ggml_tensor * t_dflash_topk        = nullptr;
+    ggml_tensor * t_dflash_topk_argmax = nullptr;
 
     // DFlash target hidden-state captures, one per entry in
     // dflash->capture_layer_ids (parallel order). Each tensor has shape

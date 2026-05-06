@@ -267,15 +267,36 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
     // block for Qwen3 vocab=151,936 and bs=16) eliminates the dominant
     // draft-side PCIe transfer.
     //
-    // K=1 fast path: ggml_argmax — single-pass max over the vocab, the
-    //   cheapest possible kernel. Output shape: I32 [n_outputs]. This is
-    //   the original (paper §3) chain-mode behavior; bit-identical to the
-    //   pre-DDTree implementation when cparams.dflash_topk is 1.
+    // K=1 fast path: ggml_top_k(logits, 1) — partial_sort with K=1 over
+    //   the vocab, picks the single largest element per row. Output shape:
+    //   I32 [1, n_outputs]; memory layout = n_outputs contiguous int32s,
+    //   identical to the pre-commit-34 ggml_argmax output. Used by chain
+    //   mode (the original paper §3 algorithm).
     //
-    // K>=2 path: ggml_argsort_top_k(logits, K) — argsort + view, O(vocab
-    //   log vocab). Output shape: I32 [K, n_outputs] row-major. Sorted
-    //   descending so [i*K+0] is still the argmax. Used by
+    // K>=2 path: ggml_top_k(logits, K) — partial_sort, O(vocab * log K).
+    //   Output shape: I32 [K, n_outputs] row-major, **UNSORTED** (the
+    //   CPU kernel deliberately swaps positions 0/1 to discourage callers
+    //   from relying on order — see ggml-cpu/ops.cpp::
+    //   ggml_compute_forward_top_k_f32). Used by
     //   common_speculative_state_dflash to build K parallel verify chains.
+    //
+    // K>=2 also emits ggml_top_k(logits, 1) into res->t_dflash_topk_argmax
+    // so llama_context::decode can do a tiny O(n_outputs * K) post-pass
+    // that swaps whichever top-K slot matches the argmax into position 0 —
+    // restoring the consumer's "[i*K+0] is the argmax" invariant cheaply.
+    //
+    // History:
+    //  * pre-commit-33 used ggml_argsort_top_k for K>=2: O(vocab log vocab)
+    //    full argsort. On CPU at K=2 / vocab=151,936 that op alone was
+    //    9.1% of total spec-decode time. Replaced in commit 33.
+    //  * pre-commit-34 used ggml_argmax for K=1 + the K>=2 companion
+    //    argmax: ggml_compute_forward_argmax_f32 is single-threaded
+    //    (`if (params->ith != 0) return;` at ggml-cpu/ops.cpp:1567 —
+    //    7/8 cores idle). Replaced here with ggml_top_k(K=1), which has
+    //    the same semantics for our use (single largest index per row)
+    //    but parallelizes across rows for free. ~5x faster per call on
+    //    8-thread Zen 5; saves ~17 ms per 32-token gen on both chain
+    //    (K=1 path) and tree (K>=2 companion).
     //
     // We deliberately set `res->t_logits = nullptr` in either case so the
     // generic logits read-back path in llama_context::decode() skips the
@@ -285,40 +306,44 @@ llm_build_dflash::llm_build_dflash(const llama_model & model, const llm_graph_pa
     // done with it.
     const uint32_t K = cparams.dflash_topk == 0 ? 1 : cparams.dflash_topk;
     ggml_tensor * topk;
+    ggml_tensor * topk_argmax = nullptr;
     if (K == 1) {
-        topk = ggml_argmax(ctx0, logits);
+        // ggml_top_k(K=1) returns I32 [1, n_outputs] = n_outputs contiguous
+        // int32s (= argmax per row). The flat byte-stride readback in
+        // llama_context::decode (which copies n_outputs * K * 4 = n_outputs
+        // * 4 bytes for K=1) sees the same memory layout as the historical
+        // ggml_argmax output [n_outputs]. dflash.draft_topk[i] is the
+        // argmax of position i either way — bit-identical to the K=1
+        // pre-commit-34 storage.
+        topk = ggml_top_k(ctx0, logits, 1);
         cb(topk, "result_output_argmax", -1);
     } else {
-        // ggml_argsort_top_k returns a VIEW with ne[0] shrunk to K but
-        // the underlying argsort buffer's row stride (nb[1]) is still
-        // sized for the full vocab (~607 KiB per row at vocab=151,936).
-        // The flat-byte read-back in llama_context::decode does a single
-        // ggml_backend_tensor_get_async for K * n_outputs * 4 bytes
-        // starting at offset 0 — which would read row 0's argsort tail
-        // (= the lowest-ranked tokens) as if they were rows 1..n-1's
-        // top-K, totally garbage. Wrap with ggml_cont to materialise a
-        // compact [K, n_outputs] tensor whose row stride is K*4 bytes;
-        // a single contiguous read-back then yields the correct top-K
-        // for every output position.
-        //
-        // Cost: one extra GPU memcpy of K*n_outputs int32s per draft
-        // step (~64 bytes for K=2, bs=16; ~256 bytes for K=4). Negligible
-        // vs the ~9.7 MiB float-logits transfer the in-graph top-K
-        // already eliminates.
-        //
-        // (This fix supersedes the pre-existing K>=2 layout bug from
-        // commit 25; the byte-exact test that gated commit 25 passed
-        // for the wrong reason — drafts at K>=2 were silently garbage
-        // and target's argmax always wins, so output text matched even
-        // though acceptance dropped to ~1%. Stage B in commit 29 needs
-        // K>=2 to function, so the fix lands here as a precondition.)
-        topk = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, logits, (int) K));
+        // ggml_top_k allocates a fresh, contiguous I32 [K, ne1, ne2, ne3]
+        // tensor (not a view onto a larger argsort buffer), so the flat
+        // byte-stride read-back in llama_context::decode is correct without
+        // any wrapping ggml_cont — unlike the pre-commit-33
+        // ggml_argsort_top_k path.
+        topk = ggml_top_k(ctx0, logits, (int) K);
         cb(topk, "result_output_topk", -1);
+
+        // Companion "single argmax" for the post-decode "swap argmax to
+        // slot 0" pass. Same partial_sort kernel as the K-element top_k
+        // above (just K=1), so it parallelizes across the n_outputs rows
+        // — unlike ggml_argmax, which is single-threaded in the CPU
+        // backend (see comment block above). Result shape: I32
+        // [1, n_outputs] = n_outputs contiguous int32s, drop-in
+        // compatible with the readback into dflash.draft_topk_argmax.
+        topk_argmax = ggml_top_k(ctx0, logits, 1);
+        cb(topk_argmax, "result_output_topk_argmax", -1);
     }
-    res->t_logits      = nullptr;
-    res->t_dflash_topk = topk;
+    res->t_logits             = nullptr;
+    res->t_dflash_topk        = topk;
+    res->t_dflash_topk_argmax = topk_argmax;
 
     ggml_build_forward_expand(gf, topk);
+    if (topk_argmax) {
+        ggml_build_forward_expand(gf, topk_argmax);
+    }
 }
 
 // =================================================================
