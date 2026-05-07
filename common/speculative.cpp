@@ -26,7 +26,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE
+    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,
+    COMMON_SPECULATIVE_TYPE_DFLASH
 };
 
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
@@ -37,7 +38,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH}
 };
 
 struct common_speculative_config {
@@ -149,6 +151,20 @@ struct common_speculative_state {
             const llama_tokens & prompt_tgt,
             llama_token id_last,
             llama_tokens & result) = 0;
+
+    // DDTree (DFlash Phase 2): tree-shaped draft.
+    // Default impl returns an empty tree (chain-mode-only states).
+    virtual void draft_tree(
+            const common_params_speculative & /*params*/,
+            const llama_tokens & /*prompt_tgt*/,
+            llama_token /*id_last*/,
+            common_speculative_tree & result) {
+        result = {};
+    }
+
+    // DDTree Phase 2 Stage C alt-accept fast path. Default impl is a no-op
+    // (DRAFT speculative state has no captures buffer to remap).
+    virtual void record_alt_accept(int /*alt_capture_idx*/, int /*alt_depth*/) {}
 
     virtual void accept(uint16_t n_accepted) = 0;
 
@@ -905,6 +921,487 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
     }
 };
 
+// =============================================================================
+// DFlash speculative-decoding state
+// =============================================================================
+//
+// Reads block_size, mask_token_id, target_layer_ids from the draft GGUF;
+// installs hidden-state capture on the target context; runs a single
+// DFlash decoder forward per draft step and reads back the per-position
+// top-K argmax tokens via llama_get_dflash_draft_topk().
+//
+// Invariants:
+//   * The draft context must be created with cparams.dflash_topk set
+//     (the in-graph top-K layout depends on it).
+//   * The target's tok_embd / lm_head are bound into the draft model
+//     in `common_speculative_init` (before the draft context is created),
+//     so the DFlash decoder graph can read them via model.target_*.
+//   * Capture is installed in this state's ctor and detached in its dtor;
+//     the target context's capture state is owned by this state for its
+//     lifetime.
+struct common_speculative_state_dflash : public common_speculative_state {
+    llama_context * ctx_tgt;
+    llama_context * ctx_dft;
+
+    llama_batch batch_tgt {};
+    llama_batch batch_dft {};
+
+    uint32_t              block_size_default = 0;
+    llama_token           mask_token_id      = LLAMA_TOKEN_NULL;
+    int64_t               n_features         = 0;
+    int64_t               n_embd_target      = 0;
+    std::vector<int32_t>  target_layer_ids;
+
+    // Number of tokens whose target hidden states have been pushed through
+    // the DFlash encoder into the draft's per-layer K/V side store.
+    int64_t               n_committed_total  = 0;
+
+    // DDTree Phase 2 Stage C — alt-accept fast path.
+    //
+    // When the driver's tree-verify accept walk descends into an alt
+    // branch, it calls record_alt_accept(alt_capture_idx, alt_depth)
+    // INSTEAD OF redecoding `[id_last, m_1, ..., m_{d-1}, alt_token]` in
+    // seq 0. The fields below stash the hint; the next draft_tree →
+    // extend_side_store consumes them by remapping the captures buffer
+    // offsets. -1 = no hint pending (linear chain-prefix path applies).
+    int                   pending_alt_capture_idx = -1;
+    int                   pending_alt_depth       = 0;
+
+    // Scratch buffer used by extend_side_store to materialise the
+    // remapped captures rows for an alt-accept extend.
+    std::vector<float>    alt_remap_buf;
+
+    common_speculative_state_dflash(
+            enum common_speculative_type type,
+            llama_context * ctx_tgt,
+            llama_context * ctx_dft)
+        : common_speculative_state(type)
+        , ctx_tgt(ctx_tgt)
+        , ctx_dft(ctx_dft)
+    {
+        batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+        batch_dft = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
+
+        const llama_model * model_dft = llama_get_model(ctx_dft);
+        const llama_model * model_tgt = llama_get_model(ctx_tgt);
+
+        block_size_default = llama_model_dflash_block_size(model_dft);
+        mask_token_id      = llama_model_dflash_mask_token_id(model_dft);
+        n_embd_target      = llama_model_n_embd(model_tgt);
+
+        const int n_tlid = llama_model_dflash_n_target_layer_ids(model_dft);
+        target_layer_ids.reserve(n_tlid > 0 ? n_tlid : 0);
+        for (int i = 0; i < n_tlid; ++i) {
+            target_layer_ids.push_back(llama_model_dflash_target_layer_id(model_dft, i));
+        }
+        n_features = (int64_t) target_layer_ids.size() * n_embd_target;
+
+        // Defensive: bind target tensors into draft (idempotent — also done
+        // in common_speculative_init before draft context creation).
+        llama_dflash_bind_target(const_cast<llama_model *>(model_dft), model_tgt);
+
+        // Install per-layer hidden-state capture on the target context so
+        // every decode tees out the layers the draft was trained against.
+        if (!target_layer_ids.empty()) {
+            llama_set_dflash_capture(ctx_tgt,
+                                     target_layer_ids.data(),
+                                     target_layer_ids.size(),
+                                     n_embd_target);
+        }
+
+        LOG_INF("%s: dflash spec initialised: block_size=%u, mask_token=%d, "
+                "n_features=%lld, target_layer_ids=[",
+                __func__, block_size_default, (int) mask_token_id,
+                (long long) n_features);
+        for (size_t i = 0; i < target_layer_ids.size(); ++i) {
+            LOG_INF("%s%d", i == 0 ? "" : ",", (int) target_layer_ids[i]);
+        }
+        LOG_INF("]\n");
+    }
+
+    ~common_speculative_state_dflash() override {
+        if (ctx_tgt != nullptr) {
+            llama_set_dflash_capture(ctx_tgt, nullptr, 0, 0);
+        }
+        llama_perf_context_print(ctx_dft);
+        llama_batch_free(batch_tgt);
+        llama_batch_free(batch_dft);
+        llama_free(ctx_dft);
+    }
+
+    // begin() runs at start of each new generation.
+    //
+    // The target's prompt prefill in speculative-simple happens BEFORE this
+    // call (line ~149) without capture installed, so captures for those
+    // positions are missing. We re-decode the prompt with logits=true at
+    // every position (capture fires for each) and push the resulting
+    // captures into the draft's K/V side store.
+    //
+    // Cost: one extra prompt-length target decode per generation. For
+    // long-running gens this is negligible vs. the verify-loop time;
+    // future optimization could install capture before the user's prefill
+    // and skip this re-decode.
+    void begin(const llama_tokens & prompt) override {
+        llama_dflash_reset_ctx_kv(ctx_dft);
+        n_committed_total       = 0;
+        pending_alt_capture_idx = -1;
+        pending_alt_depth       = 0;
+
+        if (prompt.empty() || target_layer_ids.empty()) {
+            return;
+        }
+
+        const int n_to_decode = (int) prompt.size();
+        if (n_to_decode <= 0) {
+            return;
+        }
+
+        // Clear target's KV cache for the prompt re-decode.
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
+
+        common_batch_clear(batch_tgt);
+        for (int i = 0; i < n_to_decode; ++i) {
+            common_batch_add(batch_tgt, prompt[i], (llama_pos) i, { 0 }, /*logits=*/true);
+        }
+        if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+            LOG_ERR("%s: target prompt prefill (with capture) failed\n", __func__);
+            return;
+        }
+
+        if (!extend_side_store(n_to_decode, /*pos_start=*/0)) {
+            return;
+        }
+        n_committed_total = n_to_decode;
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        if (target_layer_ids.empty() || mask_token_id == LLAMA_TOKEN_NULL) {
+            return;
+        }
+
+        // Resolve block size from draft's trained block_size.
+        const int block_size = (int) block_size_default;
+        if (block_size <= 1) {
+            return;
+        }
+        // Note: params.draft.n_max may be smaller than block_size - 1 (the
+        // user asked for a shorter draft). DFlash always runs a full
+        // block decode; we emit min(block_size - 1, params.draft.n_max)
+        // tokens to the verifier. Per paper §5.4.4 only the larger-than-
+        // trained direction is un-generalisable; emitting fewer is fine.
+        const int n_emit = (params.draft.n_max > 0)
+            ? std::min<int>(block_size - 1, params.draft.n_max)
+            : block_size - 1;
+
+        // Step 1: bring the K/V side store up to date with whatever the
+        // verify loop accepted since the previous call.
+        const int64_t n_committed_after = (int64_t) prompt_tgt.size();
+        const int64_t n_to_extend       = n_committed_after - n_committed_total;
+        if (n_to_extend < 0) {
+            LOG_ERR("%s: prompt_tgt shrank below n_committed_total (%lld < %lld)\n",
+                    __func__, (long long) n_committed_after, (long long) n_committed_total);
+            return;
+        }
+        if (n_to_extend > 0) {
+            if (!extend_side_store(n_to_extend, /*pos_start=*/n_committed_total)) {
+                return;
+            }
+            n_committed_total = n_committed_after;
+        }
+
+        // Step 2: run the draft on a block [id_last, MASK, ..., MASK].
+        // Reset draft KV cache (side store carries the persistent state).
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, -1);
+
+        const llama_pos pos_block_start = (llama_pos) n_committed_total;
+        common_batch_clear(batch_dft);
+        for (int i = 0; i < block_size; ++i) {
+            const llama_token tok = (i == 0) ? id_last : mask_token_id;
+            common_batch_add(batch_dft, tok, pos_block_start + i, { 0 }, /*logits=*/true);
+        }
+        if (llama_decode(ctx_dft, batch_dft) != 0) {
+            LOG_ERR("%s: draft llama_decode failed\n", __func__);
+            return;
+        }
+
+        // Step 3: read top-K candidates per draft position (bidirectional
+        // intra-block attention: position i predicts the token AT position
+        // i, position 0 is the anchor = id_last).
+        int64_t  n_topk_outputs = 0;
+        uint32_t topk_K         = 0;
+        const int32_t * draft_topk = llama_get_dflash_draft_topk(ctx_dft, &n_topk_outputs, &topk_K);
+        if (draft_topk == nullptr || n_topk_outputs < block_size || topk_K < 1) {
+            LOG_ERR("%s: draft top-K buffer missing or too small (got n=%lld K=%u, need n>=%d K>=1)\n",
+                    __func__, (long long) n_topk_outputs, topk_K, block_size);
+            return;
+        }
+
+        // Emit positions [1..n_emit] as draft tokens (position 0 is the anchor).
+        result.reserve(n_emit);
+        for (int i = 1; i <= n_emit; ++i) {
+            result.push_back((llama_token) draft_topk[(size_t) i * topk_K + 0]);
+        }
+
+        // Reset draft cache so the next iteration starts from a clean slate.
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, -1);
+    }
+
+    void accept(uint16_t /*n_accepted*/) override {
+        // n_committed_total is updated lazily in draft() based on the size
+        // of the incoming prompt_tgt; nothing to do here.
+    }
+
+    // DDTree (DFlash Phase 2): tree-shaped variant of draft().
+    // Same draft compute (one DFlash forward pass), different post-
+    // processing — the tree builder consumes draft_topk directly instead
+    // of flattening to a chain.
+    void draft_tree(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            common_speculative_tree & result) override {
+        result = {};
+        if (target_layer_ids.empty() || mask_token_id == LLAMA_TOKEN_NULL) {
+            return;
+        }
+
+        const int block_size = (int) block_size_default;
+        if (block_size <= 1) {
+            return;
+        }
+
+        // Bring the K/V side store up to date with whatever was committed
+        // since the previous draft / draft_tree call.
+        const int64_t n_committed_after = (int64_t) prompt_tgt.size();
+        const int64_t n_to_extend       = n_committed_after - n_committed_total;
+        if (n_to_extend < 0) {
+            LOG_ERR("%s: prompt_tgt shrank below n_committed_total (%lld < %lld)\n",
+                    __func__, (long long) n_committed_after, (long long) n_committed_total);
+            return;
+        }
+        if (n_to_extend > 0) {
+            if (!extend_side_store(n_to_extend, /*pos_start=*/n_committed_total)) {
+                return;
+            }
+            n_committed_total = n_committed_after;
+        }
+
+        // Run the draft once on [id_last, MASK, ..., MASK].
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, -1);
+
+        const llama_pos pos_block_start = (llama_pos) n_committed_total;
+        common_batch_clear(batch_dft);
+        for (int i = 0; i < block_size; ++i) {
+            const llama_token tok = (i == 0) ? id_last : mask_token_id;
+            common_batch_add(batch_dft, tok, pos_block_start + i, { 0 }, /*logits=*/true);
+        }
+        if (llama_decode(ctx_dft, batch_dft) != 0) {
+            LOG_ERR("%s: draft llama_decode failed\n", __func__);
+            return;
+        }
+
+        // Read top-K candidates per draft position.
+        int64_t  n_topk_outputs = 0;
+        uint32_t topk_K         = 0;
+        const int32_t * draft_topk = llama_get_dflash_draft_topk(ctx_dft, &n_topk_outputs, &topk_K);
+        if (draft_topk == nullptr || n_topk_outputs < block_size || topk_K < 1) {
+            LOG_ERR("%s: draft top-K buffer missing or too small (got n=%lld K=%u, need n>=%d K>=1)\n",
+                    __func__, (long long) n_topk_outputs, topk_K, block_size);
+            return;
+        }
+
+        // Resolve tree budget. 0 = Stage B default (= block_size).
+        const int budget = (params.dflash_tree_budget > 0)
+                         ? params.dflash_tree_budget
+                         : block_size;
+        build_ddtree_tree(draft_topk, block_size, topk_K, budget, result);
+
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, -1);
+    }
+
+    void record_alt_accept(int alt_capture_idx, int alt_depth) override {
+        pending_alt_capture_idx = alt_capture_idx;
+        pending_alt_depth       = alt_depth;
+    }
+
+    int32_t n_max(const common_params_speculative & params) const override {
+        const int32_t bs_max = (int32_t) block_size_default - 1;
+        return params.draft.n_max > 0 ? std::min(params.draft.n_max, bs_max) : bs_max;
+    }
+
+    int32_t n_min(const common_params_speculative & params) const override {
+        return params.draft.n_min;
+    }
+
+private:
+    // Read freshly-captured target features from ctx_tgt and push the first
+    // `n_keep` of them into the draft's per-layer K/V side store at offset
+    // `pos_start`. Wraps llama_dflash_extend with a friendlier error path.
+    //
+    // Stage C alt-accept fast path: when a record_alt_accept hint is
+    // pending, the captures buffer holds the previous tree-decode outputs
+    // at indices [0..main_path_len, alt_1, ..., alt_n]; we want to push
+    // `[0, 1, ..., d-1, alt_capture_idx]` into the side store (= replace
+    // the rejected m_d capture with the accepted alt's at depth d). The
+    // remap is done host-side into `alt_remap_buf`.
+    bool extend_side_store(int64_t n_keep, int64_t pos_start) {
+        int64_t n_outputs = 0;
+        const float * captures = llama_get_dflash_captured_features(ctx_tgt, &n_outputs);
+        if (captures == nullptr || n_outputs == 0) {
+            LOG_ERR("%s: target captured no features (capture not installed or no outputs requested)\n", __func__);
+            return false;
+        }
+        if (n_keep > n_outputs) {
+            LOG_ERR("%s: asked to keep %lld captures but target produced only %lld\n",
+                    __func__, (long long) n_keep, (long long) n_outputs);
+            return false;
+        }
+
+        const float * extend_buf = captures;
+
+        if (pending_alt_capture_idx >= 0) {
+            const int     d                = pending_alt_depth;
+            const int     alt_idx          = pending_alt_capture_idx;
+            const int64_t expected_n_keep  = (int64_t) d + 1;
+            const size_t  row_floats       = (size_t) n_features;
+
+            if (n_keep != expected_n_keep) {
+                LOG_ERR("%s: alt-accept remap: n_keep=%lld but alt_depth+1=%lld (out of sync)\n",
+                        __func__, (long long) n_keep, (long long) expected_n_keep);
+                return false;
+            }
+            if (alt_idx >= n_outputs) {
+                LOG_ERR("%s: alt-accept remap: alt_capture_idx=%d but only %lld outputs\n",
+                        __func__, alt_idx, (long long) n_outputs);
+                return false;
+            }
+            if (row_floats == 0) {
+                LOG_ERR("%s: alt-accept remap: n_features=0\n", __func__);
+                return false;
+            }
+
+            const size_t buf_size = (size_t) (d + 1) * row_floats;
+            if (alt_remap_buf.size() < buf_size) {
+                alt_remap_buf.resize(buf_size);
+            }
+            if (d > 0) {
+                std::memcpy(
+                    alt_remap_buf.data(),
+                    captures,
+                    (size_t) d * row_floats * sizeof(float));
+            }
+            std::memcpy(
+                alt_remap_buf.data() + (size_t) d * row_floats,
+                captures + (size_t) alt_idx * row_floats,
+                row_floats * sizeof(float));
+            extend_buf = alt_remap_buf.data();
+
+            // Consume the hint: subsequent extends use the linear path.
+            pending_alt_capture_idx = -1;
+            pending_alt_depth       = 0;
+        }
+
+        const int32_t rc = llama_dflash_extend(ctx_dft, extend_buf, n_keep, pos_start);
+        if (rc != 0) {
+            LOG_ERR("%s: llama_dflash_extend failed (rc=%d)\n", __func__, rc);
+            return false;
+        }
+        return true;
+    }
+
+    // Stage C tree shape: chain seed (top-1 at depths 1..bs-1, capped at
+    // budget) + uniform round-robin sibling expansion (rank 1..K-1 across
+    // all depths) until budget is exhausted. Each alt is a LEAF hanging
+    // off the main chain at its depth and gets a unique branch_id.
+    static void build_ddtree_tree(const int32_t * draft_topk,
+                                  int             block_size,
+                                  uint32_t        topk_K,
+                                  int             budget,
+                                  common_speculative_tree & tree) {
+        tree.tokens.clear();
+        tree.parents.clear();
+        tree.depths.clear();
+        tree.branch_ids.clear();
+        tree.child_maps.clear();
+        tree.visibility.clear();
+        tree.n_nodes       = 0;
+        tree.main_path_len = 0;
+        tree.n_branches    = 1;
+
+        if (budget <= 0 || block_size <= 1) {
+            // Degenerate: return empty tree (just the implicit root).
+            tree.parents.push_back(-1);
+            tree.child_maps.emplace_back();
+            tree.visibility.assign(1, 1);
+            return;
+        }
+
+        // Root.
+        tree.parents.push_back(-1);
+        tree.child_maps.emplace_back();
+
+        // ----- chain seed (main path) -----
+        const int chain_target = std::min(block_size - 1, budget);
+        {
+            int parent = 0;
+            for (int d = 1; d <= chain_target; ++d) {
+                const llama_token tok = (llama_token) draft_topk[(size_t) d * topk_K + 0];
+                const int idx = tree.n_nodes + 1;
+                tree.tokens.push_back(tok);
+                tree.parents.push_back(parent);
+                tree.depths.push_back(d);
+                tree.branch_ids.push_back(0); // main branch
+                tree.child_maps.emplace_back();
+                tree.child_maps[parent][tok] = idx;
+                tree.n_nodes++;
+                parent = idx;
+            }
+            tree.main_path_len = tree.n_nodes;
+        }
+
+        // ----- alt leaves (Stage C uniform expansion) -----
+        if (topk_K >= 2 && tree.n_nodes < budget) {
+            int next_branch = 1;
+            for (uint32_t rank = 1; rank < topk_K && tree.n_nodes < budget; ++rank) {
+                for (int d = 1; d <= chain_target && tree.n_nodes < budget; ++d) {
+                    const int alt_parent_idx = d - 1; // root or main_path[d-1]
+                    const llama_token alt_tok =
+                        (llama_token) draft_topk[(size_t) d * topk_K + rank];
+                    if (alt_tok < 0) continue;
+                    if (tree.child_maps[alt_parent_idx].count(alt_tok)) continue;
+
+                    const int idx = tree.n_nodes + 1;
+                    tree.tokens.push_back(alt_tok);
+                    tree.parents.push_back(alt_parent_idx);
+                    tree.depths.push_back(d);
+                    tree.branch_ids.push_back(next_branch);
+                    tree.child_maps.emplace_back();
+                    tree.child_maps[alt_parent_idx][alt_tok] = idx;
+                    tree.n_nodes++;
+                    next_branch++;
+                }
+            }
+            tree.n_branches = next_branch;
+        }
+
+        // ----- visibility matrix (Stage A tree-mask compatibility) -----
+        const int n = tree.n_nodes + 1;
+        tree.visibility.assign((size_t) n * n, 0);
+        tree.visibility[0 * n + 0] = 1;
+        for (int i = 1; i < n; ++i) {
+            const int parent = tree.parents[i];
+            for (int j = 0; j < i; ++j) {
+                tree.visibility[(size_t) i * n + j] = tree.visibility[(size_t) parent * n + j];
+            }
+            tree.visibility[(size_t) i * n + i] = 1;
+        }
+    }
+};
+
 struct common_speculative {
     std::vector<std::unique_ptr<common_speculative_state>> impls; // list of implementations to use and their states
 
@@ -957,6 +1454,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
+        case COMMON_SPECULATIVE_TYPE_DFLASH:        return "dflash";
         default:                                    return "unknown";
     }
 }
@@ -975,6 +1473,35 @@ common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt) {
     llama_context * ctx_dft = nullptr;
+
+    // Detect DFlash drafts before context creation: if the user explicitly
+    // requested DFlash, OR if the loaded draft GGUF carries DFlash metadata
+    // and no other type was requested, the target's tok_embd / lm_head
+    // must be bound into the draft model BEFORE `llama_init_from_model`
+    // (graph_reserve runs at context creation and reads target_tok_embd /
+    // target_output via the bound model.target_* fields).
+    const bool draft_is_dflash =
+        params.draft.model != nullptr &&
+        llama_model_dflash_block_size(params.draft.model) > 0;
+
+    const bool want_dflash =
+        (params.type == COMMON_SPECULATIVE_TYPE_DFLASH) ||
+        (draft_is_dflash && params.type == COMMON_SPECULATIVE_TYPE_NONE);
+
+    if (want_dflash) {
+        if (!draft_is_dflash) {
+            LOG_ERR("%s: --draft-type dflash requires a DFlash draft GGUF "
+                    "(missing dflash.block_size metadata)\n", __func__);
+            return nullptr;
+        }
+        const llama_model * model_tgt = llama_get_model(ctx_tgt);
+        if (!llama_dflash_bind_target(params.draft.model, model_tgt)) {
+            LOG_WRN("%s: llama_dflash_bind_target returned false; the draft "
+                    "graph will fall back to its self-contained tensors\n",
+                    __func__);
+        }
+    }
+
     if (params.draft.model) {
         ctx_dft = llama_init_from_model(params.draft.model, params.draft.cparams);
         if (ctx_dft == nullptr) {
@@ -994,6 +1521,7 @@ common_speculative * common_speculative_init(
         bool has_ngram_map_k   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
         bool has_ngram_map_k4v = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         bool has_ngram_mod     = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+        bool has_dflash        = want_dflash;
 
         // In a more complex implementation we could use the same implementation but with different parameters.
         // This was initially used in PR-18471 but removed to simplify the code.
@@ -1028,7 +1556,13 @@ common_speculative * common_speculative_init(
         if (has_ngram_cache) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
         }
-        if (has_draft) {
+        if (has_dflash) {
+            // DFlash takes precedence over the regular DRAFT path when the
+            // draft model is a DFlash GGUF; the two are mutually exclusive
+            // (DFlash binds target tensors into the draft model, which a
+            // regular small-draft path doesn't expect).
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DFLASH, params));
+        } else if (has_draft) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
         }
         if (has_draft_eagle3) {
@@ -1091,6 +1625,11 @@ common_speculative * common_speculative_init(
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {
                 auto state = create_state_ngram_cache(params.ngram_cache.lookup_cache_static, params.ngram_cache.lookup_cache_dynamic, config);
                 impls.push_back(std::make_unique<common_speculative_state_ngram_cache>(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DFLASH: {
+                impls.push_back(std::make_unique<common_speculative_state_dflash>(
+                    config.type, ctx_tgt, ctx_dft));
                 break;
             }
             default:
@@ -1170,6 +1709,51 @@ llama_tokens common_speculative_draft(
     }
 
     return result;
+}
+
+common_speculative_tree common_speculative_draft_tree(
+        common_speculative * spec,
+        const common_params_speculative & params,
+        const llama_tokens & prompt_tgt,
+        llama_token id_last) {
+    common_speculative_tree result;
+
+    if (spec == nullptr) {
+        return result;
+    }
+
+    spec->curr_impl = nullptr;
+
+    // Tree-mode is currently DFlash-only; iterate impls and use the first
+    // one that produces a non-empty tree.
+    for (auto & impl : spec->impls) {
+        {
+            common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+            impl->draft_tree(params, prompt_tgt, id_last, result);
+            impl->n_call_draft++;
+        }
+
+        if (result.n_nodes > 0) {
+            spec->curr_impl = impl.get();
+            impl->n_gen_drafts++;
+            impl->n_gen_tokens += result.n_nodes;
+            break;
+        }
+    }
+
+    return result;
+}
+
+void common_speculative_record_alt_accept(
+        common_speculative * spec,
+        int                  alt_capture_idx,
+        int                  alt_depth) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->record_alt_accept(alt_capture_idx, alt_depth);
+    }
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {

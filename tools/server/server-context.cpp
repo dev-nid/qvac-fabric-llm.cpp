@@ -807,6 +807,10 @@ private:
 
             params_base.speculative.draft.model = model_dft.get();
             params_base.speculative.draft.cparams = common_context_params_to_llama(params_dft);
+
+            // Forward DFlash-specific cparams to the draft context.
+            params_base.speculative.draft.cparams.dflash_max_ctx = params_base.speculative.dflash_max_ctx;
+            params_base.speculative.draft.cparams.dflash_topk    = params_base.speculative.dflash_topk;
         }
 
         std::string & mmproj_path = params_base.mmproj.path;

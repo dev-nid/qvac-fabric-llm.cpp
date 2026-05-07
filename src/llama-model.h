@@ -559,6 +559,18 @@ struct llama_model {
     struct ggml_tensor * dense_2_out_layers_b = nullptr;
     struct ggml_tensor * dense_3_out_layers   = nullptr;
 
+    // DFlash speculative-decoding draft globals
+    // dflash_fc projects len(target_layer_ids)*n_embd -> n_embd
+    // dflash_hidden_norm is the RMSNorm applied to the projected target hidden state
+    struct ggml_tensor * dflash_fc           = nullptr;
+    struct ggml_tensor * dflash_hidden_norm  = nullptr;
+
+    // Paper §4.2: shared frozen tok_embd + lm_head from the target.
+    // Bound at runtime by the speculative driver via llama_dflash_bind_target().
+    // Non-owning references — never freed by this model.
+    struct ggml_tensor * target_tok_embd = nullptr;
+    struct ggml_tensor * target_output   = nullptr;
+
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 

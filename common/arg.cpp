@@ -3504,6 +3504,100 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
 
+    // ---------- DFlash speculative-decoding flags ----------
+    add_opt(common_arg(
+        {"--draft-type"}, "TYPE",
+        "speculative decoding algorithm: 'draft' (small vocab-compatible draft model), "
+        "'dflash' (DFlash block-parallel speculative decoding via paper §4.1 "
+        "K/V cache reuse). When 'dflash', the draft GGUF must be a DFlash GGUF "
+        "(carrying dflash.block_size metadata). Defaults to auto-detection: "
+        "DFlash is selected when the loaded draft GGUF has DFlash metadata.",
+        [](common_params & params, const std::string & value) {
+            if      (value == "draft" ) { params.speculative.type = COMMON_SPECULATIVE_TYPE_DRAFT;  }
+            else if (value == "dflash") { params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH; }
+            else if (value == "auto"  ) { params.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;   }
+            else {
+                throw std::invalid_argument(
+                    string_format("invalid --draft-type value '%s' (allowed: auto, draft, dflash)", value.c_str()));
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_TYPE"));
+
+    add_opt(common_arg(
+        {"--dflash-max-ctx"}, "N",
+        string_format(
+            "DFlash drafter: sliding-window cap on the per-layer K/V side store (default: %d). "
+            "-1 = auto-scale (clamp(n_ctx_seq/4, 512, 1024)). "
+            " 0 = uncapped. "
+            ">0 = explicit cap. Ignored for non-DFlash drafts.",
+            params.speculative.dflash_max_ctx),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument(
+                    string_format("invalid --dflash-max-ctx value %d (must be >= -1)", value));
+            }
+            params.speculative.dflash_max_ctx = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_MAX_CTX"));
+
+    add_opt(common_arg(
+        {"--dflash-topk"}, "K",
+        string_format(
+            "DFlash drafter: number of top-K candidate tokens emitted per draft position "
+            "(default: %d). 1 = chain mode (greedy argmax). >=2 = tree mode (top-K via "
+            "ggml_argsort_top_k); the speculative driver consumes the extras to build "
+            "K parallel verify chains. Ignored for non-DFlash drafts.",
+            params.speculative.dflash_topk),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument(
+                    string_format("invalid --dflash-topk value %d (must be >= 1)", value));
+            }
+            params.speculative.dflash_topk = (uint32_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_TOPK"));
+
+    add_opt(common_arg(
+        {"--dflash-tree"},
+        "DFlash drafter: enable DDTree Phase 2 multi-seq tree-shaped verify. "
+        "The driver builds a tree of likely continuations from the draft's per-position "
+        "top-K, runs ONE target verify pass with multi-seq tagging (one seq_id per "
+        "branch), walks the accept tree to pick the longest accepted chain, and uses "
+        "per-branch seq_rm rollback. Default tree shape (no --dflash-tree-budget): chain "
+        "seed + 1 alt at depth 1 = block_size nodes (Stage B). Auto-bumps --dflash-topk "
+        "to 2 if needed. Strong-correctness preserved by construction.",
+        [](common_params & params) {
+            params.speculative.dflash_tree = true;
+            if (params.speculative.dflash_topk < 2) {
+                params.speculative.dflash_topk = 2;
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_TREE"));
+
+    add_opt(common_arg(
+        {"--dflash-tree-budget"}, "B",
+        string_format(
+            "DFlash drafter (Stage C): total tree node budget excluding the implicit root "
+            "(default: %d, 0 = Stage B shape). Implies --dflash-tree. Tree composition: "
+            "chain seed of min(B, block_size-1) main-path nodes, then uniform round-robin "
+            "sibling expansion (rank 1, 2, ..., K-1 across all depths) until B nodes total. "
+            "n_branches = 1 + (B - chain_len). Recommended budgets to try: 16 (Stage B), "
+            "18 (small NL win on Qwen3-4B-DFlash), 22 (Lucebox sweet spot on larger "
+            "targets). Strong-correctness preserved at any budget.",
+            params.speculative.dflash_tree_budget),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument(
+                    string_format("invalid --dflash-tree-budget value %d (must be >= 0)", value));
+            }
+            params.speculative.dflash_tree_budget = value;
+            params.speculative.dflash_tree        = true;
+            if (params.speculative.dflash_topk < 2) {
+                params.speculative.dflash_topk = 2;
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_TREE_BUDGET"));
+
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),

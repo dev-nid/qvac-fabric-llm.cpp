@@ -1858,3 +1858,35 @@ struct llama_model_step35 : public llama_model_base {
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
+
+
+// DFlash speculative-decoding draft model.
+//
+// Structurally a Qwen3-shaped decoder with two extra globals:
+//   - dflash_fc       : projects concat(target hidden states) -> hidden_size
+//   - dflash_hidden_norm: RMSNorm applied on the projection result
+//
+// The token embedding and lm_head live in the *target* model and are bound
+// at runtime by the speculative driver (llama_dflash_bind_target).
+struct llama_model_dflash : public llama_model_base {
+    llama_model_dflash(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // Decoder graph (built once per draft decode by the standard build_graph
+    // dispatch). Reads K_ctx / V_ctx via zero-copy views of the per-layer
+    // K/V side store populated by the encoder graph.
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    // Encoder graph (called from llama_context::dflash_extend, NOT via the
+    // standard build_graph dispatch). Projects newly-committed target
+    // features through fc + hidden_norm + per-layer wk/wv (+k_norm +RoPE)
+    // and scatters them into the per-layer side store.
+    struct encode_graph : public llm_graph_context {
+        encode_graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};

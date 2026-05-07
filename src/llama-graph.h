@@ -73,6 +73,53 @@ struct llama_cross {
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
 };
 
+// DFlash cross-context state.
+//
+// Two roles, one struct:
+//   (a) On the *draft* context — speculative driver pushes per-block target
+//       hidden states into the per-layer K/V side store via
+//       llama_dflash_extend(). The drafter graph reads `n_ctx` and the side
+//       store tensors `ctx_K[il]` / `ctx_V[il]` to build cross-attention.
+//   (b) On the *target* context — driver writes capture_layer_ids /
+//       capture_n_embd via llama_set_dflash_capture() before any decode.
+//       The target graph tees out hidden states at those layer indices.
+struct llama_dflash {
+    // ---------- (a) drafter sizing ----------
+    int64_t n_features = 0; // per-token feature dim (n_target_layer_ids * n_embd_target)
+    int64_t n_ctx      = 0; // K_ctx column count seen by drafter's attention
+
+    // ---------- (b) target capture ----------
+    std::vector<int32_t> capture_layer_ids;
+    int64_t              capture_n_embd = 0;
+    std::vector<float>   captured_features;
+    int64_t              captured_n_outputs = 0;
+
+    // Per-layer host staging buffers for batched D2H capture transfer.
+    std::vector<std::vector<float>> capture_staging;
+
+    // ---------- (a') drafter inline top-K read-back ----------
+    std::vector<int32_t> draft_topk;
+    int64_t              draft_topk_n_outputs = 0;
+    uint32_t             draft_topk_K         = 0;
+
+    // Companion to draft_topk for the K>=2 path.
+    std::vector<int32_t> draft_topk_argmax;
+
+    // ---------- (c) per-layer K/V side store (paper §4.1 reuse) ----------
+    std::vector<ggml_tensor *> ctx_K;
+    std::vector<ggml_tensor *> ctx_V;
+    int64_t ctx_filled   = 0;
+    int64_t ctx_capacity = 0;
+    int64_t ctx_pos_base = 0;
+};
+
+// DDTree (DFlash Phase 2): custom attention mask for tree-shaped verification.
+struct llama_tree_mask {
+    bool                 active        = false;
+    int                  n_tree_tokens = 0;
+    std::vector<uint8_t> visibility;
+};
+
 struct llm_graph_params;
 
 //
@@ -259,6 +306,25 @@ public:
     const llama_cross * cross;
 };
 
+// DFlash drafter context input.
+// Builds the non-causal kq_mask for the drafter's cross-attention over
+// the [side-store K/V | proposal] segments.
+class llm_graph_input_dflash : public llm_graph_input_i {
+public:
+    llm_graph_input_dflash(const llama_dflash * dflash, int64_t n_ctx, int64_t n_block)
+        : dflash(dflash), n_ctx(n_ctx), n_block(n_block) {}
+    virtual ~llm_graph_input_dflash() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * kq_mask     = nullptr; // F32 [n_ctx + n_block, n_block_pad, 1, 1]
+    ggml_tensor * kq_mask_cnv = nullptr; // f16 cast for flash_attn
+
+    const llama_dflash * dflash;
+    int64_t              n_ctx;
+    int64_t              n_block;
+};
+
 class llm_graph_input_attn_no_cache : public llm_graph_input_i {
 public:
     llm_graph_input_attn_no_cache(const llama_hparams & hparams, const llama_cparams & cparams) :
@@ -287,10 +353,12 @@ public:
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_context * mctx) :
+            const llama_kv_cache_context * mctx,
+            const llama_tree_mask * tree_mask = nullptr) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        tree_mask(tree_mask) {
     }
     ~llm_graph_input_attn_kv() = default;
 
@@ -320,6 +388,13 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+
+    // DDTree: when non-null AND `tree_mask->active`, set_input overwrites
+    // the [n_tree_tokens × n_tree_tokens] block of the freshly written
+    // attention mask with `visibility[i*n+j] ? 0.0f : -INFINITY`. Pointer
+    // borrowed from llama_context::tree_mask. nullptr (the default) means
+    // "no override — Stage A no-op".
+    const llama_tree_mask * tree_mask = nullptr;
 };
 
 // V-less input for the KV cache
@@ -544,6 +619,8 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_dflash           * dflash    = nullptr; // DFlash drafter state (capture, K/V side store)
+    const llama_tree_mask        * tree_mask = nullptr; // DDTree custom attention mask (nullptr = no override)
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -630,7 +707,9 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            dflash    == other.dflash &&
+            tree_mask == other.tree_mask;
     }
 };
 
@@ -672,6 +751,19 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+
+    // DFlash drafter: in-graph top-K candidate token IDs of the per-position
+    // lm_head logits. When non-null, llm_build_dflash sets t_logits = nullptr
+    // — the float-logits read-back is skipped to eliminate the
+    // bs * n_vocab * 4 byte PCIe transfer per block (replaced by a
+    // K * bs * 4 byte int32 read-back).
+    ggml_tensor * t_dflash_topk        = nullptr;
+    ggml_tensor * t_dflash_topk_argmax = nullptr;
+
+    // DFlash target hidden-state captures, one per entry in
+    // dflash->capture_layer_ids (parallel order). Each tensor has shape
+    // [n_embd_target, n_outputs].
+    std::vector<ggml_tensor *> t_dflash_captures;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -758,6 +850,8 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_dflash           * dflash    = nullptr; // DFlash drafter context
+    const llama_tree_mask        * tree_mask = nullptr; // DDTree custom attention mask (nullptr = no override)
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -888,6 +982,18 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos_bucket_enc() const;
     ggml_tensor * build_inp_pos_bucket_dec() const;
     ggml_tensor * build_pos_bias(ggml_tensor * pos_bucket, ggml_tensor * attn_rel_b) const;
+
+    // DFlash drafter cross-context input.
+    // Returns the kq_mask input for the drafter's bidirectional
+    // cross-attention. K_ctx / V_ctx themselves are zero-copy views of
+    // the per-layer side store and are built directly in the dflash graph.
+    llm_graph_input_dflash * build_inp_dflash() const;
+
+    // DFlash target hidden-state capture.
+    // If `il` is in dflash->capture_layer_ids, register `cur` as an output
+    // tensor and push it into res->t_dflash_captures so llama_context::decode()
+    // can read it back. No-op if dflash is null or capture is disabled.
+    void build_dflash_capture(ggml_tensor * cur, int il) const;
 
     //
     // attention

@@ -9,6 +9,10 @@
 #define LLAMA_MAX_LAYERS  512
 #define LLAMA_MAX_EXPERTS 512 // Qwen3 Next
 
+// max number of target layers a DFlash draft may concatenate hidden states from.
+// real DFlash drafts use 1-4 layers; we cap at 32 to be safe.
+#define LLAMA_DFLASH_MAX_TARGET_LAYERS 32
+
 enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX        = 1,
@@ -212,6 +216,13 @@ struct llama_hparams {
 
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
+
+    // DFlash speculative-decoding draft model parameters
+    uint32_t    dflash_block_size              = 0;
+    llama_token dflash_mask_token_id           = LLAMA_TOKEN_NULL;
+    uint32_t    dflash_num_target_layers       = 0; // size of the target model the draft was trained against
+    uint32_t    dflash_n_target_layer_ids      = 0; // number of valid entries in dflash_target_layer_ids
+    std::array<int32_t, LLAMA_DFLASH_MAX_TARGET_LAYERS> dflash_target_layer_ids;
 
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141

@@ -160,6 +160,14 @@ llama_model_qwen3vlmoe::graph::graph(const llama_model & model, const llm_graph_
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        // DFlash: tee out this layer's hidden state if requested.
+        // No-op when the context isn't being used as a DFlash target.
+        // Note for VL-MoE: the published Qwen3-VL-MoE-DFlash checkpoints
+        // were trained against the post-residual hidden state of each
+        // layer (the same point as plain Qwen3-MoE), not the deepstack
+        // intermediate. We capture before the deepstack overwrite below.
+        build_dflash_capture(cur, il);
+
         if (il < (int) n_deepstack_layers) {
             ggml_tensor * ds = ggml_view_2d(ctx0, res->t_inp_embd, n_embd, n_tokens, res->t_inp_embd->nb[1], (il + 1) * n_embd * sizeof(float));
             cur = ggml_add(ctx0, cur, ds);

@@ -284,6 +284,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_kimi_linear(params);
         case LLM_ARCH_STEP35:
             return new llama_model_step35(params);
+        case LLM_ARCH_DFLASH:
+            return new llama_model_dflash(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -2307,6 +2309,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_DFLASH:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
@@ -2424,6 +2427,46 @@ const char * llama_model_chat_template(const llama_model * model, const char * n
 
 uint64_t llama_model_n_params(const llama_model * model) {
     return model->n_elements();
+}
+
+uint32_t llama_model_dflash_block_size(const struct llama_model * model) {
+    return model->hparams.dflash_block_size;
+}
+
+llama_token llama_model_dflash_mask_token_id(const struct llama_model * model) {
+    return model->hparams.dflash_mask_token_id;
+}
+
+int32_t llama_model_dflash_n_target_layer_ids(const struct llama_model * model) {
+    return (int32_t) model->hparams.dflash_n_target_layer_ids;
+}
+
+int32_t llama_model_dflash_target_layer_id(const struct llama_model * model, int32_t i) {
+    const auto & h = model->hparams;
+    if (i < 0 || (uint32_t) i >= h.dflash_n_target_layer_ids) {
+        return -1;
+    }
+    return h.dflash_target_layer_ids[i];
+}
+
+int32_t llama_model_dflash_num_target_layers(const struct llama_model * model) {
+    return (int32_t) model->hparams.dflash_num_target_layers;
+}
+
+bool llama_dflash_bind_target(struct llama_model * model_dft, const struct llama_model * model_tgt) {
+    if (model_dft == nullptr || model_tgt == nullptr) {
+        return false;
+    }
+
+    if (model_dft->arch != LLM_ARCH_DFLASH) {
+        return false;
+    }
+
+    // Copy non-owning pointers from target → draft.
+    model_dft->target_tok_embd = const_cast<ggml_tensor *>(model_tgt->tok_embd);
+    model_dft->target_output   = const_cast<ggml_tensor *>(model_tgt->output);
+
+    return true;
 }
 
 bool llama_model_has_encoder(const llama_model * model) {

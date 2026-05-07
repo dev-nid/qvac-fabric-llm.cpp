@@ -348,6 +348,41 @@ void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    if (dflash == nullptr) {
+        return;
+    }
+
+    // kq_mask shape: [n_kv = n_ctx + n_block, n_block_pad, 1, 1].
+    // Rows q in [0, n_block):
+    //   * ctx slot k in [0, n_ctx)        — open if k < n_real, else -inf
+    //   * proposal slot k in [n_ctx, n_kv) — open (bidirectional)
+    // Rows q in [n_block, n_block_pad): fully masked (-inf).
+    if (kq_mask && kq_mask->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
+        float * data            = (float *) kq_mask->data;
+        const int64_t n_real    = std::min<int64_t>(dflash->n_ctx, n_ctx);
+        const int64_t n_kv      = n_ctx + n_block;
+        const int64_t n_block_p = kq_mask->ne[1]; // actual second-dim shape (may be padded by FA)
+        for (int64_t q = 0; q < n_block; ++q) {
+            for (int64_t k = 0; k < n_kv; ++k) {
+                if (k < n_ctx) {
+                    data[q * n_kv + k] = (k < n_real) ? 0.0f : -INFINITY;
+                } else {
+                    data[q * n_kv + k] = 0.0f;
+                }
+            }
+        }
+        for (int64_t q = n_block; q < n_block_p; ++q) {
+            for (int64_t k = 0; k < n_kv; ++k) {
+                data[q * n_kv + k] = -INFINITY;
+            }
+        }
+    }
+}
+
 static void print_mask(const float * data, int64_t n_tokens, int64_t n_kv, int64_t n_swa, llama_swa_type swa_type) {
     LLAMA_LOG_DEBUG("%s: === Attention mask ===\n", __func__);
     const char * swa_type_str = "unknown";
@@ -454,6 +489,34 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+    // DDTree (Phase 2 prep): if a tree mask is active, overwrite the
+    // [n × n] tree block of the freshly written attention mask with
+    // `visibility[i*n+j] ? 0.0f : -INFINITY`. Stage A no-op when
+    // tree_mask is null or inactive.
+    if (tree_mask && tree_mask->active) {
+        GGML_ASSERT(self_kq_mask != nullptr);
+        GGML_ASSERT(self_k_idxs  != nullptr);
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_k_idxs->buffer));
+        GGML_ASSERT(self_kq_mask->ne[3] == 1 && "tree-mask requires single-stream KV (kv_unified=true)");
+
+        float   * mask_data = (float *)   self_kq_mask->data;
+        int64_t * k_idxs    = (int64_t *) self_k_idxs->data;
+
+        const int     n    = tree_mask->n_tree_tokens;
+        const int64_t n_kv = self_kq_mask->ne[0];
+
+        GGML_ASSERT((int) ubatch->n_tokens == n);
+        GGML_ASSERT((int) tree_mask->visibility.size() == n * n);
+
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                const float val = tree_mask->visibility[i * n + j] ? 0.0f : -INFINITY;
+                mask_data[i * n_kv + k_idxs[j]] = val;
+            }
+        }
+    }
 
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
@@ -805,11 +868,14 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
-    t_inp_tokens  = nullptr;
-    t_inp_embd    = nullptr;
-    t_logits      = nullptr;
-    t_embd        = nullptr;
-    t_embd_pooled = nullptr;
+    t_inp_tokens         = nullptr;
+    t_inp_embd           = nullptr;
+    t_logits             = nullptr;
+    t_embd               = nullptr;
+    t_embd_pooled        = nullptr;
+    t_dflash_topk        = nullptr;
+    t_dflash_topk_argmax = nullptr;
+    t_dflash_captures.clear();
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -951,6 +1017,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    dflash           (params.dflash),
+    tree_mask        (params.tree_mask),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1889,6 +1957,58 @@ ggml_tensor * llm_graph_context::build_inp_cross_embd() const {
     return cur;
 }
 
+void llm_graph_context::build_dflash_capture(ggml_tensor * cur, int il) const {
+    if (dflash == nullptr) {
+        return;
+    }
+    if (dflash->capture_layer_ids.empty()) {
+        return;
+    }
+    bool wanted = false;
+    for (int32_t want : dflash->capture_layer_ids) {
+        if (want == il) {
+            wanted = true;
+            break;
+        }
+    }
+    if (!wanted) {
+        return;
+    }
+    // Force a copy via ggml_dup() so each capture has its own backend storage,
+    // otherwise ggml-alloc's per-backend scratch reuse aliases consecutive
+    // capture tensors. ggml_set_output() prevents recycling before readback.
+    ggml_tensor * cap = ggml_dup(ctx0, cur);
+    ggml_format_name(cap, "dflash_capture-%d", il);
+    ggml_set_output(cap);
+    ggml_build_forward_expand(gf, cap);
+    res->t_dflash_captures.push_back(cap);
+}
+
+llm_graph_input_dflash * llm_graph_context::build_inp_dflash() const {
+    GGML_ASSERT(dflash != nullptr && "build_inp_dflash() called without a llama_dflash on the context");
+
+    const int64_t n_ctx_dft = dflash->n_ctx;
+    const int64_t n_block   = (int64_t) n_tokens;
+
+    GGML_ASSERT(n_block > 0 && "DFlash: n_block must be > 0");
+
+    auto inp = std::make_unique<llm_graph_input_dflash>(dflash, n_ctx_dft, n_block);
+
+    // kq_mask: [n_kv = n_ctx + n_block, n_block, 1, 1].
+    // Note: upstream removed GGML_KQ_MASK_PAD; flash-attention kernels now
+    // accept un-padded kq_mask shapes.
+    const int64_t n_kv = n_ctx_dft + n_block;
+    inp->kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, n_block, 1, 1);
+    ggml_set_input(inp->kq_mask);
+    cb(inp->kq_mask, "dflash_kq_mask", -1);
+
+    inp->kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->kq_mask, GGML_TYPE_F16) : inp->kq_mask;
+
+    auto * inp_ptr = inp.get();
+    res->add_input(std::move(inp));
+    return inp_ptr;
+}
+
 ggml_tensor * llm_graph_context::build_inp_pos_bucket_enc() const {
     auto inp = std::make_unique<llm_graph_input_pos_bucket>(hparams);
 
@@ -2148,9 +2268,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+    const llama_tree_mask * tree_mask = nullptr) {
 
-    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
+    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur, tree_mask);
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
@@ -2171,7 +2292,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, tree_mask);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }

@@ -164,6 +164,16 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        // DFlash: tee out this layer's hidden state if requested.
+        // No-op when the context isn't being used as a DFlash target.
+        // Note for Qwen3-Next: this arch interleaves linear attention
+        // (DeltaNet) and full-attention layers; the published
+        // Qwen3-Next-DFlash checkpoints capture from the standard
+        // attention layers. The capture point is identical (post-
+        // residual `cur`); the layer-id selection done by the speculative
+        // driver via target_layer_ids picks the right ones.
+        build_dflash_capture(cur, il);
+
         // Input for next layer
         inpL = cur;
     }

@@ -393,6 +393,9 @@ namespace GGUFMeta {
     }
 
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
+    // DFlash target_layer_ids
+    template bool llama_model_loader::get_arr<std::array<int32_t, LLAMA_DFLASH_MAX_TARGET_LAYERS>>(
+        enum llm_kv kid, std::array<int32_t, LLAMA_DFLASH_MAX_TARGET_LAYERS> & result, bool required);
 
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {

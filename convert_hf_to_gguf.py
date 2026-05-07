@@ -4808,6 +4808,60 @@ class Qwen3Model(Qwen2Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+# ---------------------------------------------------------------------------
+# DFlash speculative-decoding draft model
+# ---------------------------------------------------------------------------
+#
+# DFlash drafts are small Qwen3-shaped decoders that share their token
+# embedding and lm_head with the *target* model. They carry an extra
+# 'fc' projection from concat(target hidden states) -> hidden_size and a
+# matching 'hidden_norm' RMSNorm.
+#
+# Reference: https://github.com/z-lab/dflash
+@ModelBase.register("DFlashDraftModel")
+class DFlashModel(Qwen3Model):
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        cfg = self.hparams
+        block_size = int(cfg.get("block_size", 16))
+        self.gguf_writer.add_dflash_block_size(block_size)
+
+        dflash_config = cfg.get("dflash_config", {})
+        mask_token_id = int(dflash_config.get("mask_token_id", 0))
+        self.gguf_writer.add_dflash_mask_token_id(mask_token_id)
+
+        n_target_layers = int(cfg.get("num_target_layers", 0))
+        if n_target_layers > 0:
+            self.gguf_writer.add_dflash_num_target_layers(n_target_layers)
+
+        target_layer_ids = dflash_config.get("target_layer_ids")
+        if target_layer_ids is None:
+            n_draft_layers = int(cfg["num_hidden_layers"])
+            if n_draft_layers <= 1:
+                target_layer_ids = [n_target_layers // 2]
+            else:
+                start = 1
+                end = max(start, n_target_layers - 3)
+                span = end - start
+                target_layer_ids = [
+                    int(round(start + (i * span) / (n_draft_layers - 1)))
+                    for i in range(n_draft_layers)
+                ]
+        self.gguf_writer.add_dflash_target_layer_ids([int(x) for x in target_layer_ids])
+
+    def modify_tensors(self, data_torch, name, bid):
+        # Paper §4.2: DFlash drafts share embed_tokens and lm_head with the
+        # target model and keep them frozen during training. Drop them so
+        # the resulting GGUF is paper-faithful and forces the inference
+        # engine to bind them from the target via llama_dflash_bind_target.
+        if "embed_tokens" in name or "lm_head" in name:
+            return []
+        return super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("Qwen3MoeForCausalLM")
 class Qwen3MoeModel(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.QWEN3MOE

@@ -164,6 +164,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash block-parallel speculative drafting (paper §4.1)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -359,6 +360,13 @@ struct common_params_speculative {
     common_params_speculative_ngram_map ngram_map_k4v;
 
     common_params_speculative_ngram_cache ngram_cache;
+
+    // DFlash speculative-decoding draft parameters (see llama_context_params
+    // in include/llama.h for full semantics).
+    int32_t  dflash_max_ctx     = -1; // sliding-window cap; -1 = auto-scale, 0 = uncapped, >0 = explicit
+    uint32_t dflash_topk        = 1;  // top-K candidates per position; 1 = chain, >=2 = tree mode
+    bool     dflash_tree        = false; // enable DDTree multi-seq tree verify (Phase 2)
+    int32_t  dflash_tree_budget = 0;     // tree node budget; 0 = Stage B default (= block_size)
 
     bool has_dft() const {
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();

@@ -375,6 +375,17 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
+        int32_t dflash_max_ctx;  // sliding-window cap on the DFlash drafter's per-layer K/V side store.
+                                 // -1 = auto-scale (the default): cap = clamp(cparams.n_ctx_seq / 4, 512, 1024),
+                                 //      then capped to n_ctx_seq.
+                                 //  0 = uncapped: use the full cparams.n_ctx_seq.
+                                 // >0 = explicit cap: capped to cparams.n_ctx_seq.
+                                 // Ignored for non-DFlash drafts.
+
+        uint32_t dflash_topk;    // number of top-K candidate tokens the DFlash drafter emits per output position.
+                                 // 1 = chain mode (default), >=2 = tree mode (DDTree).
+                                 // Ignored for non-DFlash drafts.
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
@@ -601,6 +612,125 @@ extern "C" {
 
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
+
+    // -----------------------------------------------------------------------
+    // DFlash speculative-decoding draft model accessors
+    // -----------------------------------------------------------------------
+    //
+    // These getters return values stored in the GGUF of a DFlash draft model.
+    // They return 0 / LLAMA_TOKEN_NULL / negative values when the model is
+    // not a DFlash draft (i.e. the consumer can defensively call them
+    // without first checking the architecture).
+
+    // Block size: how many tokens the DFlash draft generates per forward pass.
+    // Returns 0 if the model is not a DFlash draft.
+    LLAMA_API uint32_t llama_model_dflash_block_size(const struct llama_model * model);
+
+    // Mask token id used to fill the draft block prior to running the draft.
+    // Returns LLAMA_TOKEN_NULL if the model is not a DFlash draft.
+    LLAMA_API llama_token llama_model_dflash_mask_token_id(const struct llama_model * model);
+
+    // Number of layer indices in the target_layer_ids list. Returns 0 if not DFlash.
+    LLAMA_API int32_t llama_model_dflash_n_target_layer_ids(const struct llama_model * model);
+
+    // Get the i-th target layer id (i.e. an index into the *target* model's layers,
+    // whose hidden state should be captured and fed to the DFlash draft).
+    // Returns -1 on out-of-range or non-DFlash model.
+    LLAMA_API int32_t llama_model_dflash_target_layer_id(const struct llama_model * model, int32_t i);
+
+    // Total number of target-model layers (informational; from training time).
+    LLAMA_API int32_t llama_model_dflash_num_target_layers(const struct llama_model * model);
+
+    // -----------------------------------------------------------------------
+    // DFlash: bind target model's tok_embd + lm_head into the draft
+    // -----------------------------------------------------------------------
+    //
+    // Paper §4.2: "the draft model shares the token embedding layer and
+    // language modeling head with the target model and keeps them frozen
+    // during training." A paper-faithful DFlash draft GGUF therefore does
+    // not contain its own tok_embd or output tensors; the inference engine
+    // must bind them from the target.
+    //
+    // Call this once after loading both models, before running any draft
+    // decode. It copies non-owning pointers from target → draft; the target
+    // model must outlive the draft.
+    //
+    // No-op if the draft already has its own tok_embd / output (i.e. when
+    // the GGUF was converted in self-contained mode). Returns false if
+    // either model is null.
+    LLAMA_API bool llama_dflash_bind_target(
+            struct llama_model *       model_dft,
+            const struct llama_model * model_tgt);
+
+    // -----------------------------------------------------------------------
+    // DFlash target hidden-state capture (call on the *target* context)
+    // -----------------------------------------------------------------------
+    //
+    // Tee out the post-block hidden state at the given target-model layer
+    // indices on every llama_decode() call. After decode, retrieve the
+    // captures via llama_get_dflash_captured_features().
+    LLAMA_API void llama_set_dflash_capture(
+            struct llama_context * ctx,
+            const int32_t *        layer_ids,
+            size_t                 n_layer_ids,
+            int64_t                n_embd_target);
+
+    // After llama_decode() on the target context, returns a pointer to the
+    // captured features in row-major layout [n_features, n_outputs].
+    LLAMA_API const float * llama_get_dflash_captured_features(
+            struct llama_context * ctx,
+            int64_t *              n_outputs_out);
+
+    // After llama_decode() on a *draft* context, returns top-K candidate
+    // tokens per output position. Returns NULL on a non-DFlash context.
+    LLAMA_API const int32_t * llama_get_dflash_draft_topk(
+            struct llama_context * ctx,
+            int64_t *              n_outputs_out,
+            uint32_t *             topk_out);
+
+    // -----------------------------------------------------------------------
+    // DFlash K/V cache reuse (paper §4.1) — call on the *draft* context
+    // -----------------------------------------------------------------------
+    //
+    // Append `n_new` newly-committed target features to the draft's
+    // persistent K/V side store.
+    LLAMA_API int32_t llama_dflash_extend(
+            struct llama_context * ctx,
+            const float *          target_hidden_new,
+            int64_t                n_new,
+            int64_t                pos_start);
+
+    // Reset the K/V side store (e.g. on a new prompt).
+    LLAMA_API void llama_dflash_reset_ctx_kv(struct llama_context * ctx);
+
+    // -----------------------------------------------------------------------
+    // DDTree (DFlash Phase 2): tree-shaped attention mask
+    // -----------------------------------------------------------------------
+    LLAMA_API void llama_set_tree_mask(
+            struct llama_context * ctx,
+            const uint8_t        * visibility,
+            int                    n_tree_tokens);
+
+    LLAMA_API void llama_clear_tree_mask(struct llama_context * ctx);
+
+    // -----------------------------------------------------------------------
+    // DFlash memory accounting
+    // -----------------------------------------------------------------------
+    struct llama_dflash_memory_buckets {
+        size_t side_store_K_total;
+        size_t side_store_V_total;
+        size_t captured_features_bytes;
+        size_t capture_staging_bytes;
+        size_t draft_topk_bytes;
+        size_t draft_topk_argmax_bytes;
+        int64_t ctx_capacity;
+        int64_t ctx_filled;
+        int     n_layers;
+    };
+
+    LLAMA_API void llama_dflash_memory_breakdown(
+            const struct llama_context *         ctx,
+            struct llama_dflash_memory_buckets * out);
 
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);

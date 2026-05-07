@@ -48,6 +48,28 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // DDTree (DFlash Phase 2): when --dflash-tree is set, bump n_parallel
+    // and enable kv_unified BEFORE target context creation. Tree-mode
+    // verify uses one seq_id per branch, all sharing a single KV stream.
+    if (params.speculative.dflash_tree) {
+        const int budget = params.speculative.dflash_tree_budget;
+        // Worst-case n_branches with K=2 uniform expansion is 1 + budget;
+        // we don't know block_size yet (draft model isn't loaded), so we
+        // use this upper bound. Over-allocating n_seq_max is cheap.
+        const int min_parallel_tree = std::max(2, (budget > 0) ? budget + 1 : 2);
+        if (params.n_parallel < min_parallel_tree) {
+            LOG_INF("%s: --dflash-tree (budget=%d): bumping n_parallel from %d to %d "
+                    "so ctx_tgt's n_seq_max fits all alt-branch seq_ids\n",
+                    __func__, budget, params.n_parallel, min_parallel_tree);
+            params.n_parallel = min_parallel_tree;
+        }
+        if (!params.kv_unified) {
+            LOG_INF("%s: --dflash-tree: enabling kv_unified (required for multi-seq tree-verify pattern)\n",
+                    __func__);
+            params.kv_unified = true;
+        }
+    }
+
     // init llama.cpp
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -105,6 +127,10 @@ int main(int argc, char ** argv) {
 
         params.speculative.draft.model = model_dft.get();
         params.speculative.draft.cparams = common_context_params_to_llama(params_dft);
+
+        // Forward DFlash-specific cparams to the draft context.
+        params.speculative.draft.cparams.dflash_max_ctx = params.speculative.dflash_max_ctx;
+        params.speculative.draft.cparams.dflash_topk    = params.speculative.dflash_topk;
     }
 
     // Tokenize the prompt
@@ -171,11 +197,174 @@ int main(int argc, char ** argv) {
     llama_tokens draft;
     spec_checkpoint spec_ckpt;
 
+    // DDTree Phase 2 tree-mode statistics.
+    int64_t n_tree_iters     = 0;
+    int64_t n_tree_alt_taken = 0;
+
     const auto t_enc_end = ggml_time_us();
 
     const auto t_dec_start = ggml_time_us();
 
+    const bool use_tree = params.speculative.dflash_tree;
+
     while (true) {
+        // ============================================================
+        // DDTree Phase 2: multi-seq tree-shaped verify branch
+        // ============================================================
+        // 1. Build a small tree from the draft's per-position top-K
+        //    (Stage B: chain seed + 1 alt at depth 1; Stage C with
+        //    --dflash-tree-budget B: chain seed + uniform round-robin
+        //    sibling expansion until B nodes total).
+        // 2. Multi-seq batch construction: seq_cp(0->b) broadcasts the
+        //    prefix to alt branches; main-path nodes carry seqs
+        //    {0} ∪ {alt branches at deeper depths}; alt nodes carry
+        //    only their own branch_id.
+        // 3. Decode (no tree mask — seq-id-based mask handles separation).
+        // 4. Tree-walk accept (root → child by target argmax, repeat).
+        // 5. Rollback: drop alt seqs; for main-accept drop rejected
+        //    main-path tail; for alt-accept use commit-35 KV surgery
+        //    (seq_rm/seq_cp metadata-only) + record_alt_accept hint.
+        if (use_tree) {
+            common_speculative_tree tree =
+                common_speculative_draft_tree(spec, params_spec, prompt_tgt, id_last);
+
+            const int n_past_before = n_past;
+            auto * mem = llama_get_memory(ctx_tgt);
+
+            common_batch_clear(batch_tgt);
+            llama_tokens ids;
+
+            if (tree.n_nodes == 0) {
+                // Drafter returned no tree (non-DFlash, or topk read failed).
+                // Decode just id_last and emit the bonus token.
+                common_batch_add(batch_tgt, id_last, n_past_before, { 0 }, /*logits=*/true);
+                llama_decode(ctx_tgt, batch_tgt);
+
+                const llama_token bonus = common_sampler_sample(smpl.get(), ctx_tgt, 0);
+                common_sampler_accept(smpl.get(), bonus, true);
+                ids.push_back(bonus);
+                n_past = n_past_before + 1;
+            } else {
+                // Multi-seq prefix tagging: copy seq 0 -> seq b for each alt branch.
+                for (int b = 1; b < tree.n_branches; ++b) {
+                    llama_memory_seq_cp(mem, 0, b, -1, -1);
+                }
+
+                // For each main-path node at depth d, compute which alt seqs
+                // it must additionally carry (every alt at deeper depths).
+                std::vector<std::vector<llama_seq_id>> main_extra_seqs(tree.main_path_len);
+                for (int i = 0; i < tree.n_nodes; ++i) {
+                    if (tree.branch_ids[i] == 0) continue;
+                    const int alt_depth = tree.depths[i];
+                    const llama_seq_id alt_seq = (llama_seq_id) tree.branch_ids[i];
+                    for (int d_main = 1; d_main < alt_depth; ++d_main) {
+                        main_extra_seqs[d_main - 1].push_back(alt_seq);
+                    }
+                }
+
+                // id_last (root) — visible from every branch.
+                std::vector<llama_seq_id> root_seqs(tree.n_branches);
+                for (int b = 0; b < tree.n_branches; ++b) root_seqs[b] = b;
+                common_batch_add(batch_tgt, id_last, n_past_before, root_seqs, /*logits=*/true);
+
+                // Tree nodes.
+                for (int i = 0; i < tree.n_nodes; ++i) {
+                    const int d  = tree.depths[i];
+                    const int bi = tree.branch_ids[i];
+                    std::vector<llama_seq_id> seqs;
+                    if (bi == 0) {
+                        seqs.reserve(1 + main_extra_seqs[d - 1].size());
+                        seqs.push_back(0);
+                        for (auto s : main_extra_seqs[d - 1]) seqs.push_back(s);
+                    } else {
+                        seqs.push_back((llama_seq_id) bi);
+                    }
+                    common_batch_add(batch_tgt, tree.tokens[i],
+                                     n_past_before + d, seqs, /*logits=*/true);
+                }
+
+                llama_decode(ctx_tgt, batch_tgt);
+
+                // Tree-walk accept: root → ... → commit_n following target argmax.
+                int current  = 0;
+                int commit_n = 0;
+                while (true) {
+                    const llama_token target_token =
+                        common_sampler_sample(smpl.get(), ctx_tgt, current);
+                    common_sampler_accept(smpl.get(), target_token, true);
+                    ids.push_back(target_token);
+
+                    auto it = tree.child_maps[current].find(target_token);
+                    if (it == tree.child_maps[current].end()) {
+                        break; // bonus token
+                    }
+                    current  = it->second;
+                    commit_n = current;
+                }
+
+                const bool alt_accepted = (commit_n > tree.main_path_len);
+
+                if (alt_accepted) {
+                    n_tree_alt_taken++;
+
+                    // Stage C alt-accept: KV surgery (no compute).
+                    const int          d          = tree.depths[commit_n - 1];
+                    const llama_seq_id alt_branch = (llama_seq_id) tree.branch_ids[commit_n - 1];
+
+                    // (a) Drop main-path tail m_d..m_main_path_len from seq 0.
+                    llama_memory_seq_rm(mem, 0, n_past_before + d, -1);
+                    // (b) Promote alt slot at N0+d into seq 0 (metadata-only under kv_unified).
+                    llama_memory_seq_cp(mem, alt_branch, 0,
+                                        n_past_before + d,
+                                        n_past_before + d + 1);
+                    // (c) Drop every alt seq.
+                    for (int b = 1; b < tree.n_branches; ++b) {
+                        llama_memory_seq_rm(mem, b, -1, -1);
+                    }
+                    // (d) Hint the spec state to remap captures on next extend.
+                    common_speculative_record_alt_accept(spec,
+                        /*alt_capture_idx=*/commit_n, /*alt_depth=*/d);
+
+                    n_past = n_past_before + d + 1;
+                } else {
+                    // Main-path accept (commit_n == 0 or 1..main_path_len).
+                    const int L = (commit_n > 0) ? tree.depths[commit_n - 1] : 0;
+                    llama_memory_seq_rm(mem, 0, n_past_before + 1 + L, -1);
+                    for (int b = 1; b < tree.n_branches; ++b) {
+                        llama_memory_seq_rm(mem, b, -1, -1);
+                    }
+                    n_past = n_past_before + 1 + L;
+                }
+            }
+
+            n_tree_iters++;
+            common_speculative_accept(spec, ids.empty() ? 0 : (uint16_t)(ids.size() - 1));
+
+            n_drafted += tree.n_nodes;
+            n_accept  += ids.empty() ? 0 : (int) ids.size() - 1;
+            n_predict += (int) ids.size();
+
+            for (size_t i = 0; i < ids.size(); ++i) {
+                prompt_tgt.push_back(id_last);
+                id_last = ids[i];
+                if (llama_vocab_is_eog(vocab, id_last)) {
+                    has_eos = true;
+                    break;
+                }
+                const std::string token_str = common_token_to_piece(ctx_tgt, id_last);
+                if (params.use_color && i + 1 < ids.size()) {
+                    LOG("\u001b[%dm%s\u001b[37m", (36 - 0 % 6), token_str.c_str());
+                } else {
+                    LOG("%s", token_str.c_str());
+                }
+            }
+
+            if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
+                break;
+            }
+            continue;
+        }
+
         // generate or reuse draft tokens
         //
         // this is the most important part of the speculation. the more probable tokens that are provided here
@@ -327,7 +516,11 @@ int main(int argc, char ** argv) {
     LOG_INF("n_predict = %d\n", n_predict);
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
-    LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
+    LOG_INF("accept    = %.3f%%\n", n_drafted > 0 ? 100.0f * n_accept / n_drafted : 0.0f);
+    if (use_tree) {
+        LOG_INF("tree iters    = %lld\n", (long long) n_tree_iters);
+        LOG_INF("tree alt taken = %lld\n", (long long) n_tree_alt_taken);
+    }
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");

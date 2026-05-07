@@ -84,6 +84,41 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    // -----------------------------------------------------------------------
+    // DFlash: capture target hidden states for the drafter
+    // -----------------------------------------------------------------------
+    void set_dflash_capture(const int32_t * layer_ids,
+                            size_t          n_layer_ids,
+                            int64_t         n_embd_target);
+
+    const float * get_dflash_captured_features(int64_t * n_outputs_out) const;
+
+    // After decode on a draft context (LLM_ARCH_DFLASH), returns top-K candidates.
+    const int32_t * get_dflash_draft_topk(int64_t * n_outputs_out, uint32_t * topk_out) const;
+
+    // Idempotent O(n_outputs * K) post-pass to swap argmax into slot 0 for K>=2.
+    void dflash_finalize_draft_topk();
+
+    // Read access for the graph builders.
+    const llama_dflash * get_dflash() const;
+
+    // Append `n_new` newly-committed target captures to the K/V side store.
+    int32_t dflash_extend(const float * target_hidden_new,
+                          int64_t       n_new,
+                          int64_t       pos_start);
+
+    // Reset the K/V side store to empty.
+    void dflash_reset_ctx_kv();
+
+    // Internal: drop the oldest `n_drop` columns of the side store.
+    bool dflash_slide_left(int64_t n_drop);
+
+    // -----------------------------------------------------------------------
+    // DDTree (DFlash Phase 2): tree-shaped attention mask
+    // -----------------------------------------------------------------------
+    void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
+    void clear_tree_mask();
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -234,6 +269,11 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // overload that runs the graph on a caller-provided scheduler. Used by
+    // `dflash_extend` so the encoder graph runs on its dedicated
+    // `sched_dflash_encode` rather than the regular decode `sched`.
+    ggml_status graph_compute(ggml_backend_sched_t sched_use, ggml_cgraph * gf, bool batched);
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
@@ -319,6 +359,13 @@ private:
 
     bool sched_need_reserve = true;
 
+    // Dedicated scheduler for the DFlash encoder graph. Allocated alongside
+    // `sched` for DFlash-arch contexts so the encoder + decoder don't
+    // clobber each other's compute-buffer slot assignments. See
+    // `gf_res_dflash_encode` below for the cache-hit fast path that depends
+    // on this isolation.
+    ggml_backend_sched_ptr sched_dflash_encode;
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
@@ -340,6 +387,25 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // DFlash drafter cross-context state. Populated by set_dflash_capture()
+    // (capture install) and dflash_extend() (per-layer K/V side store).
+    llama_dflash dflash;
+
+    // DDTree custom attention mask. Inactive (active==false) by default.
+    llama_tree_mask tree_mask;
+
+    // ggml contexts + backend buffers backing the DFlash K/V side store.
+    // Only populated when the model arch is LLM_ARCH_DFLASH; empty otherwise.
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> dflash_kv_ctxs_bufs;
+
+    // Encoder-graph result holder, kept across `dflash_extend()` calls so
+    // the same `llm_graph_result` instance is reused. Combined with
+    // `sched_dflash_encode`, this enables per-`n_new` graph caching: when
+    // consecutive extends share the same `n_new` value, dflash_extend skips
+    // graph rebuild and just re-runs `set_inputs + graph_compute`.
+    llm_graph_result_ptr gf_res_dflash_encode;
+    int64_t              gf_res_dflash_encode_n_new = -1;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
