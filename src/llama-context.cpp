@@ -163,6 +163,30 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // The DFlash drafter decodes EXACTLY one block of `dflash_block_size`
+    // tokens per call, with bidirectional intra-block attention (paper §4.1).
+    // n_ubatch MUST equal block_size: a smaller ubatch would split the block
+    // across multiple llama_decode internal ubatches, each of which only
+    // sees its own subset as queries, breaking the bidirectional intra-block
+    // attention the draft relies on (acceptance collapses to ~0%). A larger
+    // ubatch is harmless but wastes worst-case compute buffer. We force it
+    // here regardless of what the user passed via --ubatch-size, because the
+    // standalone speculative-dflash example shares params.n_ubatch with the
+    // target context (where the user may legitimately want a different
+    // value, e.g. -ub 1 for byte-exact-match testing against llama-cli).
+    if (model.arch == LLM_ARCH_DFLASH) {
+        const uint32_t bs = std::max<uint32_t>(1, model.hparams.dflash_block_size);
+        if (cparams.n_ubatch != bs) {
+            LLAMA_LOG_INFO("%s: DFlash draft: forcing n_ubatch %u -> %u (= dflash_block_size); "
+                           "smaller ubatch breaks bidirectional intra-block attention\n",
+                           __func__, cparams.n_ubatch, bs);
+            cparams.n_ubatch = bs;
+        }
+        if (cparams.n_batch < bs) {
+            cparams.n_batch = bs;
+        }
+    }
+
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 

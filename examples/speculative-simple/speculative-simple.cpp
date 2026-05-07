@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "dflash-profile.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "log.h"
@@ -41,6 +42,26 @@ int main(int argc, char ** argv) {
     if (params.n_predict < -1) {
         LOG_ERR("%s: --n-predict must be >= -1\n", __func__);
         return 1;
+    }
+
+    // DFlash per-op profiler (opt-in via DFLASH_PROF=1, see common/dflash-profile.h).
+    const auto dflash_prof_cfg = dflash_prof::read_env_config();
+    if (dflash_prof_cfg.enabled) {
+        auto & prof = dflash_prof::profiler::instance();
+        prof.set_enabled(true);
+        params.cb_eval           = dflash_prof::profiler::eval_callback;
+        params.cb_eval_user_data = &prof;
+        params.warmup            = false;
+        LOG_INF("%s: DFLASH_PROF=1: per-op profiling enabled (CPU-only; "
+                "single-node compute distorts absolute throughput)\n", __func__);
+    }
+
+    // Companion memory profiler (opt-in via DFLASH_MEM=1).
+    const auto dflash_mem_cfg = dflash_prof::read_mem_env_config();
+    if (dflash_mem_cfg.enabled) {
+        dflash_prof::memory_profiler::instance().set_enabled(true);
+        dflash_prof::memory_profiler::instance().snapshot("before_load", nullptr, nullptr);
+        LOG_INF("%s: DFLASH_MEM=1: memory profiling enabled\n", __func__);
     }
 
     if (params.speculative.draft.mparams.path.empty()) {
@@ -186,11 +207,27 @@ int main(int argc, char ** argv) {
     // init the speculator
     const auto & params_spec = params.speculative;
 
+    if (dflash_mem_cfg.enabled) {
+        dflash_prof::memory_profiler::instance().snapshot("after_init", nullptr, ctx_tgt);
+    }
+    if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("prompt");
+
     struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
 
     common_speculative_begin(spec, prompt_tgt);
 
-    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+    if (dflash_mem_cfg.enabled) {
+        dflash_prof::memory_profiler::instance().snapshot("after_prefill", nullptr, ctx_tgt);
+    }
+
+    // Tree mode multi-seq: each batch token may carry up to n_branches
+    // seq_ids, so size the per-slot seq_id arrays accordingly. Chain mode
+    // and Stage B keep the historical size 1; Stage C with budget B has
+    // n_branches <= 1 + B.
+    const int batch_n_seq_max = params.speculative.dflash_tree
+        ? std::max(2, params.speculative.dflash_tree_budget + 1)
+        : 1;
+    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, batch_n_seq_max);
 
     size_t n_draft = 0;
 
@@ -208,6 +245,7 @@ int main(int argc, char ** argv) {
     const bool use_tree = params.speculative.dflash_tree;
 
     while (true) {
+        if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("draft");
         // ============================================================
         // DDTree Phase 2: multi-seq tree-shaped verify branch
         // ============================================================
@@ -283,6 +321,7 @@ int main(int argc, char ** argv) {
                                      n_past_before + d, seqs, /*logits=*/true);
                 }
 
+                if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("verify");
                 llama_decode(ctx_tgt, batch_tgt);
 
                 // Tree-walk accept: root → ... → commit_n following target argmax.
@@ -342,11 +381,18 @@ int main(int argc, char ** argv) {
 
             n_drafted += tree.n_nodes;
             n_accept  += ids.empty() ? 0 : (int) ids.size() - 1;
-            n_predict += (int) ids.size();
 
+            // Cap at exactly params.n_predict tokens (per-token check) so
+            // byte-exact match against the greedy reference holds.
+            const int n_predict_pre_loop = n_predict;
             for (size_t i = 0; i < ids.size(); ++i) {
+                if (params.n_predict >= 0 && (n_predict_pre_loop + (int) i) >= params.n_predict) {
+                    has_eos = true;
+                    break;
+                }
                 prompt_tgt.push_back(id_last);
                 id_last = ids[i];
+                ++n_predict;
                 if (llama_vocab_is_eog(vocab, id_last)) {
                     has_eos = true;
                     break;
@@ -359,7 +405,7 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
+            if ((params.n_predict >= 0 && n_predict >= params.n_predict) || has_eos) {
                 break;
             }
             continue;
@@ -411,6 +457,7 @@ int main(int argc, char ** argv) {
 
             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
+            if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("verify");
             llama_decode(ctx_tgt, batch_tgt);
         }
 
@@ -460,17 +507,22 @@ int main(int argc, char ** argv) {
         n_past    += ids.size() - 1;
         n_drafted += n_draft; // note: we ignore the discarded small drafts
         n_accept  += ids.size() - 1;
-        n_predict += ids.size();
 
-        // process the accepted tokens and update contexts
-        //
-        // this is the standard token post-processing that we normally do
-        // in this case, we do it for a group of accepted tokens at once
-        //
+        // Cap at exactly params.n_predict tokens (per-token check inside
+        // the loop) so byte-exact comparison against the greedy reference
+        // holds. Without this, the last accepted draft chunk can overshoot
+        // by up to ids.size() - 1 tokens.
+        const int n_predict_pre_loop = n_predict;
         for (size_t i = 0; i < ids.size(); ++i) {
+            if (params.n_predict >= 0 && (n_predict_pre_loop + (int) i) >= params.n_predict) {
+                has_eos = true;
+                break;
+            }
+
             prompt_tgt.push_back(id_last);
 
             id_last = ids[i];
+            ++n_predict;
 
             if (llama_vocab_is_eog(vocab, id_last)) {
                 has_eos = true;
@@ -497,12 +549,16 @@ int main(int argc, char ** argv) {
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
         }
 
-        if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
+        if ((params.n_predict >= 0 && n_predict >= params.n_predict) || has_eos) {
             break;
         }
     }
 
     auto t_dec_end = ggml_time_us();
+
+    if (dflash_mem_cfg.enabled) {
+        dflash_prof::memory_profiler::instance().snapshot("after_gen", nullptr, ctx_tgt);
+    }
 
     const int n_input = inp.size();
 
@@ -532,6 +588,25 @@ int main(int argc, char ** argv) {
     llama_batch_free(batch_tgt);
 
     common_speculative_free(spec);
+
+    if (dflash_prof_cfg.enabled) {
+        FILE * out = stderr;
+        if (!dflash_prof_cfg.out_file.empty()) {
+            FILE * f = std::fopen(dflash_prof_cfg.out_file.c_str(), "w");
+            if (f) out = f;
+        }
+        dflash_prof::profiler::instance().dump(out, dflash_prof_cfg.top_n);
+        if (out != stderr) std::fclose(out);
+    }
+    if (dflash_mem_cfg.enabled) {
+        FILE * out = stderr;
+        if (!dflash_mem_cfg.out_file.empty()) {
+            FILE * f = std::fopen(dflash_mem_cfg.out_file.c_str(), "w");
+            if (f) out = f;
+        }
+        dflash_prof::memory_profiler::instance().dump(out);
+        if (out != stderr) std::fclose(out);
+    }
 
     llama_backend_free();
 

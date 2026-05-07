@@ -131,13 +131,18 @@ fi
 # Binary lookup
 # --------------------------------------------------------------------------
 
-llama_cli="$bin_dir/llama-cli"
-llama_spec="$bin_dir/llama-speculative-simple"
-
-if [ ! -x "$llama_cli" ]; then
-    printf '\033[31m[error]\033[0m %s not found / not executable\n' "$llama_cli" >&2
+# Prefer llama-completion (upstream split llama-cli into chat-only `llama-cli`
+# and raw-completion `llama-completion`; older snapshots only ship llama-cli).
+if [ -x "$bin_dir/llama-completion" ]; then
+    llama_cli="$bin_dir/llama-completion"
+elif [ -x "$bin_dir/llama-cli" ]; then
+    llama_cli="$bin_dir/llama-cli"
+else
+    printf '\033[31m[error]\033[0m neither %s/llama-completion nor %s/llama-cli is executable\n' "$bin_dir" "$bin_dir" >&2
     exit 2
 fi
+llama_spec="$bin_dir/llama-speculative-simple"
+
 if [ ! -x "$llama_spec" ]; then
     printf '\033[31m[error]\033[0m %s not found / not executable\n' "$llama_spec" >&2
     exit 2

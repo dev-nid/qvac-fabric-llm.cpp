@@ -81,6 +81,10 @@ matrix_mode="${DFLASH_TEST_MATRIX:+1}"
 matrix_mode="${matrix_mode:-0}"
 bin_dir=""
 verbose=0
+# Default to 0 (= binary's auto-detect) but allow override. On VMs with
+# fewer real cores than logical CPUs, manually capping helps avoid
+# oversubscription when the script runs many sequential cases.
+threads="${DFLASH_TEST_THREADS:-0}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -88,6 +92,7 @@ while [ $# -gt 0 ]; do
         --full)    mode="full";  shift ;;
         --matrix)  matrix_mode=1; shift ;;
         --bin-dir) bin_dir="$2"; shift 2 ;;
+        --threads) threads="$2"; shift 2 ;;
         -v|--verbose) verbose=1; shift ;;
         -h|--help)
             sed -n '3,76p' "$0" | sed 's/^# \{0,1\}//'
@@ -111,22 +116,31 @@ done
 #   3. ./build/bin  (standalone invocation from repo root)
 
 if [ -z "$bin_dir" ]; then
-    if [ -x "./llama-cli" ] && [ -x "./llama-speculative-simple" ]; then
+    if [ -x "./llama-speculative-simple" ] && { [ -x "./llama-completion" ] || [ -x "./llama-cli" ]; }; then
         bin_dir="."
-    elif [ -x "./build/bin/llama-cli" ] && [ -x "./build/bin/llama-speculative-simple" ]; then
+    elif [ -x "./build/bin/llama-speculative-simple" ] && { [ -x "./build/bin/llama-completion" ] || [ -x "./build/bin/llama-cli" ]; }; then
         bin_dir="./build/bin"
     else
-        printf '\033[31mERROR: cannot locate llama-cli + llama-speculative-simple.\033[0m\n' >&2
+        printf '\033[31mERROR: cannot locate llama-completion (or llama-cli) + llama-speculative-simple.\033[0m\n' >&2
         printf 'Tried: ./, ./build/bin/. Pass --bin-dir DIR.\n' >&2
         exit 2
     fi
 fi
 
-llama_cli="$bin_dir/llama-cli"
+# Prefer llama-completion (upstream split llama-cli into chat-only `llama-cli`
+# and raw-completion `llama-completion`; older snapshots only ship llama-cli).
+if [ -x "$bin_dir/llama-completion" ]; then
+    llama_cli="$bin_dir/llama-completion"
+elif [ -x "$bin_dir/llama-cli" ]; then
+    llama_cli="$bin_dir/llama-cli"
+else
+    printf '\033[31mERROR: neither %s/llama-completion nor %s/llama-cli is executable.\033[0m\n' "$bin_dir" "$bin_dir" >&2
+    exit 2
+fi
 llama_spec="$bin_dir/llama-speculative-simple"
 
-if [ ! -x "$llama_cli" ] || [ ! -x "$llama_spec" ]; then
-    printf '\033[31mERROR: %s or %s not executable.\033[0m\n' "$llama_cli" "$llama_spec" >&2
+if [ ! -x "$llama_spec" ]; then
+    printf '\033[31mERROR: %s not executable.\033[0m\n' "$llama_spec" >&2
     exit 2
 fi
 
@@ -317,10 +331,16 @@ for prompt in "${prompts[@]}"; do
         # notes". A target-side failure here is fatal for every config in
         # this case, so we record the FAIL once per active config (each
         # config's tally increments by 1) and skip to the next case.
+        threads_arg=()
+        if [ "$threads" -gt 0 ]; then
+            threads_arg=(-t "$threads")
+        fi
+
         if ! "$llama_cli" \
                 -m "$target_model" \
                 -p "$prompt" --n-predict "$n" --temp 0 --seed 0 \
                 -no-cnv --no-display-prompt -ngl 99 -ub 1 \
+                "${threads_arg[@]}" </dev/null \
                 > "$target_out" 2> "$target_log"; then
             for config in "${active_configs[@]}"; do
                 record_fail "$config" "llama-cli exited non-zero" "$target_log"
@@ -345,6 +365,7 @@ for prompt in "${prompts[@]}"; do
                     $extra_args \
                     -p "$prompt" --n-predict "$n" --temp 0 --seed 0 \
                     -ngl 99 -ngld 99 -ub 1 \
+                    "${threads_arg[@]}" </dev/null \
                     > "$spec_raw" 2> "$spec_log"; then
                 record_fail "$config" "llama-speculative-simple exited non-zero" "$spec_log"
                 continue
