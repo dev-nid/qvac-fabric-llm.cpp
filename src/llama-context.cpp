@@ -14,6 +14,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -380,6 +381,43 @@ llama_context::llama_context(
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
+            }
+        }
+
+        // V6: DFlash encoder warmup. The first call to `dflash_extend` for
+        // any given `n_new` shape compiles backend pipelines (cold cost
+        // ~100-300 ms on Vulkan, paid lazily on the first user
+        // generation). Pre-warming with the two most common values
+        // (block_size and 1) here amortises that cost into context
+        // construction so the first generation runs at steady-state
+        // throughput.
+        //
+        // The warmup pushes block_size+1 zero rows then `dflash_reset_ctx_kv()`
+        // restores ctx_filled/ctx_pos_base to 0; the side-store data
+        // bytes remain zero but are not visible to subsequent extends
+        // (n_ctx is reset as well).
+        if (model.arch == LLM_ARCH_DFLASH
+                && dflash.n_features > 0
+                && !dflash.ctx_K.empty()) {
+            const uint32_t bs = std::max<uint32_t>(1, model.hparams.dflash_block_size);
+            const int64_t  nf = dflash.n_features;
+            std::vector<float> zero_buf((size_t) bs * (size_t) nf, 0.0f);
+
+            const int64_t t_warm_start = ggml_time_us();
+            // Warm n_new=block_size first (the common steady-state shape
+            // for full-block extends). Then n_new=1 (the common
+            // chain-mode shape for single-token committed extends).
+            int rc1 = dflash_extend(zero_buf.data(), (int64_t) bs, 0);
+            int rc2 = (rc1 == 0) ? dflash_extend(zero_buf.data(), 1, (int64_t) bs) : -1;
+            dflash_reset_ctx_kv();
+
+            const int64_t t_warm_us = ggml_time_us() - t_warm_start;
+            if (rc1 != 0 || rc2 != 0) {
+                LLAMA_LOG_WARN("%s: DFlash encoder warmup partially failed (rc1=%d rc2=%d) — first generation may incur cold pipeline-compile cost\n",
+                               __func__, rc1, rc2);
+            } else {
+                LLAMA_LOG_INFO("%s: DFlash encoder warmup: pre-compiled pipelines for n_new={%u, 1} in %.2f ms\n",
+                               __func__, bs, t_warm_us / 1000.0);
             }
         }
     }
@@ -1213,6 +1251,12 @@ bool llama_context::dflash_slide_left(int64_t n_drop) {
     GGML_ASSERT(n_drop > 0);
     GGML_ASSERT(n_drop <= dflash.ctx_filled);
 
+    static const bool gpu_log = []() {
+        const char * e = std::getenv("DFLASH_GPU_LOG");
+        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    const int64_t t_slide_start = gpu_log ? ggml_time_us() : 0;
+
     const int64_t n_keep = dflash.ctx_filled - n_drop;
 
     if (n_keep > 0) {
@@ -1240,12 +1284,30 @@ bool llama_context::dflash_slide_left(int64_t n_drop) {
 
     dflash.ctx_filled    = n_keep;
     dflash.ctx_pos_base += n_drop;
+
+    if (gpu_log) {
+        const int64_t t_slide_end = ggml_time_us();
+        LLAMA_LOG_INFO("[DFLASH_GPU_LOG] dflash_slide_left: n_drop=%lld n_keep=%lld n_layers=%zu elapsed=%.3f ms\n",
+                       (long long) n_drop, (long long) n_keep, dflash.ctx_K.size(),
+                       (t_slide_end - t_slide_start) / 1000.0);
+    }
     return true;
 }
 
 int32_t llama_context::dflash_extend(const float * target_hidden_new,
                                      int64_t       n_new,
                                      int64_t       pos_start) {
+    static const bool gpu_log = []() {
+        const char * e = std::getenv("DFLASH_GPU_LOG");
+        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    const int64_t t_extend_start = gpu_log ? ggml_time_us() : 0;
+    int64_t t_build_us  = 0;
+    int64_t t_alloc_us  = 0;
+    int64_t t_inputs_us = 0;
+    int64_t t_compute_us = 0;
+    bool    cache_hit_log = false;
+
     if (model.arch != LLM_ARCH_DFLASH) {
         LLAMA_LOG_ERROR("%s: model is not LLM_ARCH_DFLASH (arch=%d)\n",
                 __func__, (int) model.arch);
@@ -1291,12 +1353,14 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
     auto * res = gf_res_dflash_encode.get();
 
     const bool cache_hit = (gf_res_dflash_encode_n_new == n_new);
+    cache_hit_log = cache_hit;
     ggml_cgraph * gf = nullptr;
 
     if (cache_hit) {
         gf = res->get_gf();
         GGML_ASSERT(gf != nullptr && ggml_graph_n_nodes(gf) > 0);
     } else {
+        const int64_t t_build_start = gpu_log ? ggml_time_us() : 0;
         res->reset();
 
         llama_ubatch ub_stub = {};
@@ -1321,10 +1385,14 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
             return -1;
         }
 
+        if (gpu_log) t_build_us = ggml_time_us() - t_build_start;
+
+        const int64_t t_alloc_start = gpu_log ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched_dflash_encode.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate encoder graph\n", __func__);
             return -2;
         }
+        if (gpu_log) t_alloc_us = ggml_time_us() - t_alloc_start;
 
         gf_res_dflash_encode_n_new = n_new;
     }
@@ -1339,6 +1407,8 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
     GGML_ASSERT(t_target_hidden_new != nullptr);
     GGML_ASSERT(t_pos_new           != nullptr);
     GGML_ASSERT(t_pos_idx           != nullptr);
+
+    const int64_t t_inputs_start = gpu_log ? ggml_time_us() : 0;
 
     {
         const size_t bytes = (size_t) n_new * (size_t) dflash.n_features * sizeof(float);
@@ -1364,7 +1434,10 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
                                 0, n_new * sizeof(int64_t));
     }
 
+    if (gpu_log) t_inputs_us = ggml_time_us() - t_inputs_start;
+
     // ----- compute -----
+    const int64_t t_compute_start = gpu_log ? ggml_time_us() : 0;
     {
         const auto status = graph_compute(sched_dflash_encode.get(), gf, /*batched=*/n_new > 1);
         if (status != GGML_STATUS_SUCCESS) {
@@ -1373,12 +1446,23 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
             return -3;
         }
     }
+    if (gpu_log) t_compute_us = ggml_time_us() - t_compute_start;
 
     dflash.ctx_filled += n_new;
     dflash.n_ctx = dflash.ctx_filled;
 
     if (gf_res_prev) {
         gf_res_prev->reset();
+    }
+
+    if (gpu_log) {
+        const int64_t t_extend_total = ggml_time_us() - t_extend_start;
+        LLAMA_LOG_INFO("[DFLASH_GPU_LOG] dflash_extend: n_new=%lld pos_start=%lld cache_hit=%d "
+                       "build=%.3f alloc=%.3f set_inputs=%.3f compute=%.3f total=%.3f ms\n",
+                       (long long) n_new, (long long) pos_start, cache_hit_log ? 1 : 0,
+                       t_build_us / 1000.0, t_alloc_us / 1000.0,
+                       t_inputs_us / 1000.0, t_compute_us / 1000.0,
+                       t_extend_total / 1000.0);
     }
     return 0;
 }
@@ -2303,11 +2387,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (!dflash.capture_layer_ids.empty()
             && !dflash.capture_staging.empty()
             && n_outputs_all > 0) {
+        static const bool gpu_log_capture = []() {
+            const char * e = std::getenv("DFLASH_GPU_LOG");
+            return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
+        }();
+        const int64_t t_sync_start = gpu_log_capture ? ggml_time_us() : 0;
         ggml_backend_sched_synchronize(sched.get());
+        const int64_t t_sync_end   = gpu_log_capture ? ggml_time_us() : 0;
 
         const int64_t n_embd_target = dflash.capture_n_embd;
         const int64_t n_layers_cap  = (int64_t) dflash.capture_layer_ids.size();
         const int64_t n_features    = n_layers_cap * n_embd_target;
+
+        const int64_t t_xpose_start = gpu_log_capture ? ggml_time_us() : 0;
 
         dflash.captured_features.assign((size_t) n_outputs_all * (size_t) n_features, 0.0f);
 
@@ -2321,6 +2413,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     layer_buf.data()                + (size_t) i * (size_t) n_embd_target,
                     (size_t) n_embd_target * sizeof(float));
             }
+        }
+
+        if (gpu_log_capture) {
+            const int64_t t_xpose_end = ggml_time_us();
+            const size_t  bytes_d2h    = (size_t) n_outputs_all * (size_t) n_features * sizeof(float);
+            LLAMA_LOG_INFO("[DFLASH_GPU_LOG] capture_readback: n_outputs=%lld n_layers=%lld n_features=%lld "
+                           "sync=%.3f xpose=%.3f total=%.3f ms d2h_bytes=%zu\n",
+                           (long long) n_outputs_all, (long long) n_layers_cap, (long long) n_features,
+                           (t_sync_end - t_sync_start) / 1000.0,
+                           (t_xpose_end - t_xpose_start) / 1000.0,
+                           (t_xpose_end - t_sync_start) / 1000.0,
+                           bytes_d2h);
         }
     }
 

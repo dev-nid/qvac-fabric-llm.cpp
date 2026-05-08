@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "dflash-gpu-log.h"
 #include "dflash-profile.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -62,6 +63,15 @@ int main(int argc, char ** argv) {
         dflash_prof::memory_profiler::instance().set_enabled(true);
         dflash_prof::memory_profiler::instance().snapshot("before_load", nullptr, nullptr);
         LOG_INF("%s: DFLASH_MEM=1: memory profiling enabled\n", __func__);
+    }
+
+    // GPU-aware host-observed wall-time logger (opt-in via DFLASH_GPU_LOG=1).
+    // Designed for Vulkan / Metal / CUDA where the dflash-profile cb_eval
+    // path would distort timings. See common/dflash-gpu-log.h.
+    const auto dflash_gpu_log_cfg = dflash_gpu_log::read_env_config();
+    if (dflash_gpu_log_cfg.enabled) {
+        dflash_gpu_log::logger::instance().set_enabled(true);
+        LOG_INF("%s: DFLASH_GPU_LOG=1: GPU host-observed phase logger enabled\n", __func__);
     }
 
     if (params.speculative.draft.mparams.path.empty()) {
@@ -192,8 +202,48 @@ int main(int argc, char ** argv) {
     // target model sampling context
     common_sampler_ptr smpl(common_sampler_init(model_tgt, params.sampling));
 
-    // eval the prompt
-    llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size() - 1));
+    // init the speculator BEFORE the user prefill so DFlash capture is
+    // installed in time. Pre-V2 the prefill ran first (without capture)
+    // and `begin()` re-decoded the prompt to populate captures — a full
+    // duplicate target prefill per generation, scaling with prompt
+    // length. With init moved up, capture fires during the user's
+    // prefill and `begin()` skips its re-decode.
+    const auto & params_spec = params.speculative;
+
+    if (dflash_mem_cfg.enabled) {
+        dflash_prof::memory_profiler::instance().snapshot("after_init", nullptr, ctx_tgt);
+    }
+    if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("prompt");
+
+    struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
+
+    // DFlash detection: positive block size on the draft means a DFlash
+    // drafter was loaded and capture was installed by `init` above; the
+    // prefill must request output at every prompt position so capture
+    // fires for each.
+    const bool dflash_active = llama_model_dflash_block_size(model_dft.get()) > 0;
+
+    {
+        DFLASH_GPU_TIMER("user prompt prefill (target)", ctx_tgt);
+        if (dflash_active) {
+            // Build a proper batch with logits=true per position. This is
+            // identical to what the old `begin()` re-decode did, just
+            // applied to the user's prefill so we only do it once.
+            const int32_t n_prefill = (int32_t) inp.size() - 1;
+            llama_batch prefill_batch = llama_batch_init(n_prefill, 0, 1);
+            for (int32_t i = 0; i < n_prefill; ++i) {
+                common_batch_add(prefill_batch, inp[i], (llama_pos) i, { 0 }, /*logits=*/true);
+            }
+            if (llama_decode(ctx_tgt, prefill_batch) != 0) {
+                LOG_ERR("%s: target prompt prefill (with capture) failed\n", __func__);
+                llama_batch_free(prefill_batch);
+                return 1;
+            }
+            llama_batch_free(prefill_batch);
+        } else {
+            llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size() - 1));
+        }
+    }
 
     // note: keep the last token separate!
     llama_token id_last = inp.back();
@@ -203,16 +253,6 @@ int main(int argc, char ** argv) {
     prompt_tgt.reserve(llama_n_ctx(ctx_tgt));
 
     int n_past = inp.size() - 1;
-
-    // init the speculator
-    const auto & params_spec = params.speculative;
-
-    if (dflash_mem_cfg.enabled) {
-        dflash_prof::memory_profiler::instance().snapshot("after_init", nullptr, ctx_tgt);
-    }
-    if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("prompt");
-
-    struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
 
     common_speculative_begin(spec, prompt_tgt);
 
@@ -276,7 +316,10 @@ int main(int argc, char ** argv) {
                 // Drafter returned no tree (non-DFlash, or topk read failed).
                 // Decode just id_last and emit the bonus token.
                 common_batch_add(batch_tgt, id_last, n_past_before, { 0 }, /*logits=*/true);
-                llama_decode(ctx_tgt, batch_tgt);
+                {
+                    DFLASH_GPU_TIMER("target tree-empty fallback decode", ctx_tgt);
+                    llama_decode(ctx_tgt, batch_tgt);
+                }
 
                 const llama_token bonus = common_sampler_sample(smpl.get(), ctx_tgt, 0);
                 common_sampler_accept(smpl.get(), bonus, true);
@@ -322,7 +365,10 @@ int main(int argc, char ** argv) {
                 }
 
                 if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("verify");
-                llama_decode(ctx_tgt, batch_tgt);
+                {
+                    DFLASH_GPU_TIMER("target tree-verify decode", ctx_tgt);
+                    llama_decode(ctx_tgt, batch_tgt);
+                }
 
                 // Tree-walk accept: root → ... → commit_n following target argmax.
                 int current  = 0;
@@ -458,7 +504,10 @@ int main(int argc, char ** argv) {
             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
             if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("verify");
-            llama_decode(ctx_tgt, batch_tgt);
+            {
+                DFLASH_GPU_TIMER("target chain-verify decode", ctx_tgt);
+                llama_decode(ctx_tgt, batch_tgt);
+            }
         }
 
         // only save the sampler sampler state if we use checkpoints
@@ -596,6 +645,15 @@ int main(int argc, char ** argv) {
             if (f) out = f;
         }
         dflash_prof::profiler::instance().dump(out, dflash_prof_cfg.top_n);
+        if (out != stderr) std::fclose(out);
+    }
+    if (dflash_gpu_log_cfg.enabled) {
+        FILE * out = stderr;
+        if (!dflash_gpu_log_cfg.out_file.empty()) {
+            FILE * f = std::fopen(dflash_gpu_log_cfg.out_file.c_str(), "w");
+            if (f) out = f;
+        }
+        dflash_gpu_log::dump_summary(out);
         if (out != stderr) std::fclose(out);
     }
     if (dflash_mem_cfg.enabled) {

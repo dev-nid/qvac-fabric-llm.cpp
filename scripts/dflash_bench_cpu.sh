@@ -277,6 +277,8 @@ result = {
     "tokens_per_sec": None,
     "tokens_predicted": None,
     "wall_ms": None,
+    "prompt_eval_ms": None,
+    "gen_eval_ms": None,
     "t_draft_ms": None,
     "t_verify_ms": None,
     "t_accept_ms": None,
@@ -320,6 +322,14 @@ if result["wall_ms"] is None:
     m = re.search(r"common_perf_print:\s+total time =\s+([\d.]+)\s+ms", log)
     if m:
         result["wall_ms"] = float(m.group(1))
+
+m = re.search(r"common_perf_print:\s+prompt eval time =\s+([\d.]+)\s+ms", log)
+if m:
+    result["prompt_eval_ms"] = float(m.group(1))
+
+m = re.search(r"common_perf_print:\s+eval time =\s+([\d.]+)\s+ms", log)
+if m:
+    result["gen_eval_ms"] = float(m.group(1))
 
 # Per-phase block from speculative-simple (lines 712-724)
 for label, key in [
@@ -512,6 +522,19 @@ PY
 printf '\n'
 printf 'wrote %s\n' "$out_path"
 printf 'total wall: %ds, runs: %d, failed: %d\n' "$total_dt" "$n_total" "$n_failed"
+
+# Auto-update the per-commit perf table at bench/README.md from all the
+# JSON snapshots in bench/{cpu,gpu}/. Best-effort: a render failure here
+# (e.g., missing python or stale snapshot format) must not fail the bench
+# run itself.
+script_dir="$(dirname "$0")"
+if [ -x "$script_dir/dflash_bench_render.py" ]; then
+    if python3 "$script_dir/dflash_bench_render.py" 2>/dev/null; then
+        :
+    else
+        printf '[warn] dflash_bench_render.py failed; bench/README.md not updated\n' >&2
+    fi
+fi
 
 # Pretty summary table from the JSON we just wrote.
 python3 - "$out_path" <<'PY'

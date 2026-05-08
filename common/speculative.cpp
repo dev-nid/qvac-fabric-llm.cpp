@@ -1,6 +1,7 @@
 #include "speculative.h"
 
 #include "common.h"
+#include "dflash-gpu-log.h"
 #include "ggml.h"
 #include "llama.h"
 #include "log.h"
@@ -1031,17 +1032,17 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
     // begin() runs at start of each new generation.
     //
-    // The target's prompt prefill in speculative-simple happens BEFORE this
-    // call (line ~149) without capture installed, so captures for those
-    // positions are missing. We re-decode the prompt with logits=true at
-    // every position (capture fires for each) and push the resulting
-    // captures into the draft's K/V side store.
+    // V2 (2026-05-08): if `common_speculative_init` runs BEFORE the
+    // user's prefill (as `speculative-simple` now does post-V2), DFlash
+    // capture is already installed and the user's prefill — provided
+    // it requested logits at every prompt position — populated
+    // `dflash.captured_features` for the entire prompt. We can push
+    // those captures straight into the side store without re-decoding.
     //
-    // Cost: one extra prompt-length target decode per generation. For
-    // long-running gens this is negligible vs. the verify-loop time;
-    // future optimization could install capture before the user's prefill
-    // and skip this re-decode.
+    // Pre-V2 callers that didn't install capture before their prefill
+    // still get the documented re-decode path (kept as a fallback).
     void begin(const llama_tokens & prompt) override {
+        DFLASH_GPU_TIMER("dflash.begin (extend + optional re-decode)", ctx_tgt);
         llama_dflash_reset_ctx_kv(ctx_dft);
         n_committed_total       = 0;
         pending_alt_capture_idx = -1;
@@ -1056,16 +1057,36 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
-        // Clear target's KV cache for the prompt re-decode.
+        // Fast path: caller's prefill already produced captures covering
+        // the prompt. Verified by asking ctx_tgt for the captured-feature
+        // count — if it's >= prompt size we can consume them directly.
+        {
+            int64_t n_captures = 0;
+            const float * captures = llama_get_dflash_captured_features(ctx_tgt, &n_captures);
+            if (captures != nullptr && n_captures >= (int64_t) n_to_decode) {
+                if (extend_side_store(n_to_decode, /*pos_start=*/0)) {
+                    n_committed_total = n_to_decode;
+                    return;
+                }
+                // extend_side_store already logged the error; fall through.
+            }
+        }
+
+        // Fallback: caller didn't install capture before its prefill; do
+        // the documented full re-decode of the prompt with logits=true at
+        // every position so capture fires for each.
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
 
         common_batch_clear(batch_tgt);
         for (int i = 0; i < n_to_decode; ++i) {
             common_batch_add(batch_tgt, prompt[i], (llama_pos) i, { 0 }, /*logits=*/true);
         }
-        if (llama_decode(ctx_tgt, batch_tgt) != 0) {
-            LOG_ERR("%s: target prompt prefill (with capture) failed\n", __func__);
-            return;
+        {
+            DFLASH_GPU_TIMER("dflash.begin: target prompt re-decode (fallback)", ctx_tgt);
+            if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+                LOG_ERR("%s: target prompt prefill (with capture) failed\n", __func__);
+                return;
+            }
         }
 
         if (!extend_side_store(n_to_decode, /*pos_start=*/0)) {
@@ -1123,9 +1144,12 @@ struct common_speculative_state_dflash : public common_speculative_state {
             const llama_token tok = (i == 0) ? id_last : mask_token_id;
             common_batch_add(batch_dft, tok, pos_block_start + i, { 0 }, /*logits=*/true);
         }
-        if (llama_decode(ctx_dft, batch_dft) != 0) {
-            LOG_ERR("%s: draft llama_decode failed\n", __func__);
-            return;
+        {
+            DFLASH_GPU_TIMER("draft chain decode", ctx_dft);
+            if (llama_decode(ctx_dft, batch_dft) != 0) {
+                LOG_ERR("%s: draft llama_decode failed\n", __func__);
+                return;
+            }
         }
 
         // Step 3: read top-K candidates per draft position (bidirectional
@@ -1199,9 +1223,12 @@ struct common_speculative_state_dflash : public common_speculative_state {
             const llama_token tok = (i == 0) ? id_last : mask_token_id;
             common_batch_add(batch_dft, tok, pos_block_start + i, { 0 }, /*logits=*/true);
         }
-        if (llama_decode(ctx_dft, batch_dft) != 0) {
-            LOG_ERR("%s: draft llama_decode failed\n", __func__);
-            return;
+        {
+            DFLASH_GPU_TIMER("draft tree decode", ctx_dft);
+            if (llama_decode(ctx_dft, batch_dft) != 0) {
+                LOG_ERR("%s: draft llama_decode failed\n", __func__);
+                return;
+            }
         }
 
         // Read top-K candidates per draft position.
@@ -1249,6 +1276,7 @@ private:
     // the rejected m_d capture with the accepted alt's at depth d). The
     // remap is done host-side into `alt_remap_buf`.
     bool extend_side_store(int64_t n_keep, int64_t pos_start) {
+        DFLASH_GPU_TIMER("extend_side_store (capture readback + dflash_extend)", ctx_dft);
         int64_t n_outputs = 0;
         const float * captures = llama_get_dflash_captured_features(ctx_tgt, &n_outputs);
         if (captures == nullptr || n_outputs == 0) {
@@ -1260,6 +1288,10 @@ private:
                     __func__, (long long) n_keep, (long long) n_outputs);
             return false;
         }
+
+        ::dflash_gpu_log::logger::instance().incr_capture_transpose_calls();
+        ::dflash_gpu_log::logger::instance().add_d2h_bytes(
+            (uint64_t) n_outputs * (uint64_t) n_features * sizeof(float));
 
         const float * extend_buf = captures;
 
@@ -1300,11 +1332,16 @@ private:
                 row_floats * sizeof(float));
             extend_buf = alt_remap_buf.data();
 
+            ::dflash_gpu_log::logger::instance().incr_alt_remap_calls();
+
             // Consume the hint: subsequent extends use the linear path.
             pending_alt_capture_idx = -1;
             pending_alt_depth       = 0;
         }
 
+        ::dflash_gpu_log::logger::instance().incr_extend_calls();
+        ::dflash_gpu_log::logger::instance().add_h2d_bytes(
+            (uint64_t) n_keep * (uint64_t) n_features * sizeof(float));
         const int32_t rc = llama_dflash_extend(ctx_dft, extend_buf, n_keep, pos_start);
         if (rc != 0) {
             LOG_ERR("%s: llama_dflash_extend failed (rc=%d)\n", __func__, rc);
