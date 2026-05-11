@@ -223,13 +223,25 @@ int main(int argc, char ** argv) {
     // fires for each.
     const bool dflash_active = llama_model_dflash_block_size(model_dft.get()) > 0;
 
+    llama_token id_last;
+    llama_tokens prompt_tgt;
+    int n_past;
     {
         DFLASH_GPU_TIMER("user prompt prefill (target)", ctx_tgt);
         if (dflash_active) {
-            // Build a proper batch with logits=true per position. This is
-            // identical to what the old `begin()` re-decode did, just
-            // applied to the user's prefill so we only do it once.
-            const int32_t n_prefill = (int32_t) inp.size() - 1;
+            // DFlash: prefill the FULL prompt with logits=true at every
+            // position so the drafter sees captures for all committed
+            // target tokens (including the last). The anchor token
+            // (id_last) is then sampled from the target's prediction at
+            // the last prompt position, matching how the DFlash drafter
+            // was trained — same convention as the reference Python
+            // implementation (z-lab/dflash:dflash/model.py) and the
+            // upstream-PR-candidate fork. The pre-fix path prefilled
+            // inp.size()-1 tokens and used inp.back() as the anchor,
+            // which left a one-position gap in captured features and
+            // significantly hurt accept rate on long prompts at large
+            // target model sizes (see logs/16_27b_accept_rate_divergence.md).
+            const int32_t n_prefill = (int32_t) inp.size();
             llama_batch prefill_batch = llama_batch_init(n_prefill, 0, 1);
             for (int32_t i = 0; i < n_prefill; ++i) {
                 common_batch_add(prefill_batch, inp[i], (llama_pos) i, { 0 }, /*logits=*/true);
@@ -240,19 +252,21 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             llama_batch_free(prefill_batch);
+
+            id_last = common_sampler_sample(smpl.get(), ctx_tgt, /*idx=*/-1);
+            common_sampler_accept(smpl.get(), id_last, true);
+
+            prompt_tgt.assign(inp.begin(), inp.end());
+            prompt_tgt.reserve(llama_n_ctx(ctx_tgt));
+            n_past = (int) inp.size();
         } else {
             llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size() - 1));
+            id_last = inp.back();
+            prompt_tgt.assign(inp.begin(), inp.end() - 1);
+            prompt_tgt.reserve(llama_n_ctx(ctx_tgt));
+            n_past = (int) inp.size() - 1;
         }
     }
-
-    // note: keep the last token separate!
-    llama_token id_last = inp.back();
-
-    // all tokens currently in the target context
-    llama_tokens prompt_tgt(inp.begin(), inp.end() - 1);
-    prompt_tgt.reserve(llama_n_ctx(ctx_tgt));
-
-    int n_past = inp.size() - 1;
 
     common_speculative_begin(spec, prompt_tgt);
 
