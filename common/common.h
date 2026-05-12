@@ -363,10 +363,41 @@ struct common_params_speculative {
 
     // DFlash speculative-decoding draft parameters (see llama_context_params
     // in include/llama.h for full semantics).
-    int32_t  dflash_max_ctx     = -1; // sliding-window cap; -1 = auto-scale, 0 = uncapped, >0 = explicit
-    uint32_t dflash_topk        = 1;  // top-K candidates per position; 1 = chain, >=2 = tree mode
-    bool     dflash_tree        = false; // enable DDTree multi-seq tree verify (Phase 2)
-    int32_t  dflash_tree_budget = 0;     // tree node budget; 0 = Stage B default (= block_size)
+    int32_t  dflash_max_ctx          = -1; // sliding-window cap; -1 = auto-scale, 0 = uncapped, >0 = explicit
+    uint32_t dflash_topk             = 1;  // top-K candidates per position; 1 = chain, >=2 = tree mode
+    bool     dflash_tree             = false; // enable DDTree multi-seq tree verify (Phase 2)
+    int32_t  dflash_tree_budget      = 0;     // tree node budget; 0 = Stage B default (= block_size)
+    bool     dflash_tree_best_first  = false; // expand tree by cumulative log-prob (heap) instead of round-robin
+
+    // Phase 1 plumbing for inline DFlash encoder. When true, the target
+    // context is constructed with cparams.dflash_inline_encoder set, and
+    // the speculative driver calls llama_dflash_bind_encoder() to plumb
+    // the draft's encoder weights onto the target model. The actual
+    // graph rewrite is wired in subsequent phases; this flag is a no-op
+    // until then. Default false (legacy side-store + separate encoder
+    // pass).
+    bool     dflash_inline_encoder   = false;
+
+    // Phase 4: GatedDeltaNet history kernel. When true, the target
+    // context is constructed with cparams.dflash_gdn_history set, the
+    // qwen35.cpp graph emits build_delta_net_with_history (writes
+    // per-token recurrent state into a persistent per-layer buffer),
+    // and the speculative driver replaces the FULL-seq_rm
+    // checkpoint+re-verify path with a fixup graph that selects
+    // state[K-1] for each GDN layer + standard seq_rm for the
+    // full-attention layers. CUDA only. Target-only (cleared on the
+    // draft cparams in speculative-simple). See logs/core_architecture
+    // /12_vulkan_opt_log.md Sessions 17–18.
+    bool     dflash_gdn_history      = false;
+
+    // Phase 5: GDN history persistent buffer dtype. When true, allocate
+    // gdn_history[il] as GGML_TYPE_F16 (halves the per-layer footprint;
+    // mandatory for DDTree-22 on Qwen3.5-27B in 32 GiB). When false,
+    // allocate F32 (matches Phase 4 chain-mode byte-exact behavior).
+    // Auto-defaults true when --dflash-tree && --dflash-gdn-history
+    // are both set; default false in chain mode. See
+    // logs/core_architecture/12_vulkan_opt_log.md Sessions 21–22.
+    bool     dflash_gdn_history_f16  = false;
 
     bool has_dft() const {
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();

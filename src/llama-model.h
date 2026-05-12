@@ -571,6 +571,29 @@ struct llama_model {
     struct ggml_tensor * target_tok_embd = nullptr;
     struct ggml_tensor * target_output   = nullptr;
 
+    // ----------------------------------------------------------------
+    // Inline DFlash encoder (phase 1 plumbing, not yet wired into any
+    // graph). Populated on the TARGET model by llama_dflash_bind_encoder()
+    // from a loaded DFlash draft model. Non-owning references — never
+    // freed by this model. When cparams.dflash_inline_encoder is enabled,
+    // the target's graph builder uses these to run the encoder K/V
+    // projection inline after the final captured layer instead of
+    // running it as a separate llama_decode on the draft context.
+    //
+    // Sizes:
+    //   target_dflash_fc          : [n_features, n_embd_dft]  (F16 weight)
+    //   target_dflash_hidden_norm : [n_embd_dft]              (F32 weight)
+    //   per-layer (one entry per draft layer / target_layer_id):
+    //     target_dflash_wk          : [n_embd_dft, n_embd_k_gqa_dft]
+    //     target_dflash_wv          : [n_embd_dft, n_embd_v_gqa_dft]
+    //     target_dflash_attn_k_norm : [n_embd_head_v_dft]
+    // ----------------------------------------------------------------
+    struct ggml_tensor *              target_dflash_fc          = nullptr;
+    struct ggml_tensor *              target_dflash_hidden_norm = nullptr;
+    std::vector<struct ggml_tensor *> target_dflash_wk;
+    std::vector<struct ggml_tensor *> target_dflash_wv;
+    std::vector<struct ggml_tensor *> target_dflash_attn_k_norm;
+
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 

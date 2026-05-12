@@ -95,7 +95,23 @@ struct llama_dflash {
     int64_t              captured_n_outputs = 0;
 
     // Per-layer host staging buffers for batched D2H capture transfer.
+    // Phase 1 fast path leaves this empty (single packed D2H goes straight
+    // into captured_features); only populated when the fallback path is
+    // taken (graph result without t_dflash_captures_packed).
     std::vector<std::vector<float>> capture_staging;
+
+    // Phase 2/3: when true, decode() skips the D2H of captured_features and
+    // the consumer is expected to use llama_dflash_extend_from_ctx() to feed
+    // captures into the draft via a device-to-device path. Set via
+    // llama_dflash_set_skip_host_readback() on the TARGET context once,
+    // typically at consumer init time.
+    bool                 skip_host_readback = false;
+
+    // Phase 2/3: cached pointer to the most recently finalized packed
+    // captures tensor (from the last llama_decode() on this context).
+    // Valid until the next decode on the same context. Consumers use this
+    // for device-to-device extends.
+    ggml_tensor *        last_packed_captures = nullptr;
 
     // ---------- (a') drafter inline top-K read-back ----------
     std::vector<int32_t> draft_topk;
@@ -111,6 +127,98 @@ struct llama_dflash {
     int64_t ctx_filled   = 0;
     int64_t ctx_capacity = 0;
     int64_t ctx_pos_base = 0;
+
+    // ---------- (d) Phase 3 inline encoder destinations + per-decode state ----
+    //
+    // When the TARGET context emits the encoder ops inline into its own
+    // decode graph (cparams.dflash_inline_encoder), set_rows writes K_new /
+    // V_new straight into the DRAFT context's side store. These pointers
+    // are bound from the draft via llama_dflash_bind_inline_side_store()
+    // and remain valid for the lifetime of the draft context.
+    //
+    // inline_write_offset and inline_pos_start are set per-decode by the
+    // speculative driver before llama_decode(ctx_tgt, batch) so the inline
+    // encoder input class can fill the pos_new / pos_idx tensors at
+    // set_input() time.
+    //
+    // Empty / zero on contexts that don't participate in the inline path.
+    std::vector<ggml_tensor *> inline_dst_K;
+    std::vector<ggml_tensor *> inline_dst_V;
+    int64_t                    inline_write_offset = 0;
+    int64_t                    inline_pos_start    = 0;
+
+    // ---------- (e) Phase 4 GDN history (target-side persistent buffers) ----
+    //
+    // When the TARGET context has cparams.dflash_gdn_history set and the
+    // model has GatedDeltaNet (recurrent) layers, one persistent
+    // per-token-state-history tensor is allocated per recurrent layer.
+    // Shape per tensor: [S_v, S_v, H_v, gdn_history_max_tokens * n_seqs_max].
+    // The qwen3.5 graph builder emits a ggml_cpy at the end of the GDN
+    // layer that copies the packed state_history region of the
+    // GATED_DELTA_NET_WITH_HISTORY op output into gdn_history[il]. After
+    // the verify decode + sampler accept, the speculative driver builds
+    // a small fixup graph that runs GATED_DELTA_NET_STATE_SELECT on each
+    // gdn_history[il] and writes the chosen slab back into the
+    // recurrent-state cache.
+    //
+    // Non-recurrent layers have gdn_history[il] == nullptr.
+    // Empty on draft / non-GDN-target contexts.
+    std::vector<ggml_tensor *> gdn_history;
+    int64_t                    gdn_history_max_tokens = 0;  // shared cap across layers
+    // Phase 5: per-seq dimension of the gdn_history persistent buffers
+    // (last dim of each tensor view'd as 5-D
+    // [S_v, S_v, H, max_tokens, n_seqs_max]). 1 in chain mode; bumped
+    // to cparams.n_seq_max in tree mode. The kernel routes per-seq
+    // intermediate-state spills using this stride.
+    int64_t                    gdn_history_n_seqs_max = 1;
+
+    // Companion persistent buffers for the conv (r_l) side of each GDN
+    // layer. Holds the FULL conv_input tensor from each chain-verify
+    // decode (shape [conv_kernel_size - 1 + n_seq_tokens, conv_channels,
+    // n_seqs]). On partial acceptance, the next decode's conv-state
+    // fixup reads rows [k_index+1 : k_index + conv_kernel_size] of this
+    // buffer to recover the correct conv state ending at the last
+    // accepted position.
+    //
+    // Allocated and shaped at sched_reserve() time with the same cap
+    // as gdn_history (gdn_history_max_tokens). One tensor per GDN
+    // layer; nullptr for full-attention layers.
+    std::vector<ggml_tensor *> conv_history;
+
+    // Per-decode fixup index, set by the speculative driver between
+    // chain-verify decodes. >= 0 = select state_history[k_index] for
+    // each GDN layer at the start of the next verify graph; < 0 = no
+    // fixup (state_select falls back to current ssm slot — first decode
+    // after prefill or full-acceptance iter). Default -1.
+    //
+    // Drives both the GDN state_select op AND the conv-state fixup
+    // (they share the same k_index because they're rolling back to the
+    // same chain position).
+    int32_t                    gdn_history_k_index = -1;
+
+    // Phase 5 tree-mode: per-seq k_index. Populated by
+    // llama_dflash_set_gdn_history_k_index_per_seq before each
+    // tree-verify decode. Empty in chain mode (scalar
+    // gdn_history_k_index applies). When non-empty, the gdn_fixup
+    // input class writes this whole vector into the k_index tensor
+    // (sized [n_seqs]) consumed by state_select; the kernel picks
+    // per-seq state_history[k_indices[s], s].
+    std::vector<int32_t>       gdn_history_k_indices;
+
+    // Phase 5 tree-mode: parent_ids buffer for the next decode.
+    // Shape [n_tokens, n_seqs] in row-major order — entry
+    // [t + s * n_tokens] is t's parent in seq s, or
+    // GGML_GDN_TREE_ROOT_PARENT (= -1) if t's parent is the pre-block
+    // state. Populated by llama_dflash_set_gdn_history_parent_ids;
+    // consumed by the per-decode parent_ids input class that mirrors
+    // it to a device-side I32 tensor at set_input time.
+    //
+    // Empty in chain mode. The qwen35-family graph builder only emits
+    // parent_ids inputs when cparams.n_seq_max > 1 &&
+    // cparams.dflash_gdn_history.
+    std::vector<int32_t>       gdn_history_parent_ids;
+    int32_t                    gdn_history_parent_ids_n_tokens = 0;
+    int32_t                    gdn_history_parent_ids_n_seqs   = 0;
 };
 
 // DDTree (DFlash Phase 2): custom attention mask for tree-shaped verification.
@@ -323,6 +431,73 @@ public:
     const llama_dflash * dflash;
     int64_t              n_ctx;
     int64_t              n_block;
+};
+
+// Phase 3 inline encoder input class. Holds the pos_new (RoPE positions)
+// and pos_idx (write slots into the side store) tensors created in the
+// target's main decode graph. set_input() fills both from a live pointer
+// to the target context's llama_dflash struct (inline_pos_start /
+// inline_write_offset are bumped by the speculative driver before each
+// llama_decode call).
+//
+// `n_outputs` is the number of capture positions in this graph build —
+// equals n_outputs of the target decode and matches the row count of the
+// packed captures tensor that feeds the encoder.
+class llm_graph_input_dflash_inline_encode : public llm_graph_input_i {
+public:
+    llm_graph_input_dflash_inline_encode(llama_dflash * dflash, int64_t n_outputs)
+        : dflash(dflash), n_outputs(n_outputs) {}
+    virtual ~llm_graph_input_dflash_inline_encode() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * pos_new = nullptr; // I32 [n_outputs]
+    ggml_tensor * pos_idx = nullptr; // I64 [n_outputs]
+
+    llama_dflash * dflash;     // non-owning, lives on the target context
+    int64_t        n_outputs;
+};
+
+// DFlash Phase 4 GDN history fixup input. Holds an I32 `k_index` tensor
+// that the in-graph state_select op consumes. set_input() reads the
+// host-set value(s) off the llama_dflash struct (set between decodes
+// by the speculative driver).
+//
+// `k_index` is sized [1] for chain mode (n_seqs == 1) and [n_seqs] for
+// Phase 5 tree mode (n_seqs > 1). The constructor argument
+// `k_index_count` records which one was allocated so set_input() picks
+// the right host source (scalar gdn_history_k_index vs per-seq
+// gdn_history_k_indices).
+class llm_graph_input_dflash_gdn_fixup : public llm_graph_input_i {
+public:
+    llm_graph_input_dflash_gdn_fixup(llama_dflash * dflash, int32_t k_index_count)
+        : dflash(dflash), k_index_count(k_index_count) {}
+    virtual ~llm_graph_input_dflash_gdn_fixup() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * k_index = nullptr; // I32 [k_index_count]
+
+    llama_dflash * dflash; // non-owning
+    int32_t        k_index_count = 1;
+};
+
+// Phase 5 tree-mode: parent_ids input class. Mirrors the host-side
+// dflash->gdn_history_parent_ids vector to a device-side I32 tensor at
+// set_input time. The qwen35-family graph builder emits ONE of these
+// per recurrent layer; all of them set_input from the same vector
+// (cheap host-to-device copy, ~88 bytes for DDTree-22).
+class llm_graph_input_dflash_gdn_parent_ids : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_dflash_gdn_parent_ids(llama_dflash * dflash)
+        : dflash(dflash) {}
+    virtual ~llm_graph_input_dflash_gdn_parent_ids() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * parent_ids = nullptr; // I32 [n_tokens, n_seqs]
+
+    llama_dflash * dflash; // non-owning
 };
 
 class llm_graph_input_attn_no_cache : public llm_graph_input_i {
@@ -765,6 +940,17 @@ public:
     // [n_embd_target, n_outputs].
     std::vector<ggml_tensor *> t_dflash_captures;
 
+    // DFlash target captures packed on-graph (Phase 1): same data as
+    // t_dflash_captures but as a single tensor of shape
+    // [n_layers * n_embd_target, n_outputs] in the same row-per-token,
+    // all-layers-side-by-side layout the encoder graph in dflash_extend()
+    // consumes. Built once the last expected capture lands (see
+    // build_dflash_capture in llama-graph.cpp). Optional: nullptr if the
+    // model didn't request DFlash capture, or if only a subset of expected
+    // captures arrived. Consumers should fall back to t_dflash_captures
+    // when this is null.
+    ggml_tensor * t_dflash_captures_packed = nullptr;
+
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
     std::map<llama_seq_id, ggml_tensor*> t_sampled;
@@ -994,6 +1180,62 @@ struct llm_graph_context {
     // tensor and push it into res->t_dflash_captures so llama_context::decode()
     // can read it back. No-op if dflash is null or capture is disabled.
     void build_dflash_capture(ggml_tensor * cur, int il) const;
+
+    // Phase 3 inline encoder. Called from the per-arch graph builder
+    // AFTER the main layer loop with the packed captures tensor (built
+    // earlier by build_dflash_capture at the final captured layer).
+    // Emits the encoder graph:
+    //   dflash_fc -> RMSNorm(dflash_hidden_norm)
+    //   -> for each draft layer:
+    //        wk * h_proj -> reshape -> attn_k_norm -> RoPE -> set_rows(ctx_K)
+    //        wv * h_proj -> reshape                       -> set_rows(ctx_V)
+    // directly into the target's decode graph. set_rows destinations come
+    // from dflash->inline_dst_{K,V} (bound from the draft context via
+    // llama_dflash_bind_inline_side_store). The encoder weights come from
+    // the model's target_dflash_* pointers (bound from the draft model
+    // via llama_dflash_bind_encoder). Uses *target's* hparams for the
+    // per-head dims and RoPE params — correct only when target & draft
+    // share them (Qwen3 family does; Qwen3.5 does not and needs explicit
+    // sizing through a later patch). No-op when inline mode is off or
+    // any required state is missing.
+    void build_dflash_inline_encoder(const llama_model & model,
+                                     ggml_tensor *       packed_captures) const;
+
+    // DFlash Phase 4 GDN history fixup. Returns a `selected_state` tensor
+    // of shape [S_v, S_v, H_v, n_seqs] that the caller (qwen35.cpp) uses
+    // directly as the GDN op's `state` input — bypassing the
+    // ssm_states_all read entirely on this layer in this decode.
+    //
+    // Semantics (encoded in the state_select kernel):
+    //   k_index >= 0  : selected = gdn_history[il][..., k_index, :].
+    //   k_index <  0  : selected = current ssm_states_all_slot value
+    //                   (fallback path; net effect == legacy read).
+    //
+    // Returns nullptr (no ops emitted) when cparams.dflash_gdn_history is
+    // false, dflash is null, or the gdn_history buffer for this layer
+    // wasn't allocated — caller falls back to the legacy build_rs path.
+    //
+    // In tree mode (cparams.n_seq_max > 1 && cparams.dflash_gdn_history)
+    // the k_index tensor is sized [n_seqs] and set_input pulls from
+    // dflash->gdn_history_k_indices; in chain mode it's [1] and pulls
+    // from the scalar gdn_history_k_index. `n_seqs` here matches the
+    // ubatch's n_seqs at graph build time.
+    ggml_tensor * build_dflash_gdn_history_fixup_or_null(
+            int           il,
+            ggml_tensor * ssm_states_all_slot_view,
+            int64_t       n_seqs) const;
+
+    // Phase 5 tree-mode: build the parent_ids graph input for one GDN
+    // layer. Returns the input's I32 tensor of shape [n_tokens, n_seqs]
+    // or nullptr when tree mode is not active (chain mode or no
+    // dflash on the context). The set_input call on every emitted
+    // instance pulls from the same dflash->gdn_history_parent_ids
+    // vector, so the host source stays in lock-step across layers.
+    // Per-layer cost: one host->device I32 mirror of size
+    // n_tokens * n_seqs * 4 bytes — negligible at DDTree-22 sizes.
+    ggml_tensor * build_dflash_gdn_parent_ids_or_null(
+            int64_t n_tokens,
+            int64_t n_seqs) const;
 
     //
     // attention

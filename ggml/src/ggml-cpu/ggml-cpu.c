@@ -1995,6 +1995,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ssm_conv(params, tensor);
             } break;
+        case GGML_OP_SSM_CONV_TREE:
+            {
+                ggml_compute_forward_ssm_conv_tree(params, tensor);
+            } break;
         case GGML_OP_SSM_SCAN:
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
@@ -2042,6 +2046,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_GATED_DELTA_NET:
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
+            } break;
+        case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
+            {
+                ggml_compute_forward_gated_delta_net_with_history(params, tensor);
+            } break;
+        case GGML_OP_GATED_DELTA_NET_STATE_SELECT:
+            {
+                ggml_compute_forward_gated_delta_net_state_select(params, tensor);
+            } break;
+        case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT:
+            {
+                ggml_compute_forward_dflash_conv_state_history_select(params, tensor);
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
@@ -2223,6 +2239,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
+        case GGML_OP_GATED_DELTA_NET_STATE_SELECT:
+        case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT:
             {
                 n_tasks = n_threads;
             } break;
@@ -2361,6 +2380,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_CONV_TREE:
         case GGML_OP_SSM_SCAN:
             {
                 n_tasks = n_threads;
@@ -2937,9 +2957,15 @@ struct ggml_cplan ggml_graph_plan(
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
+                case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
                     {
                         const int64_t S_v = node->src[2]->ne[0];
                         cur = S_v * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_GATED_DELTA_NET_STATE_SELECT:
+                case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT:
+                    {
+                        cur = 0;
                     } break;
                 case GGML_OP_COUNT:
                     {

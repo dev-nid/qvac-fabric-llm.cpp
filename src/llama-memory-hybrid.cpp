@@ -138,6 +138,17 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_hybrid::seq_rm_partial_tail_state_managed_externally(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // Recurrent half: rewinds the tail cell's pos to p0 - 1 on partial
+    // overlap (state buffer will be overwritten by DFlash Phase 4 fixup).
+    // Attn half: standard partial-tail removal (no state to manage).
+    if (!mem_recr->seq_rm_partial_tail_state_managed_externally(seq_id, p0, p1)) {
+        return false;
+    }
+    return mem_attn->seq_rm(seq_id, p0, p1);
+}
+
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);

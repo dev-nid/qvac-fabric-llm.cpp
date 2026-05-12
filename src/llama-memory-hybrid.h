@@ -82,6 +82,16 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    // DFlash Phase 4 partial-tail removal (chain mode only). Forwards to
+    // mem_recr->seq_rm_partial_tail_state_managed_externally for the
+    // recurrent half and mem_attn->seq_rm for the attn half. The caller
+    // must overwrite recurrent state for the rewound cell before the
+    // next decode (DFlash Phase 4 fixup graph does this).
+    bool seq_rm_partial_tail_state_managed_externally(
+            llama_seq_id seq_id,
+            llama_pos    p0,
+            llama_pos    p1);
+
 private:
     const llama_hparams & hparams;
 

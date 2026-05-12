@@ -11,6 +11,8 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -972,13 +974,28 @@ struct common_speculative_state_dflash : public common_speculative_state {
     // remapped captures rows for an alt-accept extend.
     std::vector<float>    alt_remap_buf;
 
+    // Scratch buffers for best-first DDTree expansion (Stage D Phase A).
+    // Hold per-position top-K log-probs and token IDs computed host-side
+    // from the draft's full-vocab logits. Sized to `block_size * topk_K`
+    // and reused across draft_tree() calls.
+    std::vector<float>    best_first_logprobs;
+    std::vector<int32_t>  best_first_tokens;
+
+    // Phase 2: when true, the encoder runs on ctx_tgt's scheduler via
+    // llama_dflash_inline_encode_from_ctx() instead of on ctx_dft's via
+    // llama_dflash_extend_from_ctx(). Set from params.dflash_inline_encoder
+    // at construction time; immutable for the life of this state.
+    bool                  dflash_inline_encoder = false;
+
     common_speculative_state_dflash(
             enum common_speculative_type type,
             llama_context * ctx_tgt,
-            llama_context * ctx_dft)
+            llama_context * ctx_dft,
+            bool            dflash_inline_encoder_in)
         : common_speculative_state(type)
         , ctx_tgt(ctx_tgt)
         , ctx_dft(ctx_dft)
+        , dflash_inline_encoder(dflash_inline_encoder_in)
     {
         batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
         batch_dft = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
@@ -1008,6 +1025,21 @@ struct common_speculative_state_dflash : public common_speculative_state {
                                      target_layer_ids.data(),
                                      target_layer_ids.size(),
                                      n_embd_target);
+        }
+
+        // Phase 3: enable the device-to-device capture path. The target
+        // skips the per-decode D2H of captured_features; this consumer
+        // pulls captures straight from the target's device-resident packed
+        // tensor via llama_dflash_extend_from_ctx(). The rare alt-remap
+        // path (record_alt_accept) forces a one-shot D2H readback inline.
+        // Can be disabled via DFLASH_DISABLE_DEVICE_CAPTURES=1 for
+        // bisecting if a regression is suspected.
+        {
+            const char * dis = std::getenv("DFLASH_DISABLE_DEVICE_CAPTURES");
+            const bool   disable = dis && dis[0] != '\0' && std::strcmp(dis, "0") != 0;
+            if (!disable && !target_layer_ids.empty()) {
+                llama_dflash_set_skip_host_readback(ctx_tgt, true);
+            }
         }
 
         LOG_INF("%s: dflash spec initialised: block_size=%u, mask_token=%d, "
@@ -1058,12 +1090,14 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         // Fast path: caller's prefill already produced captures covering
-        // the prompt. Verified by asking ctx_tgt for the captured-feature
-        // count — if it's >= prompt size we can consume them directly.
+        // the prompt. We check by asking ctx_tgt for the captured-feature
+        // count: in skip_host_readback mode the host pointer is null but
+        // n_captures is still updated (captures live on device). The
+        // device path in extend_side_store handles both cases uniformly.
         {
             int64_t n_captures = 0;
-            const float * captures = llama_get_dflash_captured_features(ctx_tgt, &n_captures);
-            if (captures != nullptr && n_captures >= (int64_t) n_to_decode) {
+            (void) llama_get_dflash_captured_features(ctx_tgt, &n_captures);
+            if (n_captures >= (int64_t) n_to_decode) {
                 if (extend_side_store(n_to_decode, /*pos_start=*/0)) {
                     n_committed_total = n_to_decode;
                     return;
@@ -1245,7 +1279,41 @@ struct common_speculative_state_dflash : public common_speculative_state {
         const int budget = (params.dflash_tree_budget > 0)
                          ? params.dflash_tree_budget
                          : block_size;
-        build_ddtree_tree(draft_topk, block_size, topk_K, budget, result);
+
+        if (params.dflash_tree_best_first && topk_K >= 3) {
+            // Best-first DDTree Phase A: pull full-vocab logits, compute
+            // per-position log-probs (lucebox-style logsumexp) and select
+            // leaf-alts ordered by log-prob instead of round-robin rank.
+            // dflash_emit_logits must have been set on ctx_dft for this to
+            // work; if absent we fall through to uniform.
+            //
+            // Skipped for K<3: with K=2 there is exactly one alt per depth,
+            // so best-first picks the same set as uniform — no point paying
+            // the logit-readback cost.
+            const float * logits = llama_get_logits(ctx_dft);
+            const int     vocab  = llama_vocab_n_tokens(
+                llama_model_get_vocab(llama_get_model(ctx_dft)));
+            if (logits != nullptr && vocab > 0) {
+                const size_t buf_floats = (size_t) block_size * (size_t) topk_K;
+                if (best_first_logprobs.size() < buf_floats) {
+                    best_first_logprobs.resize(buf_floats);
+                    best_first_tokens.resize(buf_floats);
+                }
+                extract_draft_topk_logprobs(
+                    logits, block_size, vocab, (int) topk_K,
+                    best_first_logprobs.data(), best_first_tokens.data());
+                build_ddtree_tree_bestfirst_leaf(
+                    best_first_logprobs.data(), best_first_tokens.data(),
+                    block_size, topk_K, budget, result);
+            } else {
+                LOG_WRN("%s: dflash_tree_best_first set but ctx_dft did not emit logits; "
+                        "falling back to uniform expansion. Did you forget "
+                        "dflash_emit_logits=true on the draft cparams?\n", __func__);
+                build_ddtree_tree(draft_topk, block_size, topk_K, budget, result);
+            }
+        } else {
+            build_ddtree_tree(draft_topk, block_size, topk_K, budget, result);
+        }
 
         llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, -1);
     }
@@ -1277,8 +1345,96 @@ private:
     // remap is done host-side into `alt_remap_buf`.
     bool extend_side_store(int64_t n_keep, int64_t pos_start) {
         DFLASH_GPU_TIMER("extend_side_store (capture readback + dflash_extend)", ctx_dft);
+
+        // Phase 3 inline-encoder fast path: the encoder ops already ran
+        // inside the target's main decode graph and wrote n_outputs
+        // captured rows to side-store slots [write_offset..write_offset
+        // + n_outputs - 1]. All we need to do is advance ctx_filled by
+        // n_keep (the accepted-token count) so the draft attention sees
+        // exactly those rows. Unaccepted rows live above the boundary
+        // and are overwritten by the next iter's extend before any read.
+        //
+        // Chain mode only — tree mode's alt-remap still needs the host
+        // path. pending_alt_capture_idx >= 0 signals alt-accept.
+        if (dflash_inline_encoder && pending_alt_capture_idx < 0) {
+            // The inline encoder already wrote captured rows into the draft
+            // side store during target's decode. Advance ctx_filled so the
+            // draft attention sees them. slide_left in inline mode isn't
+            // wired yet — fail explicitly if we'd need it (sensible chain-
+            // mode limits don't hit this in practice).
+            (void) pos_start;
+            llama_dflash_inline_advance_ctx_filled(ctx_dft, n_keep);
+            ::dflash_gpu_log::logger::instance().incr_extend_calls();
+            return true;
+        }
+
         int64_t n_outputs = 0;
         const float * captures = llama_get_dflash_captured_features(ctx_tgt, &n_outputs);
+
+        // Phase 3: alt-remap path needs host bytes for the row reshuffle.
+        // In skip_host_readback mode the target didn't D2H this iteration,
+        // so issue a one-shot readback. The blocking sync inside is the
+        // (rare) cost for tree-mode alt-accept.
+        if (pending_alt_capture_idx >= 0 && captures == nullptr && n_outputs > 0) {
+            const int32_t rc = llama_dflash_force_host_readback(ctx_tgt);
+            if (rc != 0) {
+                LOG_ERR("%s: alt-remap force readback failed (rc=%d)\n", __func__, rc);
+                return false;
+            }
+            captures = llama_get_dflash_captured_features(ctx_tgt, &n_outputs);
+        }
+
+        // Phase 2 device fast path: when no alt-remap is pending, read
+        // straight from the target's device-resident packed captures and
+        // skip the host bounce entirely.
+        const bool can_use_device_path = (pending_alt_capture_idx < 0);
+        if (can_use_device_path) {
+            // n_outputs may be 0 here if skip_host_readback dropped the
+            // host buffer; ask the target context how many captures it
+            // produced via the embedded host-side counter (still kept up
+            // to date even when bytes are skipped).
+            int64_t n_outputs_dev = 0;
+            (void) llama_get_dflash_captured_features(ctx_tgt, &n_outputs_dev);
+            if (n_outputs_dev == 0) {
+                // No captures produced this step — fall through to error
+                // path below if we have nothing usable.
+            } else if (n_keep > n_outputs_dev) {
+                LOG_ERR("%s: asked to keep %lld captures but target produced only %lld\n",
+                        __func__, (long long) n_keep, (long long) n_outputs_dev);
+                return false;
+            } else {
+                ::dflash_gpu_log::logger::instance().incr_extend_calls();
+                ::dflash_gpu_log::logger::instance().add_h2d_bytes(
+                    (uint64_t) n_keep * (uint64_t) n_features * sizeof(float));
+                // Phase 2: when inline-encoder is requested, run the encoder
+                // on the target's scheduler. Falls back to the draft-side
+                // path on failure so a stricter regression is still possible
+                // (set DFLASH_DISABLE_INLINE_ENCODER=1 to force the fallback
+                // for back-to-back A/B testing).
+                static const bool inline_disable_env = []() {
+                    const char * e = std::getenv("DFLASH_DISABLE_INLINE_ENCODER");
+                    return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
+                }();
+                if (dflash_inline_encoder && !inline_disable_env) {
+                    const int32_t rc_inline = llama_dflash_inline_encode_from_ctx(
+                        ctx_tgt, ctx_dft, /*src_row_offset=*/0, n_keep, pos_start);
+                    if (rc_inline == 0) {
+                        return true;
+                    }
+                    LOG_WRN("%s: llama_dflash_inline_encode_from_ctx failed "
+                            "(rc=%d); falling back to draft-side encoder\n",
+                            __func__, rc_inline);
+                }
+                const int32_t rc = llama_dflash_extend_from_ctx(
+                    ctx_dft, ctx_tgt, /*src_row_offset=*/0, n_keep, pos_start);
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_dflash_extend_from_ctx failed (rc=%d)\n", __func__, rc);
+                    return false;
+                }
+                return true;
+            }
+        }
+
         if (captures == nullptr || n_outputs == 0) {
             LOG_ERR("%s: target captured no features (capture not installed or no outputs requested)\n", __func__);
             return false;
@@ -1348,6 +1504,178 @@ private:
             return false;
         }
         return true;
+    }
+
+    // Host-side top-K + log-prob extraction from raw draft logits. Used by
+    // best-first DDTree expansion (Phase A: leaf-alts ordered by per-(depth,rank)
+    // log-prob). Implements lucebox's `extract_draft_topk` (lucebox/dflash/
+    // test/test_dflash.cpp): single pass over the vocab per position, online
+    // logsumexp + bounded-K heap. Output is descending by log-prob.
+    //
+    // Inputs:  logits [n_pos * vocab]
+    // Outputs: out_log_probs [n_pos * K], out_token_ids [n_pos * K]
+    //          both sorted by log-prob DESCENDING (rank 0 = argmax).
+    static void extract_draft_topk_logprobs(const float * logits,
+                                            int           n_pos,
+                                            int           vocab,
+                                            int           K,
+                                            float       * out_log_probs,
+                                            int32_t     * out_token_ids) {
+        struct Entry { float logit; int32_t id; };
+        auto cmp_greater = [](const Entry & a, const Entry & b) {
+            return a.logit > b.logit;
+        };
+
+        for (int i = 0; i < n_pos; ++i) {
+            const float * li = logits + (size_t) i * (size_t) vocab;
+            std::vector<Entry> heap;
+            heap.reserve(K);
+
+            float running_max     = -INFINITY;
+            float running_sum_exp = 0.0f;
+            for (int j = 0; j < vocab; ++j) {
+                const float l = li[j];
+
+                if (l > running_max) {
+                    if (running_max > -INFINITY) {
+                        running_sum_exp = running_sum_exp * std::exp(running_max - l);
+                    }
+                    running_sum_exp += 1.0f;
+                    running_max = l;
+                } else {
+                    running_sum_exp += std::exp(l - running_max);
+                }
+
+                if ((int) heap.size() < K) {
+                    heap.push_back({ l, (int32_t) j });
+                    std::push_heap(heap.begin(), heap.end(), cmp_greater);
+                } else if (l > heap.front().logit) {
+                    std::pop_heap(heap.begin(), heap.end(), cmp_greater);
+                    heap.back() = { l, (int32_t) j };
+                    std::push_heap(heap.begin(), heap.end(), cmp_greater);
+                }
+            }
+
+            const float log_z = running_max + std::log(running_sum_exp);
+            std::sort_heap(heap.begin(), heap.end(), cmp_greater);
+            for (int k = 0; k < K; ++k) {
+                out_log_probs[(size_t) i * (size_t) K + k] = heap[k].logit - log_z;
+                out_token_ids[(size_t) i * (size_t) K + k] = heap[k].id;
+            }
+        }
+    }
+
+    // Stage D-PhaseA tree shape: chain seed (top-1 at depths 1..bs-1, capped
+    // at budget) + best-first leaf-alt selection from `(depth, rank)` tuples
+    // ordered by per-position log-prob.
+    //
+    // Same topology family as Stage C (leaf-alts only, compatible with the
+    // existing verify-side seq_id tagging in speculative-simple.cpp); the
+    // difference is *which* alts get included when budget < (K-1)*chain_len.
+    // Uniform expansion fills rank 1 across all depths first, then rank 2,
+    // etc. — depth-blind. Best-first picks the (depth, rank) tuples with the
+    // highest log-prob regardless of rank, which biases the budget toward
+    // alts the draft is most uncertain about.
+    //
+    // Deeper alt subtrees (lucebox's full algorithm) require ancestry-aware
+    // seq_id tagging on the verify batch and are deferred to Phase B.
+    static void build_ddtree_tree_bestfirst_leaf(
+            const float   * topk_logprobs,
+            const int32_t * topk_tokens,
+            int             block_size,
+            uint32_t        topk_K,
+            int             budget,
+            common_speculative_tree & tree) {
+        tree.tokens.clear();
+        tree.parents.clear();
+        tree.depths.clear();
+        tree.branch_ids.clear();
+        tree.child_maps.clear();
+        tree.visibility.clear();
+        tree.n_nodes       = 0;
+        tree.main_path_len = 0;
+        tree.n_branches    = 1;
+
+        if (budget <= 0 || block_size <= 1) {
+            tree.parents.push_back(-1);
+            tree.child_maps.emplace_back();
+            tree.visibility.assign(1, 1);
+            return;
+        }
+
+        tree.parents.push_back(-1);
+        tree.child_maps.emplace_back();
+
+        const int chain_target = std::min(block_size - 1, budget);
+        {
+            int parent = 0;
+            for (int d = 1; d <= chain_target; ++d) {
+                const llama_token tok = (llama_token) topk_tokens[(size_t) d * topk_K + 0];
+                const int idx = tree.n_nodes + 1;
+                tree.tokens.push_back(tok);
+                tree.parents.push_back(parent);
+                tree.depths.push_back(d);
+                tree.branch_ids.push_back(0);
+                tree.child_maps.emplace_back();
+                tree.child_maps[parent][tok] = idx;
+                tree.n_nodes++;
+                parent = idx;
+            }
+            tree.main_path_len = tree.n_nodes;
+        }
+
+        if (topk_K >= 2 && tree.n_nodes < budget) {
+            // Build the candidate pool (one entry per (depth, rank) with rank>=1)
+            // and sort by per-position log-prob descending. This is O(N log N)
+            // in `N = (K-1) * chain_target`, dwarfed by everything else.
+            struct AltCand {
+                float   logp;
+                int     depth;
+                uint32_t rank;
+                int32_t tok;
+            };
+            std::vector<AltCand> cands;
+            cands.reserve((size_t) (topk_K - 1) * (size_t) chain_target);
+            for (uint32_t rank = 1; rank < topk_K; ++rank) {
+                for (int d = 1; d <= chain_target; ++d) {
+                    const size_t idx = (size_t) d * (size_t) topk_K + rank;
+                    const int32_t tok = topk_tokens[idx];
+                    if (tok < 0) continue;
+                    cands.push_back({ topk_logprobs[idx], d, rank, tok });
+                }
+            }
+            std::sort(cands.begin(), cands.end(),
+                      [](const AltCand & a, const AltCand & b) { return a.logp > b.logp; });
+
+            int next_branch = 1;
+            for (const auto & c : cands) {
+                if (tree.n_nodes >= budget) break;
+                const int alt_parent_idx = c.depth - 1;
+                if (tree.child_maps[alt_parent_idx].count(c.tok)) continue;
+
+                const int idx = tree.n_nodes + 1;
+                tree.tokens.push_back((llama_token) c.tok);
+                tree.parents.push_back(alt_parent_idx);
+                tree.depths.push_back(c.depth);
+                tree.branch_ids.push_back(next_branch);
+                tree.child_maps.emplace_back();
+                tree.child_maps[alt_parent_idx][(llama_token) c.tok] = idx;
+                tree.n_nodes++;
+                next_branch++;
+            }
+            tree.n_branches = next_branch;
+        }
+
+        const int n = tree.n_nodes + 1;
+        tree.visibility.assign((size_t) n * n, 0);
+        tree.visibility[0 * n + 0] = 1;
+        for (int i = 1; i < n; ++i) {
+            const int parent = tree.parents[i];
+            for (int j = 0; j < i; ++j) {
+                tree.visibility[(size_t) i * n + j] = tree.visibility[(size_t) parent * n + j];
+            }
+            tree.visibility[(size_t) i * n + i] = 1;
+        }
     }
 
     // Stage C tree shape: chain seed (top-1 at depths 1..bs-1, capped at
@@ -1537,6 +1865,21 @@ common_speculative * common_speculative_init(
                     "graph will fall back to its self-contained tensors\n",
                     __func__);
         }
+
+        // Phase 1 plumbing for inline DFlash encoder. Populates non-owning
+        // pointers on the target model that reference the draft's encoder
+        // weights (dflash_fc, dflash_hidden_norm, per-layer wk/wv/k_norm).
+        // Phase 3 graph wiring (when --dflash-inline-encoder is set) hooks
+        // these into the target's main decode graph after the final
+        // captured layer.
+        if (params.dflash_inline_encoder) {
+            if (!llama_dflash_bind_encoder(
+                    const_cast<llama_model *>(model_tgt),
+                    params.draft.model)) {
+                LOG_WRN("%s: llama_dflash_bind_encoder returned false; the "
+                        "inline encoder will be unavailable\n", __func__);
+            }
+        }
     }
 
     if (params.draft.model) {
@@ -1544,6 +1887,18 @@ common_speculative * common_speculative_init(
         if (ctx_dft == nullptr) {
             LOG_ERR("%s", "failed to create draft context\n");
             return nullptr;
+        }
+    }
+
+    // Phase 3 inline encoder: bind draft's side-store K/V tensors onto the
+    // target context so the target's inline encoder ops can set_rows into
+    // them. Done here (after draft context creation) because the side
+    // store is allocated in the draft context's constructor.
+    if (want_dflash && params.dflash_inline_encoder && ctx_dft != nullptr) {
+        if (!llama_dflash_bind_inline_side_store(ctx_tgt, ctx_dft)) {
+            LOG_WRN("%s: llama_dflash_bind_inline_side_store returned false; "
+                    "inline encoder will fall back to draft-side path\n",
+                    __func__);
         }
     }
 
@@ -1666,7 +2021,7 @@ common_speculative * common_speculative_init(
             }
             case COMMON_SPECULATIVE_TYPE_DFLASH: {
                 impls.push_back(std::make_unique<common_speculative_state_dflash>(
-                    config.type, ctx_tgt, ctx_dft));
+                    config.type, ctx_tgt, ctx_dft, params.dflash_inline_encoder));
                 break;
             }
             default:
@@ -1746,6 +2101,41 @@ llama_tokens common_speculative_draft(
     }
 
     return result;
+}
+
+bool common_speculative_tree::write_parent_ids(int32_t * out,
+                                               int n_tokens,
+                                               int n_seqs) const {
+    if (out == nullptr) return false;
+    if (n_tokens != n_nodes + 1) return false;
+    if (n_seqs <= 0) return false;
+
+    // Seq 0 carries the actual DFS-flattened tree. parents[i] is already
+    // in batch-slot terms: 0 = root, j = tree node j (= batch slot j).
+    // GGML_GDN_TREE_ROOT_PARENT (= -1) for the root signals
+    // "reload from curr_state" in the kernel; for tree nodes whose
+    // parent is the root (parents[i] == 0) we keep the 0 so the kernel
+    // sees parent_t=0=t-1 for t=1 (sequential continuation), and for
+    // deeper-DFS root-children parent_t=0 != t-1 triggers a reload from
+    // inter[0] (state-after-root).
+    out[0] = -1;
+    for (int i = 1; i <= n_nodes; ++i) {
+        out[i] = parents[i];
+    }
+
+    // Seqs > 0 are unused at the spec-driver level for the single-seq
+    // DFS-flattened tree layout, but the kernel still reads them (its
+    // n_seqs comes from the ubatch's recurrent dim). Fill with -1 so
+    // any per-seq state slabs that aren't actually populated this iter
+    // get treated as "reload from curr_state" — i.e. the pre-block
+    // recurrent state — and don't corrupt anything.
+    for (int s = 1; s < n_seqs; ++s) {
+        for (int t = 0; t < n_tokens; ++t) {
+            out[(size_t) s * n_tokens + t] = -1;
+        }
+    }
+
+    return true;
 }
 
 common_speculative_tree common_speculative_draft_tree(

@@ -386,6 +386,51 @@ extern "C" {
                                  // 1 = chain mode (default), >=2 = tree mode (DDTree).
                                  // Ignored for non-DFlash drafts.
 
+        bool dflash_emit_logits; // When true, the DFlash draft emits full-vocab logits so the host can
+                                 // compute per-position log-probs for best-first DDTree expansion.
+                                 // Default false (keeps the bs * n_vocab * 4 byte readback optimisation).
+                                 // Ignored for non-DFlash drafts. Auto-enabled by --dflash-tree-best-first.
+
+        // ---------------------------------------------------------------
+        // Inline DFlash encoder (phase 1 plumbing; not wired into any
+        // graph yet). When set on a TARGET context, the target's graph
+        // builder runs the encoder K/V projection inline after the
+        // final captured layer instead of calling a separate decode on
+        // the draft context. Companion sizing fields are required so
+        // graph_reserve can size the inline ops before
+        // llama_dflash_bind_encoder() is called.
+        // Ignored for DFlash drafts (these fields are target-only).
+        // ---------------------------------------------------------------
+        bool     dflash_inline_encoder;
+        uint32_t dflash_inline_n_embd_dft;        // draft n_embd
+        uint32_t dflash_inline_n_head_kv_dft;     // draft n_head_kv
+        uint32_t dflash_inline_n_embd_head_dft;   // draft n_embd_head_v
+        uint32_t dflash_inline_n_target_layers;   // len(target_layer_ids)
+
+        // ---------------------------------------------------------------
+        // DFlash GatedDeltaNet history kernel (Phase 4). When set on a
+        // TARGET context whose architecture has GDN layers (Qwen3.5 etc),
+        // the GDN op writes per-token recurrent states to a persistent
+        // per-layer buffer instead of only the final state. The
+        // speculative driver consumes those buffers after sampling to
+        // select state[K-1] (K = accepted count) and avoid the
+        // checkpoint+re-verify round-trip required by COMMON_CONTEXT_SEQ_RM_TYPE_FULL.
+        // CUDA-only. Ignored for DFlash drafts (target-only flag) —
+        // setting it on an LLM_ARCH_DFLASH context throws at init.
+        // ---------------------------------------------------------------
+        bool     dflash_gdn_history;
+
+        // ---------------------------------------------------------------
+        // Phase 5: GDN history persistent buffer dtype. When true,
+        // dflash.gdn_history[il] is allocated as GGML_TYPE_F16 instead
+        // of GGML_TYPE_F32 — halves the per-layer footprint, which is
+        // mandatory for DDTree-22 on Qwen3.5-27B in 32 GiB. Ignored when
+        // dflash_gdn_history is false. Default false (matches Phase 4
+        // chain-mode byte-exact behaviour). See
+        // logs/core_architecture/12_vulkan_opt_log.md Session 21–22.
+        // ---------------------------------------------------------------
+        bool     dflash_gdn_history_f16;
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
@@ -662,6 +707,144 @@ extern "C" {
             struct llama_model *       model_dft,
             const struct llama_model * model_tgt);
 
+    // Phase 1 plumbing for inline DFlash encoder. Populates non-owning
+    // pointers on the TARGET model that reference the encoder weights
+    // loaded as part of the DRAFT model (dflash_fc, dflash_hidden_norm,
+    // and per-target-layer wk/wv/attn_k_norm). When
+    // cparams.dflash_inline_encoder is enabled on the target context,
+    // the target's graph builder uses these to run the encoder K/V
+    // projection inline after the final captured layer instead of
+    // calling a separate decode on the draft context.
+    //
+    // Must be called AFTER both models are loaded. Returns false if
+    // either model is null, draft is not LLM_ARCH_DFLASH, or draft is
+    // missing required encoder tensors. Pointers remain valid until
+    // either model is freed; the caller is responsible for ordering.
+    LLAMA_API bool llama_dflash_bind_encoder(
+            struct llama_model *       model_tgt,
+            const struct llama_model * model_dft);
+
+    // Phase 3 inline encoder: bind the draft context's per-layer side-store
+    // K/V tensors as set_rows destinations on the target context, so the
+    // target's graph can write encoder outputs directly into the draft's
+    // side store cross-context. Must be called after both contexts are
+    // constructed. Returns false on null args or if draft side store is
+    // empty (e.g., not a DFlash draft context).
+    LLAMA_API bool llama_dflash_bind_inline_side_store(
+            struct llama_context * ctx_tgt,
+            struct llama_context * ctx_dft);
+
+    // Phase 3 inline encoder: set the per-decode bookkeeping (where in the
+    // side store to write, and the starting RoPE position for the encoder)
+    // before each llama_decode(ctx_tgt, batch). Read at graph compute time
+    // by the inline encoder input class.
+    LLAMA_API void llama_dflash_set_inline_encode_state(
+            struct llama_context * ctx_tgt,
+            int64_t                write_offset,
+            int64_t                pos_start);
+
+    // Phase 3 inline encoder: advance the draft context's side-store
+    // ctx_filled by n_keep (the accepted-token count). Used after the
+    // target's inline encoder has written n_outputs rows to the side
+    // store; the speculative driver calls this with n_keep == accepted
+    // count so subsequent draft reads see only the accepted prefix.
+    // No-op when n_keep <= 0 or ctx is null.
+    LLAMA_API void llama_dflash_inline_advance_ctx_filled(
+            struct llama_context * ctx_dft,
+            int64_t                n_keep);
+
+    // Phase 4 partial-tail seq_rm for DFlash + GDN: same as
+    // llama_memory_seq_rm BUT allows partial-tail removal on hybrid
+    // memory backends (e.g. Qwen3.5's GatedDeltaNet+attn combo) by
+    // rewinding the recurrent tail cell's pos to p0 - 1 instead of
+    // returning false. The caller MUST overwrite the recurrent state
+    // buffer for that cell before the next decode — the DFlash Phase 4
+    // in-graph fixup (state_select + cpy into ssm_states_all slot)
+    // provides this guarantee when --dflash-gdn-history is enabled.
+    //
+    // Falls back to plain seq_rm on memory backends that don't have
+    // recurrent state (so it's safe to call unconditionally from a
+    // generic spec driver).
+    //
+    // Returns true on success, false on errors that mirror seq_rm's
+    // existing rejection rules (invalid seq_id, etc.).
+    LLAMA_API bool llama_dflash_memory_seq_rm_partial_tail_state_managed_externally(
+            llama_memory_t mem,
+            llama_seq_id   seq_id,
+            llama_pos      p0,
+            llama_pos      p1);
+
+    // Phase 4 GDN history fixup: set the per-decode k_index that the
+    // target's GDN-layer state_select op consumes at the start of the
+    // next llama_decode(ctx_tgt, ...).
+    //
+    // Semantics:
+    //   k_index >= 0  : in the next verify graph, every GDN layer's
+    //                   ssm_states_all slot is overwritten with
+    //                   state_history[k_index] from the PREVIOUS verify
+    //                   decode (the chain-verify-iter-N final state at
+    //                   token position k_index inside the chain).
+    //   k_index <  0  : no fixup — the state_select op falls back to the
+    //                   current slot data; net effect is a self-cpy
+    //                   (no-op). Use after a full-acceptance iter, before
+    //                   the first decode of a new generation, or when
+    //                   --dflash-gdn-history is disabled.
+    //
+    // The value is sticky: set once, applies to the next decode call.
+    // The spec driver calls this between target decodes with K - 1
+    // (K = accepted-token count) for partial acceptance.
+    //
+    // No-op on null ctx.
+    LLAMA_API void llama_dflash_set_gdn_history_k_index(
+            struct llama_context * ctx_tgt,
+            int32_t                k_index);
+
+    // Phase 5 tree-mode variant: set per-seq k_index for the next decode.
+    // `k_indices` is an array of `n_seqs` int32 entries (one accept depth
+    // per branch in the tree-verify). Each entry follows the same
+    // semantics as the scalar setter:
+    //   k_indices[s] >= 0 : in the next verify graph, seq `s`'s GDN slab
+    //                       is rolled back to state_history[k_indices[s], s].
+    //   k_indices[s] <  0 : no fixup for seq `s` — the state_select op
+    //                       falls back to copying the current
+    //                       ssm_states_all slot for that seq.
+    //
+    // The value is sticky: set once, applies to the next decode call.
+    // No-op on null ctx or null k_indices. n_seqs must match the
+    // upcoming ubatch's n_seqs (or 1 in the chain compatibility path);
+    // passing more is allowed (entries past n_seqs are written but
+    // ignored by the state_select op).
+    //
+    // Reference: Session 22 plumbed the kernel side
+    // (gated_delta_net_state_select with k_index_count > 1); this is
+    // the host setter that feeds it.
+    LLAMA_API void llama_dflash_set_gdn_history_k_index_per_seq(
+            struct llama_context * ctx_tgt,
+            const int32_t *        k_indices,
+            int32_t                n_seqs);
+
+    // Phase 5 tree-mode: bind a parent_ids buffer (host-side int32, shape
+    // [n_tokens, n_seqs]) for the next decode. Consumed by the
+    // ggml_gated_delta_net_with_history_tree + ggml_ssm_conv_tree ops
+    // in the qwen3.5 family graphs. parent_ids[t, s] is the token index
+    // within seq `s` of t's parent in the DFS-flattened tree, or
+    // `GGML_GDN_TREE_ROOT_PARENT` (= -1) if t's parent is the pre-block
+    // recurrent state.
+    //
+    // The caller retains ownership of the buffer; the context copies it
+    // into its own per-decode I32 input tensor at graph set_input time
+    // (typical: caller fills a std::vector<int32_t> from
+    // common_speculative_tree::write_parent_ids() before each
+    // tree-verify llama_decode). Pass `parent_ids = nullptr` to clear
+    // (returns the next decode to chain mode).
+    //
+    // No-op on null ctx.
+    LLAMA_API void llama_dflash_set_gdn_history_parent_ids(
+            struct llama_context * ctx_tgt,
+            const int32_t *        parent_ids,
+            int32_t                n_tokens,
+            int32_t                n_seqs);
+
     // -----------------------------------------------------------------------
     // DFlash target hidden-state capture (call on the *target* context)
     // -----------------------------------------------------------------------
@@ -699,6 +882,57 @@ extern "C" {
             const float *          target_hidden_new,
             int64_t                n_new,
             int64_t                pos_start);
+
+    // Device-to-device variant: reads captures directly from a source
+    // (target) context's most recently produced packed-captures tensor,
+    // skipping the D2H/H2D bounce that llama_dflash_extend() does via the
+    // host buffer. Requires:
+    //   - The TARGET context had llama_dflash_set_skip_host_readback(true)
+    //     called once at init (or its host buffer is fine to ignore).
+    //   - The TARGET context has just completed an llama_decode() that
+    //     produced n_keep+src_row_offset captures.
+    //   - Both contexts remain alive until the next llama_decode() on
+    //     either side.
+    // Falls back to the host path on cross-backend pairs that don't
+    // support direct copy. Returns 0 on success, negative on error.
+    LLAMA_API int32_t llama_dflash_extend_from_ctx(
+            struct llama_context * dst_ctx,        // draft
+            struct llama_context * src_ctx,        // target
+            int64_t                src_row_offset, // start row in target's captures
+            int64_t                n_keep,
+            int64_t                pos_start);
+
+    // Phase 2 inline encoder. Same encoder ops as llama_dflash_extend_from_ctx
+    // but executed on the TARGET context's scheduler instead of the draft's.
+    // Reads captures from src_ctx (target) locally, writes K_new/V_new into
+    // dst_ctx (draft) side store cross-context. Requires both contexts to
+    // share singleton ggml_backend_t pointers per device (standard llama.cpp
+    // init). Returns 0 on success; on negative return, the caller should
+    // fall back to llama_dflash_extend_from_ctx.
+    LLAMA_API int32_t llama_dflash_inline_encode_from_ctx(
+            struct llama_context * tgt_ctx,        // target — runs encoder on its sched
+            struct llama_context * dft_ctx,        // draft  — provides encoder weights + side store
+            int64_t                src_row_offset,
+            int64_t                n_keep,
+            int64_t                pos_start);
+
+    // Configure the TARGET context to skip the D2H readback of captured
+    // features on each llama_decode(). After this is set, consumers MUST
+    // use llama_dflash_extend_from_ctx() rather than the host-pointer
+    // variant; llama_get_dflash_captured_features() will return NULL.
+    LLAMA_API void llama_dflash_set_skip_host_readback(
+            struct llama_context * ctx,
+            bool                   skip);
+
+    // One-shot D2H readback of the most recently produced packed captures
+    // from the TARGET context. Use this in skip_host_readback mode when
+    // the consumer needs host bytes for a specific iteration (e.g., the
+    // alt-accept remap path). After this returns successfully,
+    // llama_get_dflash_captured_features() yields valid host bytes for
+    // this iteration. Returns 0 on success, negative on error (no captures
+    // produced this step, etc).
+    LLAMA_API int32_t llama_dflash_force_host_readback(
+            struct llama_context * ctx);
 
     // Reset the K/V side store (e.g. on a new prompt).
     LLAMA_API void llama_dflash_reset_ctx_kv(struct llama_context * ctx);

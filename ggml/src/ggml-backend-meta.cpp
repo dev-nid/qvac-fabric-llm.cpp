@@ -943,6 +943,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             case GGML_OP_SSM_CONV: {
                 split_state = handle_ssm_conv(src_ss);
             } break;
+            case GGML_OP_SSM_CONV_TREE: {
+                // parent_ids (src[2]) is a small mirrored I32 tensor; the
+                // x/weight split logic is the same as plain SSM_CONV.
+                split_state = handle_ssm_conv(src_ss);
+            } break;
             case GGML_OP_SSM_SCAN:
             case GGML_OP_WIN_PART:
             case GGML_OP_WIN_UNPART:
@@ -956,6 +961,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             } break;
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
+            } break;
+            case GGML_OP_GATED_DELTA_NET_WITH_HISTORY: {
+                split_state = handle_gated_delta_net(src_ss);
+            } break;
+            case GGML_OP_GATED_DELTA_NET_STATE_SELECT:
+            case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);

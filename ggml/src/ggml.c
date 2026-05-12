@@ -1053,6 +1053,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
+    "SSM_CONV_TREE",
     "SSM_SCAN",
     "WIN_PART",
     "WIN_UNPART",
@@ -1063,6 +1064,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
+    "GATED_DELTA_NET_WITH_HISTORY",
+    "GATED_DELTA_NET_STATE_SELECT",
+    "DFLASH_CONV_STATE_HISTORY_SELECT",
 
     "UNARY",
 
@@ -1080,7 +1084,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1163,6 +1167,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
+    "ssm_conv_tree(x, parent_ids)",
     "ssm_scan(x)",
     "win_part(x)",
     "win_unpart(x)",
@@ -1173,6 +1178,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
+    "gated_delta_net_with_history(q, k, v, g, beta, s)",
+    "gated_delta_net_state_select(state_history, k_index)",
+    "dflash_conv_state_history_select(conv_history, k_index)",
 
     "unary(x)",
 
@@ -1190,7 +1198,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5504,6 +5512,42 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
+// ggml_ssm_conv_tree (DFlash Phase 5)
+
+struct ggml_tensor * ggml_ssm_conv_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sx,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * parent_ids) {
+    GGML_ASSERT(ggml_is_3d(sx));
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(parent_ids != NULL);
+    GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(parent_ids));
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = sx->ne[0] - d_conv + 1; // tokens per sequence
+    const int64_t n_s     = sx->ne[2];
+
+    GGML_ASSERT(sx->ne[0] == d_conv - 1 + n_t);
+    GGML_ASSERT(sx->ne[1] == d_inner);
+    GGML_ASSERT(n_t >= 0);
+
+    // parent_ids shape: [n_t, n_s]
+    GGML_ASSERT(parent_ids->ne[0] == n_t);
+    GGML_ASSERT(parent_ids->ne[1] == n_s);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+
+    result->op     = GGML_OP_SSM_CONV_TREE;
+    result->src[0] = sx;
+    result->src[1] = c;
+    result->src[2] = parent_ids;
+
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(
@@ -6224,6 +6268,210 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_gated_delta_net_with_history
+
+struct ggml_tensor * ggml_gated_delta_net_with_history(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+
+    GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
+
+    // concat attn_out, final_state, and per-token state_history into one
+    // packed tensor. Layout:
+    //   attn:          S_v * H * n_tokens * n_seqs   floats
+    //   final_state:   S_v * S_v * H * n_seqs        floats
+    //   state_history: S_v * S_v * H * n_tokens * n_seqs floats
+    const int64_t ne[4] = {
+        S_v * H,
+        n_tokens * n_seqs                  // attn region rows
+            + S_v * n_seqs                 // final-state region rows
+            + S_v * n_tokens * n_seqs,     // state-history region rows
+        1, 1
+    };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_WITH_HISTORY;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+
+    return result;
+}
+
+// ggml_gated_delta_net_with_history_tree (DFlash Phase 5)
+
+struct ggml_tensor * ggml_gated_delta_net_with_history_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * persist_inter) {
+    // Build the same op shape as the chain entry point so the result tensor's
+    // layout (attn + final_state + embedded history) stays graph-stable for
+    // existing callers. The CUDA backend will spill into persist_inter
+    // instead of the embedded region when src[7] is non-null.
+    struct ggml_tensor * result =
+        ggml_gated_delta_net_with_history(ctx, q, k, v, g, beta, state);
+
+    GGML_ASSERT(parent_ids != NULL);
+    GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(parent_ids));
+
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+    GGML_ASSERT(ggml_nelements(parent_ids) == n_tokens * n_seqs);
+
+    GGML_ASSERT(persist_inter != NULL);
+    GGML_ASSERT(persist_inter->type == GGML_TYPE_F32 ||
+                persist_inter->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(persist_inter));
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H   = v->ne[1];
+    GGML_ASSERT(ggml_nelements(persist_inter) >= S_v * S_v * H * n_tokens * n_seqs);
+
+    result->src[6] = parent_ids;
+    result->src[7] = persist_inter;
+
+    return result;
+}
+
+// ggml_gated_delta_net_state_select
+
+struct ggml_tensor * ggml_gated_delta_net_state_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * state_history,
+        struct ggml_tensor  * k_index,
+        struct ggml_tensor  * fallback) {
+    // Phase 5: state_history may be F32 (chain, byte-exact with Phase 4)
+    // or F16 (tree mode; halves the persistent buffer's footprint). The
+    // CUDA kernel templates on SrcT to handle both; the F16 read path
+    // emits a __half2float conversion on each load.
+    GGML_ASSERT(state_history->type == GGML_TYPE_F32 ||
+                state_history->type == GGML_TYPE_F16);
+    GGML_ASSERT(k_index->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(state_history));
+
+    // state_history shape: [S_v, S_v, H_v, n_tokens, n_seqs] viewed as
+    // a 4-D tensor [S_v, S_v, H_v, n_tokens * n_seqs] (with ne[3] = n_tokens * n_seqs).
+    // The op selects one (S_v, S_v, H_v) slab per seq and produces a tensor
+    // with shape [S_v, S_v, H_v, n_seqs] — same shape as the GDN recurrent
+    // state tensor. The kernel reads k_index at compute time.
+    const int64_t S_v = state_history->ne[0];
+    const int64_t H_v = state_history->ne[2];
+    GGML_ASSERT(state_history->ne[1] == S_v);
+
+    // chain-mode convention: n_seqs == 1. Tree mode (Phase 5) widens this:
+    // state_history->ne[3] == n_tokens * n_seqs, with n_seqs > 1 inferred
+    // from k_index nelements (or from the fallback shape).
+    const int64_t k_count = ggml_nelements(k_index);
+    int64_t n_seqs = 1;
+    if (k_count > 1) {
+        n_seqs = k_count;
+    } else if (fallback != NULL) {
+        // Fallback shape gives us n_seqs even when k_index is a scalar
+        // broadcast across seqs (rare but legal: e.g. all branches accept
+        // the same depth).
+        n_seqs = fallback->ne[3];
+    }
+    GGML_ASSERT(state_history->ne[3] % n_seqs == 0);
+    GGML_ASSERT(k_count == 1 || k_count == n_seqs);
+
+    const int64_t ne[4] = { S_v, S_v, H_v, n_seqs };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    if (fallback != NULL) {
+        GGML_ASSERT(fallback->type == GGML_TYPE_F32);
+        // Total element count must match the result. The fallback is
+        // viewed as a flat byte stream by the CUDA kernel; layout is
+        // assumed to match (S_v * S_v * H_v * n_seqs row-major).
+        GGML_ASSERT(ggml_nelements(fallback) == ggml_nelements(result));
+    }
+
+    result->op     = GGML_OP_GATED_DELTA_NET_STATE_SELECT;
+    result->src[0] = state_history;
+    result->src[1] = k_index;
+    result->src[2] = fallback;
+
+    return result;
+}
+
+// ggml_dflash_conv_state_history_select
+
+struct ggml_tensor * ggml_dflash_conv_state_history_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * conv_history,
+        struct ggml_tensor  * k_index,
+        struct ggml_tensor  * fallback) {
+    GGML_ASSERT(conv_history->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_index->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(k_index) == 1);
+    GGML_ASSERT(ggml_is_contiguous(conv_history));
+
+    // conv_history shape:
+    //   [conv_kernel_size - 1 + max_tokens, conv_channels, n_seqs]
+    // Result picks `conv_kernel_size - 1` rows along dim 0:
+    //   [conv_kernel_size - 1, conv_channels, n_seqs]
+    //
+    // We don't know `conv_kernel_size - 1` from conv_history alone, but
+    // the fallback (= a conv_states slot view) carries it as fallback->ne[0].
+    // Caller must pass fallback non-null (it doubles as the shape hint
+    // and the no-op rollback target).
+    GGML_ASSERT(fallback != NULL);
+    GGML_ASSERT(fallback->type == GGML_TYPE_F32);
+
+    const int64_t conv_state_rows = fallback->ne[0];
+    const int64_t conv_channels   = fallback->ne[1];
+    const int64_t n_seqs          = fallback->ne[2];
+
+    GGML_ASSERT(conv_history->ne[0] >= conv_state_rows);
+    GGML_ASSERT(conv_history->ne[1] == conv_channels);
+    GGML_ASSERT(conv_history->ne[2] == n_seqs);
+
+    const int64_t ne[4] = { conv_state_rows, conv_channels, n_seqs, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne);
+
+    result->op     = GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT;
+    result->src[0] = conv_history;
+    result->src[1] = k_index;
+    result->src[2] = fallback;
 
     return result;
 }

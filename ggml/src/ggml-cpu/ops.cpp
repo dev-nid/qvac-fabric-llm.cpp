@@ -10661,6 +10661,59 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+// ggml_compute_forward_gated_delta_net_with_history (CUDA-only; CPU aborts)
+
+void ggml_compute_forward_gated_delta_net_with_history(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_UNUSED(params);
+    GGML_UNUSED(dst);
+    GGML_ABORT(
+        "GGML_OP_GATED_DELTA_NET_WITH_HISTORY is CUDA-only "
+        "(DFlash Phase 4 history kernel). The CPU backend does not implement "
+        "this op. Disable --dflash-gdn-history or run on a CUDA backend.");
+}
+
+// ggml_compute_forward_gated_delta_net_state_select (CUDA-only; CPU aborts)
+
+void ggml_compute_forward_gated_delta_net_state_select(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_UNUSED(params);
+    GGML_UNUSED(dst);
+    GGML_ABORT(
+        "GGML_OP_GATED_DELTA_NET_STATE_SELECT is CUDA-only "
+        "(DFlash Phase 4 fixup graph). The CPU backend does not implement "
+        "this op. Disable --dflash-gdn-history or run on a CUDA backend.");
+}
+
+// ggml_compute_forward_dflash_conv_state_history_select (CUDA-only)
+
+void ggml_compute_forward_dflash_conv_state_history_select(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_UNUSED(params);
+    GGML_UNUSED(dst);
+    GGML_ABORT(
+        "GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT is CUDA-only "
+        "(DFlash Phase 4 conv-state fixup). The CPU backend does not "
+        "implement this op. Disable --dflash-gdn-history or run on a "
+        "CUDA backend.");
+}
+
+// ggml_compute_forward_ssm_conv_tree (CUDA-only; CPU aborts)
+
+void ggml_compute_forward_ssm_conv_tree(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_UNUSED(params);
+    GGML_UNUSED(dst);
+    GGML_ABORT(
+        "GGML_OP_SSM_CONV_TREE is CUDA-only "
+        "(DFlash Phase 5 tree-mode conv kernel). The CPU backend does not "
+        "implement this op. Run on a CUDA backend or use chain mode.");
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

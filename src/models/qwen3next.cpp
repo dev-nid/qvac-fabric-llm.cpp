@@ -455,6 +455,49 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
+    // DFlash Phase 4 conv-state fixup (mirror of qwen35.cpp). Active
+    // only for chain-verify ubatches that fit the persistent buffer.
+    // Note: qwen3next is not currently a DFlash-target family (no
+    // public DFlash draft trained for it), but the plumbing is wired
+    // for symmetry; the path is dormant unless dflash_gdn_history is
+    // set AND the per-layer buffers are allocated for this arch.
+    const bool use_gdn_history_layer =
+        cparams.dflash_gdn_history &&
+        n_seq_tokens > 1 &&
+        dflash != nullptr &&
+        (int) dflash->conv_history.size() > il &&
+        dflash->conv_history[il] != nullptr &&
+        (int) dflash->gdn_history.size() > il &&
+        dflash->gdn_history[il] != nullptr &&
+        n_seq_tokens <= dflash->gdn_history_max_tokens &&
+        n_seqs       <= dflash->gdn_history_n_seqs_max;
+
+    const bool use_tree_mode_layer =
+        use_gdn_history_layer && (cparams.n_seq_max > 1);
+    ggml_tensor * parent_ids = nullptr;
+    if (use_tree_mode_layer) {
+        parent_ids = build_dflash_gdn_parent_ids_or_null(
+            n_seq_tokens, n_seqs);
+        GGML_ASSERT(parent_ids != nullptr);
+    }
+
+    if (use_gdn_history_layer) {
+        const int32_t k_index_count =
+            use_tree_mode_layer ? (int32_t) n_seqs : 1;
+        auto inp_k = std::make_unique<llm_graph_input_dflash_gdn_fixup>(
+            const_cast<llama_dflash *>(dflash), k_index_count);
+        inp_k->k_index = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, k_index_count);
+        ggml_set_input(inp_k->k_index);
+        cb(inp_k->k_index, "dflash_conv_fixup_k_index", il);
+        ggml_tensor * k_index = inp_k->k_index;
+        res->add_input(std::move(inp_k));
+
+        ggml_tensor * conv_states_fixed = ggml_dflash_conv_state_history_select(
+            ctx0, dflash->conv_history[il], k_index, conv_states);
+        cb(conv_states_fixed, "conv_states_fixed", il);
+        conv_states = conv_states_fixed;
+    }
+
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
@@ -475,11 +518,32 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    if (use_gdn_history_layer) {
+        ggml_tensor * conv_hist_dst_full = dflash->conv_history[il];
+        ggml_tensor * conv_hist_dst = ggml_view_3d(ctx0, conv_hist_dst_full,
+            conv_input->ne[0], conv_input->ne[1], conv_input->ne[2],
+            conv_hist_dst_full->nb[1], conv_hist_dst_full->nb[2], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_input, conv_hist_dst));
+    }
+
+    ggml_tensor * ssm_states_all_slot_view = ggml_view_2d(
+        ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+    ggml_tensor * selected_state = build_dflash_gdn_history_fixup_or_null(
+        il, ssm_states_all_slot_view, n_seqs);
+
+    ggml_tensor * state;
+    if (selected_state != nullptr) {
+        state = selected_state;
+    } else {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    }
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    ggml_tensor * conv_output_proper = use_tree_mode_layer
+        ? ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, parent_ids)
+        : ggml_ssm_conv     (ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
@@ -550,7 +614,15 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
+    auto attn_out = use_gdn_history_layer
+        ? (use_tree_mode_layer
+              ? build_delta_net_with_history_tree(q_conv, k_conv, v_conv,
+                                                  gate, beta, state,
+                                                  parent_ids, il)
+              : build_delta_net_with_history     (q_conv, k_conv, v_conv,
+                                                  gate, beta, state, il))
+        : build_delta_net                        (q_conv, k_conv, v_conv,
+                                                  gate, beta, state, il);
 
     ggml_tensor * output    = attn_out.first;
     ggml_tensor * new_state = attn_out.second;

@@ -2469,6 +2469,53 @@ bool llama_dflash_bind_target(struct llama_model * model_dft, const struct llama
     return true;
 }
 
+bool llama_dflash_bind_encoder(struct llama_model * model_tgt, const struct llama_model * model_dft) {
+    if (model_tgt == nullptr || model_dft == nullptr) {
+        return false;
+    }
+    if (model_dft->arch != LLM_ARCH_DFLASH) {
+        return false;
+    }
+    if (model_dft->dflash_fc == nullptr || model_dft->dflash_hidden_norm == nullptr) {
+        return false;
+    }
+
+    const int n_draft_layer = (int) model_dft->layers.size();
+    if (n_draft_layer == 0) {
+        return false;
+    }
+
+    // Copy non-owning pointers from draft → target. The encoder weights
+    // live in the draft model's loaded backend buffers. The target's
+    // graph (when cparams.dflash_inline_encoder is enabled) references
+    // them directly; ggml-backend dispatches the matmul on whatever
+    // backend the source buffer lives on. Same physical device assumed.
+    model_tgt->target_dflash_fc          = model_dft->dflash_fc;
+    model_tgt->target_dflash_hidden_norm = model_dft->dflash_hidden_norm;
+
+    model_tgt->target_dflash_wk.assign(n_draft_layer, nullptr);
+    model_tgt->target_dflash_wv.assign(n_draft_layer, nullptr);
+    model_tgt->target_dflash_attn_k_norm.assign(n_draft_layer, nullptr);
+    for (int il = 0; il < n_draft_layer; ++il) {
+        model_tgt->target_dflash_wk[il]          = model_dft->layers[il].wk;
+        model_tgt->target_dflash_wv[il]          = model_dft->layers[il].wv;
+        model_tgt->target_dflash_attn_k_norm[il] = model_dft->layers[il].attn_k_norm;
+        if (model_tgt->target_dflash_wk[il]          == nullptr ||
+            model_tgt->target_dflash_wv[il]          == nullptr ||
+            model_tgt->target_dflash_attn_k_norm[il] == nullptr) {
+            // partial bind is worse than no bind — clear and bail
+            model_tgt->target_dflash_fc          = nullptr;
+            model_tgt->target_dflash_hidden_norm = nullptr;
+            model_tgt->target_dflash_wk.clear();
+            model_tgt->target_dflash_wv.clear();
+            model_tgt->target_dflash_attn_k_norm.clear();
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool llama_model_has_encoder(const llama_model * model) {
     switch (model->arch) {
         case LLM_ARCH_T5:        return true;

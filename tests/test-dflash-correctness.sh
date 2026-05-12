@@ -357,11 +357,17 @@ for prompt in "${prompts[@]}"; do
             extra_args=$(spec_args_for_config "$config")
 
             # DFlash speculative via llama-speculative-simple --draft-type dflash.
+            # --dflash-no-chat-template keeps the prompt raw so the speculative
+            # output is directly comparable to the greedy reference above (which
+            # also feeds the raw prompt). Without this flag the spec binary
+            # auto-wraps the prompt with the target model's chat template,
+            # producing a chat-formatted continuation that won't match.
             # shellcheck disable=SC2086 # intentional word-split of $extra_args
             if ! "$llama_spec" \
                     -m  "$target_model" \
                     -md "$draft_model" \
                     --draft-type dflash \
+                    --dflash-no-chat-template \
                     $extra_args \
                     -p "$prompt" --n-predict "$n" --temp 0 --seed 0 \
                     -ngl 99 -ngld 99 -ub 1 \

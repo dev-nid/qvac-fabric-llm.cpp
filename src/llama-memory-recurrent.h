@@ -48,6 +48,25 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
+    // DFlash Phase 4 partial-tail removal. Same semantics as seq_rm,
+    // BUT on the tail cell that intersects [p0, p1) the cell.pos is
+    // rewound to p0 - 1 instead of returning false. The caller MUST
+    // overwrite the state buffer (s_l[il]) for that cell before the
+    // next decode reads it — otherwise the cell will hold stale state
+    // for the rewound position. The DFlash Phase 4 fixup graph
+    // (state_select + cpy into ssm_states_all slot) provides this
+    // guarantee.
+    //
+    // Falls back to the regular seq_rm for non-partial-tail ranges
+    // (p0 == 0 full clear, or range that doesn't include the tail).
+    //
+    // Returns false on invalid seq_id or unsupported negative-seq partial
+    // range (matches seq_rm's rejection rules).
+    bool seq_rm_partial_tail_state_managed_externally(
+            llama_seq_id seq_id,
+            llama_pos    p0,
+            llama_pos    p1);
+
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 

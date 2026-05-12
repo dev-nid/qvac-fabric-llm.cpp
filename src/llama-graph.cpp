@@ -348,6 +348,121 @@ void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_dflash_inline_encode::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (dflash == nullptr) return;
+    if (n_outputs <= 0) return;
+
+    // pos_new[i] = inline_pos_start + i (RoPE positions for K_new).
+    // pos_idx[i] = inline_write_offset + i (write slots in the side store).
+    // Both are 1D tensors sized n_outputs. We always write the full extent;
+    // ctx_filled is bumped by accepted_count (not n_outputs) by the
+    // speculative driver, so unaccepted suffix positions land in slots
+    // above ctx_filled and are overwritten by the next extend before the
+    // draft can read them.
+    if (pos_new && pos_new->buffer) {
+        std::vector<int32_t> buf((size_t) n_outputs);
+        for (int64_t i = 0; i < n_outputs; ++i) {
+            buf[(size_t) i] = (int32_t) (dflash->inline_pos_start + i);
+        }
+        ggml_backend_tensor_set(pos_new, buf.data(), 0,
+                                (size_t) n_outputs * sizeof(int32_t));
+    }
+    if (pos_idx && pos_idx->buffer) {
+        std::vector<int64_t> buf((size_t) n_outputs);
+        for (int64_t i = 0; i < n_outputs; ++i) {
+            buf[(size_t) i] = dflash->inline_write_offset + i;
+        }
+        ggml_backend_tensor_set(pos_idx, buf.data(), 0,
+                                (size_t) n_outputs * sizeof(int64_t));
+    }
+}
+
+void llm_graph_input_dflash_gdn_fixup::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (dflash == nullptr) return;
+    if (k_index == nullptr || k_index->buffer == nullptr) return;
+
+    if (k_index_count <= 1) {
+        // Chain-mode path (byte-exact with Phase 4): single scalar from
+        // the dflash struct. We still honour any per-seq vector by
+        // promoting its [0] element when the scalar is at its default
+        // -1 — the spec driver may set either depending on which
+        // surface it's using.
+        int32_t k_idx = dflash->gdn_history_k_index;
+        if (k_idx == -1 && !dflash->gdn_history_k_indices.empty()) {
+            k_idx = dflash->gdn_history_k_indices[0];
+        }
+        ggml_backend_tensor_set(k_index, &k_idx, 0, sizeof(int32_t));
+        return;
+    }
+
+    // Phase 5 tree-mode: per-seq k_index vector. The spec driver fills
+    // dflash->gdn_history_k_indices with n_seqs entries before each
+    // tree-verify decode. Pad with -1 for any tail entries the driver
+    // didn't populate so the state_select op falls back per-seq.
+    std::vector<int32_t> buf((size_t) k_index_count, -1);
+    const size_t n_copy = std::min<size_t>(
+        dflash->gdn_history_k_indices.size(),
+        (size_t) k_index_count);
+    for (size_t i = 0; i < n_copy; ++i) {
+        buf[i] = dflash->gdn_history_k_indices[i];
+    }
+    ggml_backend_tensor_set(k_index, buf.data(), 0,
+                            sizeof(int32_t) * (size_t) k_index_count);
+}
+
+void llm_graph_input_dflash_gdn_parent_ids::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (dflash == nullptr) return;
+    if (parent_ids == nullptr || parent_ids->buffer == nullptr) return;
+
+    const int64_t n_tokens = parent_ids->ne[0];
+    const int64_t n_seqs   = parent_ids->ne[1];
+    const int64_t n_elem   = n_tokens * n_seqs;
+    const size_t  n_byte   = (size_t) n_elem * sizeof(int32_t);
+
+    // Two host-source modes:
+    //
+    //  (a) Tree-verify decode: the spec driver populated
+    //      gdn_history_parent_ids with a write_parent_ids() snapshot
+    //      whose dims match this tensor. Copy verbatim.
+    //
+    //  (b) Chain compatibility decode: gdn_history_parent_ids is empty
+    //      (or sized for a different ubatch). Synthesise the chain
+    //      sequence [-1, 0, 1, ..., n_tokens-2] for each seq so the
+    //      _tree kernels reduce to chain-equivalent behaviour:
+    //        - GDN kernel: parent_t == t-1 → no inter reload, identical
+    //          to chain.
+    //        - SSM-conv-tree kernel: walking parent_ids backwards yields
+    //          ancestors [i, i-1, ..., i-K+1] → identical to chain
+    //          conv window.
+    //      This lets the spec driver issue chain-shaped llama_decode()s
+    //      between tree-verifies (e.g. for the accept-path redecode that
+    //      fills the unified KV cache at the canonical positions) WITHOUT
+    //      having to clear the graph-builder tree-mode trigger.
+    const auto & src = dflash->gdn_history_parent_ids;
+    const bool host_matches =
+        ((int64_t) src.size() == n_elem) &&
+        (dflash->gdn_history_parent_ids_n_tokens == (int32_t) n_tokens) &&
+        (dflash->gdn_history_parent_ids_n_seqs   == (int32_t) n_seqs);
+
+    if (host_matches) {
+        ggml_backend_tensor_set(parent_ids, src.data(), 0, n_byte);
+        return;
+    }
+
+    std::vector<int32_t> buf((size_t) n_elem);
+    for (int64_t s = 0; s < n_seqs; ++s) {
+        int32_t * row = buf.data() + s * n_tokens;
+        row[0] = -1;  // root of block: reload from curr_state
+        for (int64_t t = 1; t < n_tokens; ++t) {
+            row[t] = (int32_t) (t - 1);
+        }
+    }
+    ggml_backend_tensor_set(parent_ids, buf.data(), 0, n_byte);
+}
+
 void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -876,6 +991,7 @@ void llm_graph_result::reset() {
     t_dflash_topk        = nullptr;
     t_dflash_topk_argmax = nullptr;
     t_dflash_captures.clear();
+    t_dflash_captures_packed = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1982,6 +2098,211 @@ void llm_graph_context::build_dflash_capture(ggml_tensor * cur, int il) const {
     ggml_set_output(cap);
     ggml_build_forward_expand(gf, cap);
     res->t_dflash_captures.push_back(cap);
+
+    // Phase 1: once the last expected capture lands, build a packed view of
+    // shape [n_layers * n_embd_target, n_outputs] by concatenating all
+    // captures along dim 0. This matches the row-per-token, all-layers-
+    // side-by-side layout the encoder graph in dflash_extend() consumes, so
+    // the consumer no longer has to host-transpose. Order of concat is the
+    // model-loop layer order, i.e. capture_layer_ids ascending (matches the
+    // existing host transpose convention in llama-context.cpp::decode()).
+    if (res->t_dflash_captures.size() == dflash->capture_layer_ids.size()) {
+        ggml_tensor * packed = res->t_dflash_captures.front();
+        for (size_t i = 1; i < res->t_dflash_captures.size(); ++i) {
+            packed = ggml_concat(ctx0, packed, res->t_dflash_captures[i], /*dim=*/0);
+        }
+        ggml_set_name(packed, "dflash_captures_packed");
+        ggml_set_output(packed);
+        ggml_build_forward_expand(gf, packed);
+        res->t_dflash_captures_packed = packed;
+    }
+}
+
+ggml_tensor * llm_graph_context::build_dflash_gdn_history_fixup_or_null(
+        int           il,
+        ggml_tensor * ssm_states_all_slot_view,
+        int64_t       n_seqs) const {
+    if (!cparams.dflash_gdn_history) return nullptr;
+    if (dflash == nullptr) return nullptr;
+    if ((int) dflash->gdn_history.size() <= il) return nullptr;
+    if (dflash->gdn_history[il] == nullptr) return nullptr;
+    if (ssm_states_all_slot_view == nullptr) return nullptr;
+    // Buffer-capacity gate. graph_reserve probes the recurrent path
+    // with cparams.n_seq_max for the worst-case allocator pass; the
+    // gdn_history persistent buffer is sized only for the runtime
+    // single-seq DFS layout (n_seqs_max == 1 in tree mode). Bail when
+    // the probe exceeds that — the fallback build_rs path handles it.
+    if (n_seqs > dflash->gdn_history_n_seqs_max) return nullptr;
+
+    // Tree mode (Phase 5) sizes k_index to [n_seqs]; chain mode keeps
+    // the scalar [1] shape so Session 22's PTX stays byte-exact. The
+    // state_select op factory uses k_index->ne[0] to derive the per-seq
+    // path internally (Session 22 plumbed the k_index_count scalar onto
+    // the GATED_DELTA_NET_STATE_SELECT kernel).
+    const bool tree_mode = (cparams.n_seq_max > 1) && (n_seqs > 1);
+    const int32_t k_index_count = tree_mode ? (int32_t) n_seqs : 1;
+
+    auto inp = std::make_unique<llm_graph_input_dflash_gdn_fixup>(
+        const_cast<llama_dflash *>(dflash), k_index_count);
+    inp->k_index = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, k_index_count);
+    ggml_set_input(inp->k_index);
+    cb(inp->k_index, "dflash_gdn_fixup_k_index", il);
+
+    ggml_tensor * k_index = inp->k_index;
+    res->add_input(std::move(inp));
+
+    ggml_tensor * gdn_hist = dflash->gdn_history[il];
+
+    // state_select picks gdn_hist[..., k_index, :] (shape
+    // [S_v, S_v, H_v, n_seqs]) — or falls back to the slot view when
+    // any k_index entry is < 0. In chain mode (n_seqs == 1) the kernel
+    // is identical to Phase 4.
+    ggml_tensor * selected = ggml_gated_delta_net_state_select(
+        ctx0, gdn_hist, k_index, ssm_states_all_slot_view);
+    cb(selected, "dflash_gdn_fixup_selected", il);
+
+    return selected;
+}
+
+ggml_tensor * llm_graph_context::build_dflash_gdn_parent_ids_or_null(
+        int64_t n_tokens,
+        int64_t n_seqs) const {
+    // Tree mode trigger (mirrors the work-order condition for switching
+    // the qwen35-family GDN op to the _tree variants).
+    if (!cparams.dflash_gdn_history) return nullptr;
+    if (cparams.n_seq_max <= 1)      return nullptr;
+    if (dflash == nullptr)           return nullptr;
+    if (n_tokens <= 0 || n_seqs <= 0) return nullptr;
+    // graph_reserve probes with worst-case n_seqs but the persistent
+    // gdn_history is sized for single-seq DFS (n_seqs_max == 1). Bail
+    // and let the caller fall back to non-tree path on those probes.
+    if (n_seqs > dflash->gdn_history_n_seqs_max) return nullptr;
+
+    auto inp = std::make_unique<llm_graph_input_dflash_gdn_parent_ids>(
+        const_cast<llama_dflash *>(dflash));
+    inp->parent_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens, n_seqs);
+    ggml_set_input(inp->parent_ids);
+    cb(inp->parent_ids, "dflash_gdn_parent_ids", -1);
+
+    ggml_tensor * parent_ids = inp->parent_ids;
+    res->add_input(std::move(inp));
+
+    return parent_ids;
+}
+
+void llm_graph_context::build_dflash_inline_encoder(const llama_model & model,
+                                                    ggml_tensor *       packed_captures) const {
+    if (!cparams.dflash_inline_encoder) {
+        return;
+    }
+    if (packed_captures == nullptr) {
+        return;
+    }
+    // Need the encoder weights bound into the target model. Bail quietly
+    // when not bound — caller still has the legacy extend path available.
+    if (model.target_dflash_fc          == nullptr ||
+        model.target_dflash_hidden_norm == nullptr) {
+        return;
+    }
+    if (model.target_dflash_wk.empty() ||
+        model.target_dflash_wk.size() != model.target_dflash_wv.size() ||
+        model.target_dflash_wk.size() != model.target_dflash_attn_k_norm.size()) {
+        return;
+    }
+    // Need the side-store destinations bound from the draft.
+    if (dflash == nullptr) {
+        return;
+    }
+    if (dflash->inline_dst_K.empty() ||
+        dflash->inline_dst_K.size() != dflash->inline_dst_V.size()) {
+        return;
+    }
+    const int n_dft_layer = (int) model.target_dflash_wk.size();
+    if ((int) dflash->inline_dst_K.size() != n_dft_layer) {
+        return;
+    }
+
+    const int64_t n_new = (int64_t) n_outputs;
+    if (n_new <= 0) {
+        return;
+    }
+
+    // Per-decode position / write-slot inputs. n_outputs is fixed at graph
+    // build time and matches the row count of packed_captures.
+    auto inp = std::make_unique<llm_graph_input_dflash_inline_encode>(
+        const_cast<llama_dflash *>(dflash), n_new);
+
+    inp->pos_new = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_new);
+    ggml_set_input(inp->pos_new);
+    cb(inp->pos_new, "dflash_inline_enc_pos_new", -1);
+
+    inp->pos_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_new);
+    ggml_set_input(inp->pos_idx);
+    cb(inp->pos_idx, "dflash_inline_enc_pos_idx", -1);
+
+    ggml_tensor * pos_new = inp->pos_new;
+    ggml_tensor * pos_idx = inp->pos_idx;
+
+    // ---------- shared projection: h_proj = hidden_norm(fc(packed)) ----------
+    // F32 prec is required: dflash_fc has F16 weights and packed_captures
+    // values can exceed the F16 matmul accumulator's range (~6.5e4). See
+    // Session 12 root-cause / fix.
+    ggml_tensor * h_fc = build_lora_mm(model.target_dflash_fc, packed_captures);
+    ggml_mul_mat_set_prec(h_fc, GGML_PREC_F32);
+    cb(h_fc, "dflash_inline_enc_h_fc", -1);
+    ggml_tensor * h_proj = build_norm(h_fc, model.target_dflash_hidden_norm,
+                                      nullptr, LLM_NORM_RMS, -1);
+    cb(h_proj, "dflash_inline_enc_h_proj", -1);
+
+    // Per-head dims and RoPE params: use TARGET's hparams. Correct only when
+    // target and draft share them (Qwen3 family). Phase 3B will add an
+    // explicit-sizing path for Qwen3.5 etc.
+    const int64_t n_embd_head_use = n_embd_head_v;
+    const int64_t n_head_kv_use   = n_head_kv;
+    GGML_ASSERT(n_embd_head_use * n_head_kv_use ==
+                model.target_dflash_wk[0]->ne[1] &&
+                "inline encoder: target's per-head dims don't match draft "
+                "wk shape; this model pair needs explicit sizing cparams");
+
+    for (int il = 0; il < n_dft_layer; ++il) {
+        // K_new = wk · h_proj  → [n_embd_head, n_head_kv, n_new]
+        ggml_tensor * K_new = build_lora_mm(model.target_dflash_wk[il], h_proj);
+        K_new = ggml_reshape_3d(ctx0, K_new, n_embd_head_use, n_head_kv_use, n_new);
+        K_new = build_norm(K_new, model.target_dflash_attn_k_norm[il],
+                           nullptr, LLM_NORM_RMS, il);
+        K_new = ggml_rope_ext(
+                ctx0, K_new, pos_new, nullptr,
+                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(K_new, "dflash_inline_enc_K_new", il);
+
+        // V_new = wv · h_proj  (no norm, no RoPE)
+        ggml_tensor * V_new = build_lora_mm(model.target_dflash_wv[il], h_proj);
+        V_new = ggml_reshape_3d(ctx0, V_new, n_embd_head_use, n_head_kv_use, n_new);
+        cb(V_new, "dflash_inline_enc_V_new", il);
+
+        ggml_tensor * dst_K = dflash->inline_dst_K[il];
+        ggml_tensor * dst_V = dflash->inline_dst_V[il];
+        GGML_ASSERT(dst_K != nullptr && dst_V != nullptr);
+        GGML_ASSERT(dst_K->ne[0] == n_embd_head_use * n_head_kv_use);
+        GGML_ASSERT(dst_V->ne[0] == n_embd_head_use * n_head_kv_use);
+
+        // Flatten K_new / V_new to 2D [n_embd_head*n_head_kv, n_new] for set_rows.
+        GGML_ASSERT(ggml_row_size(K_new->type, n_embd_head_use) == K_new->nb[1]);
+        GGML_ASSERT(ggml_row_size(V_new->type, n_embd_head_use) == V_new->nb[1]);
+        ggml_tensor * K_new_2d = ggml_view_2d(
+            ctx0, K_new, n_embd_head_use * n_head_kv_use, n_new, K_new->nb[2], 0);
+        ggml_tensor * V_new_2d = ggml_view_2d(
+            ctx0, V_new, n_embd_head_use * n_head_kv_use, n_new, V_new->nb[2], 0);
+
+        ggml_tensor * scatter_K = ggml_set_rows(ctx0, dst_K, K_new_2d, pos_idx);
+        ggml_tensor * scatter_V = ggml_set_rows(ctx0, dst_V, V_new_2d, pos_idx);
+
+        ggml_build_forward_expand(gf, scatter_K);
+        ggml_build_forward_expand(gf, scatter_V);
+    }
+
+    res->add_input(std::move(inp));
 }
 
 llm_graph_input_dflash * llm_graph_context::build_inp_dflash() const {

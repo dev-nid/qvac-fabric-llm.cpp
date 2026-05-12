@@ -57,6 +57,66 @@ struct llama_cparams {
     // See llama_context_params::dflash_topk for full semantics.
     uint32_t dflash_topk;
 
+    // When true, the DFlash draft graph emits full-vocab logits so the host
+    // can compute per-position softmax / log-probs for best-first DDTree
+    // expansion. Default false (keeps the bs * n_vocab * 4 byte readback
+    // optimisation that ships with chain-mode and uniform-expansion tree
+    // mode). Only consulted on LLM_ARCH_DFLASH drafts. Enabled automatically
+    // when --dflash-tree-best-first is passed.
+    bool dflash_emit_logits;
+
+    // ------------------------------------------------------------------
+    // Inline DFlash encoder (phase 1 plumbing; not yet wired into any
+    // graph). When true on the TARGET context, the target's graph
+    // builder runs the encoder K/V projection inline after the final
+    // captured layer using non-owning pointers populated by
+    // llama_dflash_bind_encoder(). The companion sizing fields below
+    // are needed at graph_reserve time before the draft model has been
+    // bound (graph build uses them to size the inline ops without
+    // dereferencing the draft model). All four sizing fields must be
+    // > 0 if dflash_inline_encoder is true, or initialisation fails.
+    //
+    //   n_embd_dft         : draft embedding dim
+    //   n_head_kv_dft      : draft n_head_kv (K/V heads count)
+    //   n_embd_head_dft    : draft n_embd_head_v == n_embd_head_k
+    //   n_target_layers    : len(draft target_layer_ids) — # of K/V
+    //                        side-store layers (one per draft layer)
+    //
+    // Default: all zero, dflash_inline_encoder = false (legacy path).
+    // ------------------------------------------------------------------
+    bool     dflash_inline_encoder;
+    uint32_t dflash_inline_n_embd_dft;
+    uint32_t dflash_inline_n_head_kv_dft;
+    uint32_t dflash_inline_n_embd_head_dft;
+    uint32_t dflash_inline_n_target_layers;
+
+    // ------------------------------------------------------------------
+    // GatedDeltaNet history kernel (Phase 4). When true on a TARGET
+    // context with GDN layers (Qwen3.5 family), the GDN op uses the
+    // GGML_OP_GATED_DELTA_NET_WITH_HISTORY variant which writes
+    // per-token recurrent state to a persistent per-layer buffer. The
+    // speculative driver picks state[K-1] post-sampler to roll back the
+    // recurrent state on partial acceptance, replacing the FULL-seq_rm
+    // checkpoint+re-verify path. Throws at init on LLM_ARCH_DFLASH
+    // contexts (target-only). CUDA-only at runtime.
+    // Default: false.
+    // ------------------------------------------------------------------
+    bool dflash_gdn_history;
+
+    // ------------------------------------------------------------------
+    // Phase 5: GDN history persistent buffer dtype. When true, the
+    // per-layer dflash.gdn_history[il] tensor is allocated as
+    // GGML_TYPE_F16 instead of GGML_TYPE_F32. This halves the per-layer
+    // footprint and is what makes DDTree-22 fit alongside Qwen3.5-27B
+    // weights + KV cache on a 32 GiB device.
+    //
+    // Picked up at runtime by the GDN op kernel — the InterT template
+    // parameter is selected from src_persist_inter->type (Session 22).
+    // Ignored when dflash_gdn_history is false. Default false (matches
+    // Phase 4 chain-mode behaviour byte-exact).
+    // ------------------------------------------------------------------
+    bool dflash_gdn_history_f16;
+
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 };

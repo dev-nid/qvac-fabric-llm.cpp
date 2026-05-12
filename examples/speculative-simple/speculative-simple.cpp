@@ -1,4 +1,5 @@
 #include "arg.h"
+#include "chat.h"
 #include "common.h"
 #include "dflash-gpu-log.h"
 #include "dflash-profile.h"
@@ -9,6 +10,7 @@
 
 #include <clocale>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cinttypes>
 #include <string>
@@ -117,7 +119,43 @@ int main(int argc, char ** argv) {
 
     // check if the context supports partial sequence removal
     const auto ctx_seq_rm = common_context_can_seq_rm(ctx_tgt);
-    const bool use_ckpt = (ctx_seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+    bool use_ckpt = (ctx_seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+
+    // Experimental: disable the checkpoint+re-verify path on partial acceptance
+    // even for FULL-only seq_rm contexts (e.g. Qwen3.5 GatedDeltaNet). The
+    // verify decode advanced the SSM state through all draft positions, and
+    // skipping the re-decode leaves the SSM state polluted by rejected
+    // tokens; downstream quality may drift. Enabled by DFLASH_SKIP_CKPT=1
+    // for back-to-back comparison against the default behaviour.
+    if (use_ckpt) {
+        const char * e = std::getenv("DFLASH_SKIP_CKPT");
+        if (e && e[0] != '\0' && std::strcmp(e, "0") != 0) {
+            use_ckpt = false;
+            LOG_INF("DFLASH_SKIP_CKPT=1: bypassing checkpoint+re-verify on partial acceptance "
+                    "(SSM state may drift)\n");
+        }
+    }
+
+    // Phase 4 GDN history kernel (Session 19 — partial-tail seq_rm path).
+    //
+    // When set: target's GDN op writes per-token recurrent state to a
+    // persistent buffer; qwen35.cpp emits an in-graph state_select fixup
+    // before each GDN layer's state read; on partial acceptance, the
+    // spec driver drives k_index = K - 1 to roll the GDN state back to
+    // the last accepted token in the chain. The recurrent-cache metadata
+    // is rewound via llama_dflash_memory_seq_rm_partial_tail_state_managed_externally.
+    // Together this replaces the FULL-seq_rm checkpoint + re-verify
+    // round-trip — eliminating ~20 % of decode wall on Qwen3.5-27B
+    // chain mode (Session 17 estimate).
+    const bool use_gdn_history = params.speculative.dflash_gdn_history;
+    if (use_gdn_history) {
+        if (use_ckpt) {
+            LOG_INF("--dflash-gdn-history: replacing checkpoint+re-verify path "
+                    "with in-graph GDN-state fixup + partial-tail seq_rm on "
+                    "partial acceptance\n");
+        }
+        use_ckpt = false;
+    }
 
     if (use_ckpt) {
         LOG_INF("speculative decoding will use checkpoints (context does not support partial sequence removal)\n");
@@ -160,8 +198,58 @@ int main(int argc, char ** argv) {
         params.speculative.draft.cparams = common_context_params_to_llama(params_dft);
 
         // Forward DFlash-specific cparams to the draft context.
-        params.speculative.draft.cparams.dflash_max_ctx = params.speculative.dflash_max_ctx;
-        params.speculative.draft.cparams.dflash_topk    = params.speculative.dflash_topk;
+        params.speculative.draft.cparams.dflash_max_ctx     = params.speculative.dflash_max_ctx;
+        params.speculative.draft.cparams.dflash_topk        = params.speculative.dflash_topk;
+        // dflash_inline_encoder is target-only; explicitly clear it on the
+        // draft's cparams so the draft context construction doesn't reject
+        // it via the target-only validation.
+        params.speculative.draft.cparams.dflash_inline_encoder = false;
+        // dflash_gdn_history is target-only too (the draft has no GDN layers,
+        // and the target-only validation would reject it anyway).
+        params.speculative.draft.cparams.dflash_gdn_history    = false;
+        // Best-first DDTree needs full-vocab logits so the host can compute
+        // per-position log-probs for the heap-based tree builder. Default
+        // mode (round-robin uniform expansion) keeps the bs * n_vocab * 4 byte
+        // PCIe optimisation.
+        params.speculative.draft.cparams.dflash_emit_logits = params.speculative.dflash_tree_best_first;
+    }
+
+    // DFlash: auto-wrap raw prompt with the target model's chat template.
+    // Qwen3 / Qwen3.5 drafters are instruct-trained; feeding raw text runs
+    // slightly OOD which lowers acceptance length. Gated on (1) DFlash being
+    // active and (2) chat templating not explicitly disabled via
+    // --no-chat-template, so non-DFlash callers and raw-completion users are
+    // unaffected. Falls through to the original raw-prompt path if the model
+    // has no template or templating fails.
+    const bool dflash_active_for_prompt = llama_model_dflash_block_size(model_dft.get()) > 0;
+    if (dflash_active_for_prompt && params.enable_chat_template && !params.prompt.empty()) {
+        try {
+            auto tmpls = common_chat_templates_init(model_tgt, params.chat_template);
+            common_chat_msg msg;
+            msg.role    = "user";
+            msg.content = params.prompt;
+
+            common_chat_templates_inputs inputs;
+            inputs.messages              = { msg };
+            inputs.add_generation_prompt = true;
+            inputs.use_jinja             = params.use_jinja;
+            // Disable thinking mode (Qwen3 / Qwen3.5): chain-of-thought adds
+            // exploratory text that drops draft acceptance rate. z-lab's
+            // benchmark convention matches direct-answer mode.
+            inputs.enable_thinking       = false;
+
+            const std::string wrapped = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+            if (!wrapped.empty()) {
+                LOG_INF("%s: DFlash: chat-templated prompt (raw=%zu -> wrapped=%zu chars). "
+                        "Disable with --no-chat-template.\n",
+                        __func__, params.prompt.size(), wrapped.size());
+                params.prompt = wrapped;
+            } else {
+                LOG_INF("%s: DFlash: chat template returned empty result, using raw prompt\n", __func__);
+            }
+        } catch (const std::exception & e) {
+            LOG_INF("%s: DFlash: chat template not applied (%s), using raw prompt\n", __func__, e.what());
+        }
     }
 
     // Tokenize the prompt
@@ -246,6 +334,14 @@ int main(int argc, char ** argv) {
             for (int32_t i = 0; i < n_prefill; ++i) {
                 common_batch_add(prefill_batch, inp[i], (llama_pos) i, { 0 }, /*logits=*/true);
             }
+            // Phase 3 inline encoder: the prefill captures every prompt
+            // position. Write them into the draft's side store starting at
+            // slot 0, with RoPE positions also starting at 0.
+            if (params.speculative.dflash_inline_encoder) {
+                llama_dflash_set_inline_encode_state(ctx_tgt,
+                    /*write_offset=*/ 0,
+                    /*pos_start=*/    0);
+            }
             if (llama_decode(ctx_tgt, prefill_batch) != 0) {
                 LOG_ERR("%s: target prompt prefill (with capture) failed\n", __func__);
                 llama_batch_free(prefill_batch);
@@ -297,9 +393,289 @@ int main(int argc, char ** argv) {
     const auto t_dec_start = ggml_time_us();
 
     const bool use_tree = params.speculative.dflash_tree;
+    // Single-seq DFS tree-with-GDN-history is OPT-IN via
+    // DFLASH_TREE_GDN_SINGLE_SEQ=1 — the path lands the Phase 5
+    // infrastructure end-to-end but hits llama.cpp's KV cache
+    // monotonic-position constraint: tree-mode wants positions =
+    // tree depth (so same-depth siblings share a position and ROPE
+    // rotation), but the unified cache rejects non-consecutive seq
+    // positions; the DFS-index workaround perturbs ROPE so much that
+    // acceptance collapses on non-trivial trees (HE[0]: ~3 % accept
+    // rate at DDTree-22). Default off until either a multi-seq
+    // packing strategy that engages the WITH_HISTORY kernel without
+    // ubatch fragmentation, or a KV-cache helper that accepts
+    // tree-depth positions, lands. See Session 23 log.
+    bool use_tree_with_gdn_history = false;
+    if (use_tree && use_gdn_history) {
+        const char * e = std::getenv("DFLASH_TREE_GDN_SINGLE_SEQ");
+        use_tree_with_gdn_history =
+            (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
+        if (use_tree_with_gdn_history) {
+            LOG_INF("DFLASH_TREE_GDN_SINGLE_SEQ=1: experimental "
+                    "single-seq DFS tree-with-GDN-history path "
+                    "(accept rate currently degraded by ROPE "
+                    "position perturbation; see logs/core_architecture"
+                    "/12_vulkan_opt_log.md Session 23)\n");
+        }
+    }
 
     while (true) {
         if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("draft");
+
+        // ============================================================
+        // DDTree Phase 5: single-seq DFS-flattened tree-verify with
+        // GDN history. Engaged when both --dflash-tree and
+        // --dflash-gdn-history are set. Replaces the multi-seq Stage-C
+        // tree path below with:
+        //   1. Single-seq batch (all tree tokens in seq 0, in DFS
+        //      order, positions = n_past_before + tree.depths[i]).
+        //   2. tree_mask (visibility matrix) for attention isolation.
+        //   3. parent_ids buffer for the GDN + conv tree kernels.
+        //   4. Accept walk (unchanged).
+        //   5. seq_rm(0, n_past_before + 1, -1) — keep the root's
+        //      KV cache slot, drop the rest.
+        //   6. Redecode the accepted draft tokens as a chain so the
+        //      unified KV cache picks up canonical positions
+        //      [n_past_before + 1 .. n_past_before + L]. GDN starts
+        //      from gdn_history[..., t=0, s=0] = state-after-root via
+        //      the per-seq fixup with k_indices = {0}.
+        //
+        // Reference: lucebox's single-seq tree-verify pattern — see
+        // lucebox/lucebox-hub/dflash/src/qwen35_target_graph.cpp lines
+        // 820-1040 for the graph side, and the equivalent KV-cache
+        // surgery their drafter applies after accept (MIT-licensed,
+        // Copyright 2026 Lucebox). We diverge on the KV-cache side
+        // because llama.cpp's unified cache doesn't support
+        // selective slot-keep — hence the redecode-the-accept-path
+        // step rather than lucebox's direct slot-rewire.
+        if (use_tree_with_gdn_history) {
+            common_speculative_tree tree =
+                common_speculative_draft_tree(spec, params_spec, prompt_tgt, id_last);
+
+            const int n_past_before = n_past;
+            auto * mem = llama_get_memory(ctx_tgt);
+
+            common_batch_clear(batch_tgt);
+            llama_tokens ids;
+
+            if (tree.n_nodes == 0) {
+                // Drafter returned no tree. Fall back to a single-
+                // token decode + bonus, same as the legacy tree path.
+                // Clear the parent_ids buffer so any prior
+                // tree-shaped value doesn't leak into the chain
+                // fallback graph's set_input.
+                llama_dflash_set_gdn_history_parent_ids(
+                    ctx_tgt, nullptr, 0, 0);
+                llama_dflash_set_gdn_history_k_index(ctx_tgt, -1);
+                common_batch_add(batch_tgt, id_last, n_past_before, { 0 }, /*logits=*/true);
+                {
+                    DFLASH_GPU_TIMER("target tree-empty fallback decode", ctx_tgt);
+                    llama_decode(ctx_tgt, batch_tgt);
+                }
+                const llama_token bonus =
+                    common_sampler_sample(smpl.get(), ctx_tgt, 0);
+                common_sampler_accept(smpl.get(), bonus, true);
+                ids.push_back(bonus);
+                n_past = n_past_before + 1;
+            } else {
+                const int n_tree_tokens = 1 + tree.n_nodes;
+
+                // (1) Single-seq DFS-flattened verify batch. All tokens
+                // belong to seq 0; attention separation comes from the
+                // tree_mask we install below.
+                //
+                // Positions are assigned by DFS index (n_past_before + i)
+                // rather than tree depth so the seq's position list stays
+                // strictly monotonic — llama.cpp's KV cache requires this
+                // (find_slot rejects non-consecutive seq positions).
+                // ROPE rotation is therefore slightly perturbed from the
+                // semantically-ideal tree-depth scheme, but with budget
+                // ≤22 and same-depth siblings landing one slot apart, the
+                // perturbation is small in practice and doesn't hurt
+                // acceptance (lucebox's spec driver makes the same
+                // trade-off — see test_dflash.cpp::p = committed + i).
+                common_batch_add(batch_tgt, id_last, n_past_before, { 0 }, /*logits=*/true);
+                for (int i = 0; i < tree.n_nodes; ++i) {
+                    common_batch_add(batch_tgt, tree.tokens[i],
+                                     n_past_before + 1 + i,
+                                     { 0 }, /*logits=*/true);
+                }
+
+                // (2) Tree mask. The visibility matrix is exactly the
+                // (n_tree_tokens × n_tree_tokens) byte matrix already
+                // built by common_speculative_draft_tree.
+                llama_set_tree_mask(ctx_tgt, tree.visibility.data(),
+                                    n_tree_tokens);
+
+                // (3) parent_ids for GDN + conv tree kernels.
+                // gdn_history_n_seqs_max sets the persistent buffer's
+                // last dim; we always emit a [n_tree_tokens, 1]
+                // parent_ids since the verify batch is single-seq, and
+                // unused seq slabs (s > 0) in the kernel are dormant.
+                std::vector<int32_t> parent_ids(
+                    (size_t) n_tree_tokens * 1, -1);
+                const bool ok = tree.write_parent_ids(
+                    parent_ids.data(), n_tree_tokens, 1);
+                GGML_ASSERT(ok && "write_parent_ids: tree shape mismatch");
+                llama_dflash_set_gdn_history_parent_ids(
+                    ctx_tgt, parent_ids.data(), n_tree_tokens, 1);
+
+                // No GDN-state fixup on entry: the recurrent slot
+                // already holds the right pre-block state from the
+                // previous iteration (post-redecode-of-accept-path or
+                // post-prefill). Clear any stale value.
+                llama_dflash_set_gdn_history_k_index(ctx_tgt, -1);
+
+                if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("verify");
+                {
+                    DFLASH_GPU_TIMER("target tree-verify decode (single-seq DFS)", ctx_tgt);
+                    llama_decode(ctx_tgt, batch_tgt);
+                }
+
+                // (4) Tree-walk accept: root → ... → commit_n.
+                int current  = 0;
+                int commit_n = 0;
+                while (true) {
+                    const llama_token target_token =
+                        common_sampler_sample(smpl.get(), ctx_tgt, current);
+                    common_sampler_accept(smpl.get(), target_token, true);
+                    ids.push_back(target_token);
+
+                    auto it = tree.child_maps[current].find(target_token);
+                    if (it == tree.child_maps[current].end()) {
+                        break; // bonus token (off-tree)
+                    }
+                    current  = it->second;
+                    commit_n = current;
+                }
+
+                // Always done with the tree from here on — clear the
+                // tree mask and parent_ids so the redecode chain runs
+                // through the (graph-builder-level) tree-mode path but
+                // with the chain fallback parent_ids pattern.
+                llama_clear_tree_mask(ctx_tgt);
+                llama_dflash_set_gdn_history_parent_ids(
+                    ctx_tgt, nullptr, 0, 0);
+
+                // L = depth of deepest accepted leaf in the tree. For
+                // commit_n == 0 (only the bonus sampled, no draft
+                // accepted) L = 0. For commit_n in main-path range L
+                // matches the chain accept count; for alt-accept it
+                // matches the alt's tree depth too.
+                const int L = (commit_n > 0) ? tree.depths[commit_n - 1] : 0;
+                const bool alt_accepted = (commit_n > tree.main_path_len);
+
+                if (alt_accepted) {
+                    n_tree_alt_taken++;
+                    // Hint the spec state to remap captures on next
+                    // extend, same as the legacy alt-accept path. The
+                    // alt_capture_idx here is the DFS batch slot of
+                    // the accepted leaf (which is what the draft uses
+                    // to slice its target-feat captures).
+                    common_speculative_record_alt_accept(spec,
+                        /*alt_capture_idx=*/commit_n,
+                        /*alt_depth=*/L);
+                }
+
+                // (5) KV-cache surgery: keep only the root's slot at
+                // n_past_before, drop everything past. The recurrent
+                // half's seq_pos rewinds — DFlash partial-tail variant
+                // because the recurrent state is about to be
+                // overwritten by the redecode's state_select fixup.
+                {
+                    const bool ok = llama_dflash_memory_seq_rm_partial_tail_state_managed_externally(
+                        mem, 0, n_past_before + 1, -1);
+                    GGML_ASSERT(ok);
+                }
+
+                if (L > 0) {
+                    // (6) Redecode the accepted path. ids[0..L-1] are
+                    // the target-sampled (and tree-matched) draft
+                    // tokens; ids[L] is the bonus that goes into the
+                    // next iter's id_last. We only redecode the L
+                    // accepted tokens — the bonus is anchored on the
+                    // next loop.
+                    //
+                    // GDN starts from gdn_history[..., t=0, s=0] =
+                    // state-after-root via the per-seq fixup; that's
+                    // what was just captured by the tree-verify's
+                    // single-seq DFS pass at DFS slot 0.
+                    int32_t k_root = 0;
+                    llama_dflash_set_gdn_history_k_index_per_seq(
+                        ctx_tgt, &k_root, 1);
+
+                    common_batch_clear(batch_tgt);
+                    for (int i = 0; i < L; ++i) {
+                        // logits=true so the DFlash target-feature
+                        // capture runs on the redecode positions. The
+                        // draft's extend_side_store on the next
+                        // iter consumes captures via
+                        // llama_dflash_force_host_readback; if these
+                        // tokens aren't output positions the readback
+                        // size doesn't match the packed tensor.
+                        common_batch_add(batch_tgt, ids[i],
+                                         n_past_before + 1 + i,
+                                         { 0 }, /*logits=*/true);
+                    }
+                    {
+                        DFLASH_GPU_TIMER("tree accept-path redecode", ctx_tgt);
+                        llama_decode(ctx_tgt, batch_tgt);
+                    }
+
+                    // Post-redecode the recurrent slot holds the right
+                    // state-after-accept-leaf; next iter doesn't need
+                    // a fixup.
+                    llama_dflash_set_gdn_history_k_index(ctx_tgt, -1);
+                    n_past = n_past_before + 1 + L;
+                } else {
+                    // L == 0: only the bonus token was sampled; KV
+                    // beyond the root is gone. Next iter's chain
+                    // decode will load state-after-root via the fixup
+                    // (k_index = 0 picks gdn_history[..., t=0, s=0]).
+                    int32_t k_root = 0;
+                    llama_dflash_set_gdn_history_k_index_per_seq(
+                        ctx_tgt, &k_root, 1);
+                    n_past = n_past_before + 1;
+                }
+            }
+
+            n_tree_iters++;
+            common_speculative_accept(spec,
+                ids.empty() ? 0 : (uint16_t)(ids.size() - 1));
+
+            n_drafted += tree.n_nodes;
+            n_accept  += ids.empty() ? 0 : (int) ids.size() - 1;
+
+            // Commit accepted tokens + bonus to id_last, capped at
+            // params.n_predict. Same shape as the legacy tree branch
+            // below so byte-exact match against greedy is preserved.
+            const int n_predict_pre_loop = n_predict;
+            for (size_t i = 0; i < ids.size(); ++i) {
+                if (params.n_predict >= 0 && (n_predict_pre_loop + (int) i) >= params.n_predict) {
+                    has_eos = true;
+                    break;
+                }
+                prompt_tgt.push_back(id_last);
+                id_last = ids[i];
+                ++n_predict;
+                if (llama_vocab_is_eog(vocab, id_last)) {
+                    has_eos = true;
+                    break;
+                }
+                const std::string token_str = common_token_to_piece(ctx_tgt, id_last);
+                if (params.use_color && i + 1 < ids.size()) {
+                    LOG("\u001b[%dm%s\u001b[37m", (36 - 0 % 6), token_str.c_str());
+                } else {
+                    LOG("%s", token_str.c_str());
+                }
+            }
+
+            if ((params.n_predict >= 0 && n_predict >= params.n_predict) || has_eos) {
+                break;
+            }
+            continue;
+        }
+
         // ============================================================
         // DDTree Phase 2: multi-seq tree-shaped verify branch
         // ============================================================
@@ -507,6 +883,16 @@ int main(int argc, char ** argv) {
 
         // always have a token to evaluate from before - id_last
         common_batch_clear(batch_tgt);
+        // Phase 3 inline encoder: this iteration's captured rows land in
+        // the side store starting at slot prompt_tgt.size() (= n_committed_total),
+        // with RoPE positions starting at the current n_past (the slot
+        // id_last lands in inside the target's batch). Must be set BEFORE
+        // n_past++ below.
+        if (params.speculative.dflash_inline_encoder) {
+            llama_dflash_set_inline_encode_state(ctx_tgt,
+                /*write_offset=*/ (int64_t) prompt_tgt.size(),
+                /*pos_start=*/    (int64_t) n_past);
+        }
         common_batch_add  (batch_tgt, id_last, n_past++, { 0 }, true);
 
         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
@@ -564,6 +950,33 @@ int main(int argc, char ** argv) {
             continue;
         }
 
+        // Phase 4 GDN history fixup: between target decodes, set the
+        // host k_index so the next verify graph's state_select op
+        // restores the GDN recurrent state to "right after the last
+        // accepted token" instead of "after the entire draft".
+        //
+        // Verify batch was [id_last, draft[0], ..., draft[N-1]] at
+        // positions [P, P+1, ..., P+N]. state_history slot t holds the
+        // GDN state right after position P+t. The sampler accepts
+        // `accepted_count = ids.size() - 1` draft tokens (id_last is
+        // never counted as a draft accept). Last accepted token sits
+        // at position P + accepted_count → k_index = accepted_count.
+        //
+        //   Partial: accepted_count < draft.size() →
+        //     k_index = accepted_count (rolls state back, fixup runs).
+        //   Full:    accepted_count == draft.size() →
+        //     k_index = -1 (no-op; current slot already holds the
+        //     correct final state).
+        if (use_gdn_history) {
+            const int accepted_count = (int) ids.size() - 1;
+            if (accepted_count < (int) draft.size()) {
+                llama_dflash_set_gdn_history_k_index(ctx_tgt,
+                    (int32_t) accepted_count);
+            } else {
+                llama_dflash_set_gdn_history_k_index(ctx_tgt, -1);
+            }
+        }
+
         common_speculative_accept(spec, ids.size() - 1);
 
         // full acceptance: consume the draft and commit accepted tokens
@@ -609,7 +1022,18 @@ int main(int argc, char ** argv) {
         {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
 
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
+            if (use_gdn_history) {
+                // The GDN state for positions [n_past, end-of-batch) is
+                // about to be rolled back by the next decode's
+                // state_select fixup, so allow the recurrent half to
+                // rewind its tail-cell pos rather than rejecting the
+                // partial-tail removal.
+                const bool ok = llama_dflash_memory_seq_rm_partial_tail_state_managed_externally(
+                    llama_get_memory(ctx_tgt), 0, n_past, -1);
+                GGML_ASSERT(ok);
+            } else {
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
+            }
         }
 
         if ((params.n_predict >= 0 && n_predict >= params.n_predict) || has_eos) {

@@ -1,0 +1,73 @@
+#version 450
+
+// DFlash Phase 4 state-history fixup. Picks state_history[..., k_index, :]
+// into a [S_v, S_v, H_v, n_seqs] result tensor. CUDA reference:
+// ggml-cuda/gated_delta_net.cu gated_delta_net_state_select_cuda<float>.
+//
+// Chain-mode scope only: state_history is F32, k_index is a single I32 scalar,
+// fallback is contiguous F32 with the same nelements as dst. F16 InterT and
+// per-seq k_index_count are Phase 5 (tree mode) territory and intentionally
+// not implemented here.
+//
+//   k_index >= 0: dst[s, h, col, r] = state_history[s, k_index, h, col, r]
+//   k_index <  0: dst[s, h, col, r] = fallback[s, h, col, r]
+//
+// state_history layout (contiguous floats):
+//   [S_v, S_v, H_v, n_tokens * n_seqs] - viewed by ggml as 4-D, the kernel
+//   indexes it as a 5-D [S_v, S_v, H_v, n_tokens, n_seqs].
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+
+layout(push_constant) uniform PushConstants {
+    uint S_v;
+    uint H_v;
+    uint n_tokens;
+    uint n_seqs;
+};
+
+layout(binding = 0) readonly buffer StateHistory { float state_history[]; };
+layout(binding = 1) readonly buffer KIndex       { int   k_index[];       };
+layout(binding = 2) readonly buffer Fallback     { float fallback[];      };
+layout(binding = 3)          buffer Dst          { float dst[];           };
+
+void main() {
+    const uint seq = gl_WorkGroupID.z;
+    const uint h   = gl_WorkGroupID.y;
+    const uint col = gl_WorkGroupID.x;
+
+    if (col >= S_v || h >= H_v || seq >= n_seqs) {
+        return;
+    }
+
+    const uint slab_elems = S_v * S_v;
+    const uint dst_base   = ((seq * H_v) + h) * slab_elems + col * S_v;
+
+    const int  k_idx = k_index[0];
+
+    if (k_idx < 0) {
+        // No-fixup path: copy fallback -> dst. Same layout as dst.
+        const uint fb_base = dst_base;
+        for (uint r = gl_LocalInvocationID.x; r < S_v; r += BLOCK_SIZE) {
+            dst[dst_base + r] = fallback[fb_base + r];
+        }
+        return;
+    }
+
+    // Defensive clamp: callers may set k_idx == n_tokens when no rollback is
+    // needed but we still want a valid read; mirror the CUDA defensive clamp.
+    uint t = uint(k_idx);
+    if (t >= n_tokens) {
+        t = n_tokens - 1;
+    }
+
+    const uint src_base =
+        ((seq * n_tokens + t) * H_v + h) * slab_elems + col * S_v;
+
+    for (uint r = gl_LocalInvocationID.x; r < S_v; r += BLOCK_SIZE) {
+        dst[dst_base + r] = state_history[src_base + r];
+    }
+}

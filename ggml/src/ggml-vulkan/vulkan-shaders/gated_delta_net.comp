@@ -31,6 +31,13 @@ layout(push_constant) uniform Parameters {
     uint sb1, sb2, sb3;
     uint neq1, rq3;
     float scale;
+#if WRITE_STATE_HISTORY
+    // DFlash Phase 4: per-token state-history region offset inside dst, in
+    // floats. Only the WITH_HISTORY variant of the pipeline reads this; the
+    // legacy chain pipeline declares an identical struct without the field
+    // so the byte layout doesn't shift.
+    uint sh_off;
+#endif
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -159,6 +166,19 @@ void main() {
         if (lane == 0) {
             data_dst[attn_off + col] = attn_col * scale;
         }
+
+#if WRITE_STATE_HISTORY
+        // Per-token state spill into dst's state_history region. Same
+        // transposed layout as the final-state write at the bottom of main(),
+        // strided by S_V*S_V*H to advance one (seq, token, head) slab per
+        // iteration. CUDA reference: ggml-cuda/gated_delta_net.cu:225-232.
+        const uint sh_base = sh_off
+            + ((seq_id * n_tokens + t) * H + head_id) * state_size
+            + col * S_V;
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            data_dst[sh_base + r * LANES_PER_COLUMN + lane] = s_shard[r];
+        }
+#endif
 
         attn_off += S_V * H;
     }

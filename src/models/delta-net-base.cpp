@@ -420,6 +420,177 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     return {output, new_state};
 }
 
+std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_with_history(
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * g,
+        ggml_tensor * b,
+        ggml_tensor * s,
+        int           il) {
+    const int64_t S_k      = q->ne[0];
+    const int64_t H_k      = q->ne[1];
+    const int64_t n_tokens = q->ne[2];
+    const int64_t n_seqs   = q->ne[3];
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H_v = v->ne[1];
+
+    GGML_ASSERT(S_k == S_v);
+    GGML_ASSERT(H_v % H_k == 0);
+
+    GGML_ASSERT(q->ne[0] == S_k && q->ne[1] == H_k && q->ne[2] == n_tokens && q->ne[3] == n_seqs);
+    GGML_ASSERT(k->ne[0] == S_k && k->ne[1] == H_k && k->ne[2] == n_tokens && k->ne[3] == n_seqs);
+    GGML_ASSERT(v->ne[0] == S_v && v->ne[1] == H_v && v->ne[2] == n_tokens && v->ne[3] == n_seqs);
+
+    GGML_ASSERT(g->ne[0] == 1   || g->ne[0] == S_v);
+    GGML_ASSERT(                   g->ne[1] == H_v && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
+    GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
+    GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
+
+    GGML_ASSERT(cparams.dflash_gdn_history &&
+                "build_delta_net_with_history called without "
+                "cparams.dflash_gdn_history set");
+    GGML_ASSERT(dflash != nullptr &&
+                "build_delta_net_with_history needs a llama_dflash on the context");
+    GGML_ASSERT((int) dflash->gdn_history.size() > il &&
+                dflash->gdn_history[il] != nullptr &&
+                "dflash->gdn_history not allocated for this layer; "
+                "context init must run with cparams.dflash_gdn_history set");
+    GGML_ASSERT(n_tokens * n_seqs <= dflash->gdn_history_max_tokens &&
+                "chain length exceeds gdn_history_max_tokens; "
+                "raise the cap in llama-context.cpp or reduce the draft block size");
+
+    ggml_tensor * result = ggml_gated_delta_net_with_history(ctx0, q, k, v, g, b, s);
+    // Reuse the same node-name convention so the fused-GDN device-mismatch
+    // check (sched_reserve in llama-context.cpp) can also catch issues for
+    // this op variant when n_tokens > 1.
+    cb(result, LLAMA_TENSOR_NAME_FGDN_CH, il);
+
+    // result layout (per ggml_gated_delta_net_with_history factory):
+    //   [0,                                          S_v*H*n_tokens*n_seqs)   = attn
+    //   [...,                                         + S_v*S_v*H*n_seqs)     = final_state
+    //   [...,                                         + S_v*S_v*H*n_tokens*n_seqs) = state_history
+    // ne[0] = S_v * H_v; floats only.
+    const size_t r_elt = ggml_row_size(result->type, 1);
+
+    ggml_tensor * output = ggml_view_4d(ctx0, result,
+            S_v, H_v, n_tokens, n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * H_v),
+            ggml_row_size(result->type, S_v * H_v * n_tokens), 0);
+
+    ggml_tensor * new_state = ggml_view_4d(ctx0, result,
+            S_v, S_v, H_v, n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * S_v),
+            ggml_row_size(result->type, S_v * S_v * H_v),
+            ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
+
+    // state_history view: shape [S_v, S_v, H_v, n_tokens * n_seqs] (ggml
+    // 4-D representation of the 5-D semantic [S_v, S_v, H_v, n_tokens, n_seqs]).
+    // Offset = attn_size + final_state_size, all in floats.
+    const size_t state_history_offset_bytes =
+        (size_t) (S_v * H_v * n_tokens * n_seqs + S_v * S_v * H_v * n_seqs) * r_elt;
+
+    ggml_tensor * state_history_view = ggml_view_4d(ctx0, result,
+            S_v, S_v, H_v, n_tokens * n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * S_v),
+            ggml_row_size(result->type, S_v * S_v * H_v),
+            state_history_offset_bytes);
+    cb(state_history_view, "gdn_state_history_view", il);
+
+    // Persistent destination is sized for max_tokens; cpy only the live prefix.
+    ggml_tensor * gdn_hist_dst_full = dflash->gdn_history[il];
+    ggml_tensor * gdn_hist_dst = ggml_view_4d(ctx0, gdn_hist_dst_full,
+            S_v, S_v, H_v, n_tokens * n_seqs,
+            gdn_hist_dst_full->nb[1],
+            gdn_hist_dst_full->nb[2],
+            gdn_hist_dst_full->nb[3],
+            0);
+
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, state_history_view, gdn_hist_dst));
+
+    return {output, new_state};
+}
+
+std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_with_history_tree(
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * g,
+        ggml_tensor * b,
+        ggml_tensor * s,
+        ggml_tensor * parent_ids,
+        int           il) {
+    // Same shape contract as build_delta_net_with_history; the only new
+    // input is parent_ids ([n_tokens, n_seqs] i32). persist_inter is
+    // the persistent gdn_history[il] buffer — the kernel writes
+    // intermediate states straight there, so the chain-variant's
+    // embedded-region → gdn_history cpy isn't needed.
+    const int64_t S_k      = q->ne[0];
+    const int64_t H_k      = q->ne[1];
+    const int64_t n_tokens = q->ne[2];
+    const int64_t n_seqs   = q->ne[3];
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H_v = v->ne[1];
+
+    GGML_ASSERT(S_k == S_v);
+    GGML_ASSERT(H_v % H_k == 0);
+
+    GGML_ASSERT(cparams.dflash_gdn_history &&
+                "build_delta_net_with_history_tree called without "
+                "cparams.dflash_gdn_history set");
+    GGML_ASSERT(cparams.n_seq_max > 1 &&
+                "build_delta_net_with_history_tree called without "
+                "cparams.n_seq_max > 1 (tree-mode trigger)");
+    GGML_ASSERT(dflash != nullptr &&
+                "build_delta_net_with_history_tree needs a llama_dflash "
+                "on the context");
+    GGML_ASSERT((int) dflash->gdn_history.size() > il &&
+                dflash->gdn_history[il] != nullptr &&
+                "dflash->gdn_history not allocated for this layer");
+    GGML_ASSERT(parent_ids != nullptr &&
+                "build_delta_net_with_history_tree needs parent_ids — "
+                "use build_dflash_gdn_parent_ids_or_null in the layer "
+                "builder to allocate one");
+    GGML_ASSERT(n_tokens <= dflash->gdn_history_max_tokens &&
+                "tree-verify n_tokens exceeds gdn_history_max_tokens; "
+                "raise the cap in llama-context.cpp");
+    GGML_ASSERT(n_seqs <= dflash->gdn_history_n_seqs_max &&
+                "tree-verify n_seqs exceeds gdn_history_n_seqs_max; "
+                "raise n_seq_max so the persistent buffer is widened");
+
+    // Reference: lucebox/lucebox-hub/dflash/src/qwen35_target_graph.cpp
+    // build_delta_net_block (lines 820-1040), specifically the
+    // ggml_gated_delta_net_tree_persist call at line 995. The persist
+    // buffer there is `cap->ssm_intermediate_states`; our analogue is
+    // dflash->gdn_history[il]. MIT-licensed, Copyright 2026 Lucebox.
+    ggml_tensor * persist_inter = dflash->gdn_history[il];
+    ggml_tensor * result = ggml_gated_delta_net_with_history_tree(
+        ctx0, q, k, v, g, b, s, parent_ids, persist_inter);
+    cb(result, LLAMA_TENSOR_NAME_FGDN_CH, il);
+
+    // Output / new_state views (same offsets as the chain variant; the
+    // dst tensor's shape is identical because the op enum is shared).
+    ggml_tensor * output = ggml_view_4d(ctx0, result,
+            S_v, H_v, n_tokens, n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * H_v),
+            ggml_row_size(result->type, S_v * H_v * n_tokens), 0);
+
+    ggml_tensor * new_state = ggml_view_4d(ctx0, result,
+            S_v, S_v, H_v, n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * S_v),
+            ggml_row_size(result->type, S_v * S_v * H_v),
+            ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
+
+    return {output, new_state};
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net(
         ggml_tensor * q,
         ggml_tensor * k,

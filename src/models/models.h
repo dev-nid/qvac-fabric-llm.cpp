@@ -65,6 +65,48 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * b,
                 ggml_tensor * s,
                         int   il);
+
+    // DFlash Phase 4: fused GDN op that also writes per-token recurrent
+    // state into the persistent dflash->gdn_history[il] buffer. Used in
+    // place of build_delta_net_fused when cparams.dflash_gdn_history is
+    // set and we're inside a chain-mode (n_tokens > 1) ubatch.
+    //
+    // Returns the same {output, new_state} pair as build_delta_net_fused.
+    // The caller is responsible for cpy'ing new_state into the recurrent
+    // KV cache; this builder additionally adds a cpy of the state-history
+    // view into dflash->gdn_history[il] so the spec driver's fixup graph
+    // can read state[K-1] after sampling.
+    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_with_history(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * s,
+                        int   il);
+
+    // Phase 5 tree variant: calls ggml_gated_delta_net_with_history_tree
+    // with parent_ids + persist_inter = dflash->gdn_history[il]. The
+    // kernel writes per-token intermediate states DIRECTLY into the
+    // persistent buffer (no embedded-region ggml_cpy needed, unlike the
+    // chain variant), and reloads them at branch points per parent_ids.
+    //
+    // persist_inter (= gdn_history[il]) may be either F32 or F16; the
+    // kernel picks the InterT template instantiation at runtime from
+    // the tensor's dtype.
+    //
+    // Reference: lucebox/lucebox-hub/dflash/src/qwen35_target_graph.cpp
+    // line ~995 (ggml_gated_delta_net_tree_persist call). MIT-licensed,
+    // Copyright 2026 Lucebox.
+    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_with_history_tree(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * s,
+                ggml_tensor * parent_ids,
+                        int   il);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

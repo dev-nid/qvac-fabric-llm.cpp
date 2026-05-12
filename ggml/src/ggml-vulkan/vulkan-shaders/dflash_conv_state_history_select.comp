@@ -1,0 +1,68 @@
+#version 450
+
+// DFlash Phase 4 conv-state fixup. Picks `conv_state_rows` contiguous rows
+// of conv_history starting at offset (k_index + 1) along dim 0; on
+// k_index < 0 falls back to copying the `fallback` tensor.
+// CUDA reference: ggml-cuda/gated_delta_net.cu
+//                 dflash_conv_state_history_select_cuda.
+//
+// Layout (contiguous floats, row-major across the listed dims):
+//   conv_history: [conv_history_rows, conv_channels, n_seqs]
+//   fallback:     [conv_state_rows,    conv_channels, n_seqs]
+//   dst:          [conv_state_rows,    conv_channels, n_seqs]
+//
+// The dispatch fires (channels / channels_per_block) x n_seqs workgroups,
+// with channels_per_block lanes covering channels and rows_per_block
+// invocations covering all conv_state_rows in a single block.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint conv_state_rows;
+    uint conv_history_rows;
+    uint conv_channels;
+    uint n_seqs;
+};
+
+layout(binding = 0) readonly buffer History  { float conv_history[]; };
+layout(binding = 1) readonly buffer KIndex   { int   k_index[];      };
+layout(binding = 2) readonly buffer Fallback { float fallback[];     };
+layout(binding = 3)          buffer Dst      { float dst[];          };
+
+void main() {
+    const uint seq     = gl_WorkGroupID.y;
+    const uint c_chunk = gl_WorkGroupID.x;
+    const uint c_lane  = gl_LocalInvocationID.x;
+    const uint r       = gl_LocalInvocationID.y;
+    const uint c       = c_chunk * gl_WorkGroupSize.x + c_lane;
+
+    if (c >= conv_channels || r >= conv_state_rows || seq >= n_seqs) {
+        return;
+    }
+
+    const int k_idx = k_index[0];
+
+    // dst is contiguous [conv_state_rows, conv_channels, n_seqs]:
+    //   dst[r, c, s] sits at offset (s * channels + c) * rows + r.
+    const uint dst_idx = (seq * conv_channels + c) * conv_state_rows + r;
+
+    if (k_idx < 0) {
+        const uint fb_idx = dst_idx;
+        dst[dst_idx] = fallback[fb_idx];
+        return;
+    }
+
+    // History path: pick rows [k_idx + 1, k_idx + 1 + conv_state_rows) of
+    // conv_history along dim 0. Defensive clamp matches the CUDA kernel.
+    int row_off    = k_idx + 1;
+    const int row_max = int(conv_history_rows) - int(conv_state_rows);
+    if (row_off < 0)        row_off = 0;
+    if (row_off > row_max)  row_off = row_max;
+
+    const uint src_idx =
+        (seq * conv_channels + c) * conv_history_rows + uint(row_off + int(r));
+
+    dst[dst_idx] = conv_history[src_idx];
+}

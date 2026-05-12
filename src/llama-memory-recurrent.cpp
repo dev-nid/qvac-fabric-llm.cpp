@@ -211,6 +211,44 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     return true;
 }
 
+bool llama_memory_recurrent::seq_rm_partial_tail_state_managed_externally(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (p0 < 0) {
+        p0 = 0;
+    }
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    if (seq_id >= (int64_t) size) {
+        return false;
+    }
+
+    // Negative seq_id with a partial range isn't supported (matches
+    // seq_rm's behavior). Fall back to regular seq_rm for the full-clear
+    // and noop cases.
+    if (seq_id < 0) {
+        return seq_rm(seq_id, p0, p1);
+    }
+
+    int32_t & tail_id = cells[seq_id].tail;
+    if (tail_id >= 0) {
+        auto & cell = cells[tail_id];
+        // Partial-tail intersection: rewind the tail cell's position
+        // (DFlash Phase 4 fixup overwrites the state buffer). Leave
+        // tail_id, seq_id membership, and used-count untouched.
+        if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+            cell.pos = p0 - 1;
+            return true;
+        }
+    }
+
+    // Range doesn't include the tail (or no tail exists yet). The
+    // regular seq_rm handles this case fine — it'll either be a no-op
+    // or a normal cell-clearing pass on non-tail cells.
+    return seq_rm(seq_id, p0, p1);
+}
+
 void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     if (seq_id_src == seq_id_dst) {
         return;

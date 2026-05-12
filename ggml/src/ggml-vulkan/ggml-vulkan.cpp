@@ -843,6 +843,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128
     vk_pipeline pipeline_gated_delta_net[3][2];
+    // DFlash Phase 4: chain-mode WITH_HISTORY GDN variants. Same shape as
+    // the base table; additional pipeline that spills per-token state into
+    // dst's state_history region. Plus two cheap data-shuffling kernels for
+    // the in-graph rollback fixups (state + conv state).
+    vk_pipeline pipeline_gated_delta_net_history[3][2];
+    vk_pipeline pipeline_gated_delta_net_state_select_f32;
+    vk_pipeline pipeline_dflash_conv_state_history_select_f32;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1497,6 +1504,33 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
     float scale;
+};
+// DFlash Phase 4: GDN with state-history spill. Same shape as the base
+// struct, plus the offset (in floats) into dst where the history region
+// begins. Mirrors the WRITE_STATE_HISTORY-guarded field in the shader.
+struct vk_op_gated_delta_net_history_push_constants {
+    uint32_t H;
+    uint32_t n_tokens;
+    uint32_t n_seqs;
+    uint32_t s_off;
+    uint32_t sq1, sq2, sq3;
+    uint32_t sv1, sv2, sv3;
+    uint32_t sb1, sb2, sb3;
+    uint32_t neq1, rq3;
+    float scale;
+    uint32_t sh_off;
+};
+struct vk_op_gated_delta_net_state_select_push_constants {
+    uint32_t S_v;
+    uint32_t H_v;
+    uint32_t n_tokens;
+    uint32_t n_seqs;
+};
+struct vk_op_dflash_conv_state_history_select_push_constants {
+    uint32_t conv_state_rows;
+    uint32_t conv_history_rows;
+    uint32_t conv_channels;
+    uint32_t n_seqs;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -4766,6 +4800,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
             {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda"},
             {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda"},
         };
+        const char * gdn_history_names[][2] = {
+            {"gated_delta_net_history_f32_d32",  "gated_delta_net_history_f32_d32_kda"},
+            {"gated_delta_net_history_f32_d64",  "gated_delta_net_history_f32_d64_kda"},
+            {"gated_delta_net_history_f32_d128", "gated_delta_net_history_f32_d128_kda"},
+        };
         const bool use_subgroup_reduce = device->subgroup_arithmetic;
         for (uint32_t si = 0; si < 3; si++) {
             const uint32_t S_V = gdn_sizes[si];
@@ -4784,15 +4823,23 @@ static void ggml_vk_load_shaders(vk_device& device) {
             const bool need_clustered_shader = lanes_per_column != 1 && (lanes_per_column < device->subgroup_size);
             size_t gdn_len;
             const void * gdn_data;
+            size_t gdn_hist_len;
+            const void * gdn_hist_data;
             if (use_subgroup_reduce && need_clustered_shader) {
                 gdn_len = gated_delta_net_f32_len;
                 gdn_data = (const void *)gated_delta_net_f32_data;
+                gdn_hist_len = gated_delta_net_history_f32_len;
+                gdn_hist_data = (const void *)gated_delta_net_history_f32_data;
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+                gdn_hist_len = gated_delta_net_history_f32_nocluster_len;
+                gdn_hist_data = (const void *)gated_delta_net_history_f32_nocluster_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
+                gdn_hist_len = gated_delta_net_history_f32_shmem_len;
+                gdn_hist_data = (const void *)gated_delta_net_history_f32_shmem_data;
             }
 
             const uint32_t cols_per_wg = device->subgroup_size / lanes_per_column;
@@ -4802,8 +4849,29 @@ static void ggml_vk_load_shaders(vk_device& device) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_reduce, device->subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_history[si][kda],
+                    gdn_history_names[si][kda], gdn_hist_len, gdn_hist_data, "main", 7, sizeof(vk_op_gated_delta_net_history_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_reduce, device->subgroup_size);
             }
         }
+
+        // DFlash Phase 4: state-history fixup + conv-state fixup. One pipeline
+        // each; chain mode (F32, scalar k_index). One workgroup per
+        // (col, head, seq); BLOCK_SIZE invocations cover S_v rows.
+        ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_state_select_f32,
+            "gated_delta_net_state_select_f32",
+            gated_delta_net_state_select_f32_len, gated_delta_net_state_select_f32_data,
+            "main", 4, sizeof(vk_op_gated_delta_net_state_select_push_constants),
+            {1, 1, 1}, {128u}, 1);
+
+        // For the conv-state shader: local size is (channels_per_block,
+        // rows_per_block, 1). conv_kernel_size on Qwen3.5-27B is 4 -> 3 rows;
+        // we hand 32 channel lanes per block. Fixed at pipeline creation.
+        ggml_vk_create_pipeline(device, device->pipeline_dflash_conv_state_history_select_f32,
+            "dflash_conv_state_history_select_f32",
+            dflash_conv_state_history_select_f32_len, dflash_conv_state_history_select_f32_data,
+            "main", 4, sizeof(vk_op_dflash_conv_state_history_select_push_constants),
+            {32, 1, 1}, {32u, 3u}, 1);
     }
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
@@ -9815,6 +9883,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_GATED_DELTA_NET:
+    case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t S_v = dst->src[2]->ne[0];
             const uint32_t kda = (dst->src[3]->ne[0] == (int64_t)S_v) ? 1 : 0;
@@ -9825,7 +9894,20 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 128: si = 2; break;
                 default: return nullptr;
             }
+            if (op == GGML_OP_GATED_DELTA_NET_WITH_HISTORY) {
+                return ctx->device->pipeline_gated_delta_net_history[si][kda];
+            }
             return ctx->device->pipeline_gated_delta_net[si][kda];
+        }
+        return nullptr;
+    case GGML_OP_GATED_DELTA_NET_STATE_SELECT:
+        if (dst->type == GGML_TYPE_F32 && dst->src[0]->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_gated_delta_net_state_select_f32;
+        }
+        return nullptr;
+    case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT:
+        if (dst->type == GGML_TYPE_F32 && dst->src[0]->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_dflash_conv_state_history_select_f32;
         }
         return nullptr;
     case GGML_OP_SSM_SCAN:
@@ -10679,7 +10761,11 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t n_tokens = (uint32_t)src_v->ne[2];
     const uint32_t n_seqs   = (uint32_t)src_v->ne[3];
 
-    const uint32_t s_off = S_v * H * n_tokens * n_seqs;
+    const uint32_t s_off  = S_v * H * n_tokens * n_seqs;
+    // DFlash Phase 4: state-history region begins after attn (s_off floats)
+    // and final_state (S_v*S_v*H*n_seqs floats). Only consumed by the
+    // WITH_HISTORY pipeline; ignored by the legacy chain pipeline.
+    const uint32_t sh_off = s_off + S_v * S_v * H * n_seqs;
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
@@ -10706,18 +10792,138 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
-    const vk_op_gated_delta_net_push_constants pc = {
-        H, n_tokens, n_seqs, s_off,
-        sq1, sq2, sq3,
-        sv1, sv2, sv3,
-        sb1, sb2, sb3,
-        neq1, rq3,
-        scale
-    };
+
+    if (dst->op == GGML_OP_GATED_DELTA_NET_WITH_HISTORY) {
+        // DFlash Phase 4 chain mode only: tree-mode parent_ids + persist
+        // buffer (CUDA src[6]/src[7]) are not implemented on Vulkan yet -
+        // those are Phase 5 (Session 23 architectural blocker). The ops
+        // factory accepts them but the dispatch here aborts so the failure
+        // is loud rather than silent.
+        GGML_ASSERT(dst->src[6] == nullptr &&
+                    "Vulkan GDN history: tree-mode parent_ids (src[6]) not supported (Phase 5)");
+        GGML_ASSERT(dst->src[7] == nullptr &&
+                    "Vulkan GDN history: external persist buffer (src[7]) not supported (Phase 5)");
+
+        const vk_op_gated_delta_net_history_push_constants pc = {
+            H, n_tokens, n_seqs, s_off,
+            sq1, sq2, sq3,
+            sv1, sv2, sv3,
+            sb1, sb2, sb3,
+            neq1, rq3,
+            scale,
+            sh_off
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+            pc, { H, n_seqs, S_v });
+    } else {
+        const vk_op_gated_delta_net_push_constants pc = {
+            H, n_tokens, n_seqs, s_off,
+            sq1, sq2, sq3,
+            sv1, sv2, sv3,
+            sb1, sb2, sb3,
+            neq1, rq3,
+            scale
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+            pc, { H, n_seqs, S_v });
+    }
+}
+
+// DFlash Phase 4 state-history fixup (chain mode).
+static void ggml_vk_gated_delta_net_state_select(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src_sh     = dst->src[0];
+    const ggml_tensor * src_kindex = dst->src[1];
+    const ggml_tensor * src_fb     = dst->src[2];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+    GGML_ASSERT(src_sh->type     == GGML_TYPE_F32 &&
+                "Vulkan GDN state_select: F16 InterT path is Phase 5, not implemented");
+    GGML_ASSERT(src_kindex->type == GGML_TYPE_I32);
+    GGML_ASSERT(src_fb != nullptr && src_fb->type == GGML_TYPE_F32 &&
+                "Vulkan GDN state_select: chain-mode requires fallback (src[2])");
+
+    const uint32_t S_v      = (uint32_t)src_sh->ne[0];
+    const uint32_t H_v      = (uint32_t)src_sh->ne[2];
+    const uint32_t n_seqs   = (uint32_t)dst->ne[3];
+    const uint32_t n_tokens = (uint32_t)(src_sh->ne[3] / n_seqs);
+
+    GGML_ASSERT(src_sh->ne[1] == (int64_t)S_v);
+    GGML_ASSERT((src_sh->ne[3] % (int64_t)n_seqs) == 0);
+
+    // Chain-mode scope: scalar k_index. Per-seq k_index is Phase 5.
+    GGML_ASSERT(ggml_nelements(src_kindex) == 1 &&
+                "Vulkan GDN state_select: per-seq k_index_count is Phase 5");
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src_sh, src_kindex, src_fb, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer sh_buf  = ggml_vk_tensor_subbuffer(ctx, src_sh);
+    vk_subbuffer ki_buf  = ggml_vk_tensor_subbuffer(ctx, src_kindex);
+    vk_subbuffer fb_buf  = ggml_vk_tensor_subbuffer(ctx, src_fb);
+
+    const vk_op_gated_delta_net_state_select_push_constants pc = { S_v, H_v, n_tokens, n_seqs };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
-        pc, { H, n_seqs, S_v });
+        {sh_buf, ki_buf, fb_buf, dst_buf},
+        pc, { S_v, H_v, n_seqs });
+}
+
+// DFlash Phase 4 conv-state fixup (chain mode).
+static void ggml_vk_dflash_conv_state_history_select(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src_hist   = dst->src[0];
+    const ggml_tensor * src_kindex = dst->src[1];
+    const ggml_tensor * src_fb     = dst->src[2];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+    GGML_ASSERT(src_hist->type   == GGML_TYPE_F32);
+    GGML_ASSERT(src_kindex->type == GGML_TYPE_I32);
+    GGML_ASSERT(src_fb != nullptr && src_fb->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(src_kindex) == 1);
+
+    const uint32_t conv_state_rows   = (uint32_t)dst->ne[0];
+    const uint32_t conv_channels     = (uint32_t)dst->ne[1];
+    const uint32_t n_seqs            = (uint32_t)dst->ne[2];
+    const uint32_t conv_history_rows = (uint32_t)src_hist->ne[0];
+
+    GGML_ASSERT(src_hist->ne[1] == (int64_t)conv_channels);
+    GGML_ASSERT(src_hist->ne[2] == (int64_t)n_seqs);
+    GGML_ASSERT(src_fb->ne[0]   == (int64_t)conv_state_rows);
+    GGML_ASSERT(src_fb->ne[1]   == (int64_t)conv_channels);
+    GGML_ASSERT(src_fb->ne[2]   == (int64_t)n_seqs);
+    GGML_ASSERT(conv_history_rows >= conv_state_rows);
+
+    // The pipeline was created with local size (32, 3, 1); rows_per_block
+    // must equal conv_state_rows. On Qwen3.5-27B conv_kernel_size = 4 so
+    // conv_state_rows = 3. If a future model uses a different kernel size
+    // the local-size spec constants below must be adjusted; assert loudly.
+    GGML_ASSERT(conv_state_rows == 3 &&
+                "Vulkan dflash_conv_state_history_select: pipeline currently "
+                "compiled for conv_state_rows=3 only (Qwen3.5 conv_kernel_size=4)");
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src_hist, src_kindex, src_fb, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer hi_buf  = ggml_vk_tensor_subbuffer(ctx, src_hist);
+    vk_subbuffer ki_buf  = ggml_vk_tensor_subbuffer(ctx, src_kindex);
+    vk_subbuffer fb_buf  = ggml_vk_tensor_subbuffer(ctx, src_fb);
+
+    const vk_op_dflash_conv_state_history_select_push_constants pc = {
+        conv_state_rows, conv_history_rows, conv_channels, n_seqs
+    };
+
+    // wg_denoms is {32, 1, 1} so dispatching elements (channels, n_seqs, 1)
+    // gives ceil(channels/32) workgroups along x.
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {hi_buf, ki_buf, fb_buf, dst_buf},
+        pc, { conv_channels, n_seqs, 1u });
 }
 
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -13445,7 +13651,18 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_GATED_DELTA_NET:
+    case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_GATED_DELTA_NET_STATE_SELECT:
+        ggml_vk_gated_delta_net_state_select(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT:
+        ggml_vk_dflash_conv_state_history_select(ctx, compute_ctx, node);
 
         break;
 
@@ -15957,6 +16174,59 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     }
                 }
                 return op->type == GGML_TYPE_F32;
+            }
+        case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
+            {
+                // DFlash Phase 4: chain mode only on Vulkan. Phase 5 tree mode
+                // (parent_ids = src[6], external persist buffer = src[7]) is
+                // intentionally rejected here so the scheduler routes those
+                // graphs back to CPU (where the stub aborts cleanly). Same
+                // S_v / src[0..5] requirements as the base GDN op.
+                if (op->src[6] != nullptr || op->src[7] != nullptr) {
+                    return false;
+                }
+                const uint32_t S_v = op->src[2]->ne[0];
+                if (S_v != 32 && S_v != 64 && S_v != 128) {
+                    return false;
+                }
+                for (int i = 0; i < 6; i++) {
+                    if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
+                        return false;
+                    }
+                }
+                return op->type == GGML_TYPE_F32;
+            }
+        case GGML_OP_GATED_DELTA_NET_STATE_SELECT:
+            {
+                // DFlash Phase 4 chain-mode shape: F32 state_history, scalar
+                // I32 k_index, F32 fallback. F16 InterT and per-seq k_index
+                // count > 1 are Phase 5 - reject here.
+                if (op->type != GGML_TYPE_F32)         return false;
+                if (op->src[0] == nullptr ||
+                    op->src[0]->type != GGML_TYPE_F32) return false;
+                if (op->src[1] == nullptr ||
+                    op->src[1]->type != GGML_TYPE_I32) return false;
+                if (ggml_nelements(op->src[1]) != 1)   return false;
+                if (op->src[2] == nullptr ||
+                    op->src[2]->type != GGML_TYPE_F32) return false;
+                return true;
+            }
+        case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT:
+            {
+                // Chain-mode shape; pipeline is currently compiled for
+                // conv_state_rows = 3 (Qwen3.5 conv_kernel_size = 4). Reject
+                // any other shape so a future arch with a different kernel
+                // size doesn't silently mis-dispatch.
+                if (op->type != GGML_TYPE_F32)         return false;
+                if (op->src[0] == nullptr ||
+                    op->src[0]->type != GGML_TYPE_F32) return false;
+                if (op->src[1] == nullptr ||
+                    op->src[1]->type != GGML_TYPE_I32) return false;
+                if (ggml_nelements(op->src[1]) != 1)   return false;
+                if (op->src[2] == nullptr ||
+                    op->src[2]->type != GGML_TYPE_F32) return false;
+                if (op->ne[0] != 3) return false;
+                return true;
             }
         case GGML_OP_SSM_SCAN:
             {

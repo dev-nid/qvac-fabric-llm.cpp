@@ -317,13 +317,20 @@ llama_model_dflash::graph::graph(const llama_model & model, const llm_graph_para
         topk_argmax = ggml_top_k(ctx0, logits, 1);
         cb(topk_argmax, "result_output_topk_argmax", -1);
     }
-    res->t_logits             = nullptr;
+    // Default: skip the bs * n_vocab * 4 byte logits readback (chain mode and
+    // uniform-expansion tree mode never need it). When dflash_emit_logits is
+    // set (best-first DDTree), emit the full logits so the host can do
+    // softmax + log-prob top-K for the heap-based tree builder.
+    res->t_logits             = cparams.dflash_emit_logits ? logits : nullptr;
     res->t_dflash_topk        = topk;
     res->t_dflash_topk_argmax = topk_argmax;
 
     ggml_build_forward_expand(gf, topk);
     if (topk_argmax) {
         ggml_build_forward_expand(gf, topk_argmax);
+    }
+    if (cparams.dflash_emit_logits) {
+        ggml_build_forward_expand(gf, logits);
     }
 }
 
@@ -390,8 +397,19 @@ llama_model_dflash::encode_graph::encode_graph(const llama_model    & model,
     ggml_tensor * pos_idx           = inp->pos_idx;
 
     // ---------- shared projection: h_proj = hidden_norm(fc(target_hidden_new)) ----------
-    ggml_tensor * h_proj = build_lora_mm(model.dflash_fc, target_hidden_new);   // [n_embd, n_new]
-    h_proj = build_norm(h_proj, model.dflash_hidden_norm, NULL, LLM_NORM_RMS, -1);
+    // target_hidden_new is the concat of unnormalized hidden states from
+    // several target layers; its magnitude is unbounded and the fc weight is
+    // F16. On CUDA the default mat-mul kernel for F16 weights uses an F16
+    // accumulator, which overflows for output magnitudes > ~6.5e4 and produces
+    // +inf values. Those infs poison the following RMSNorm (scale becomes 0)
+    // and cascade into NaN downstream, killing speculative acceptance on
+    // medium/long prompts. Force F32 accumulation here; the RMSNorm right
+    // after still normalizes the result, so the fix is free in terms of
+    // numerics but pays a small CUDA mat-mul cost for higher precision.
+    ggml_tensor * h_fc = build_lora_mm(model.dflash_fc, target_hidden_new);
+    ggml_mul_mat_set_prec(h_fc, GGML_PREC_F32);
+    cb(h_fc, "dflash_enc_h_fc", -1);
+    ggml_tensor * h_proj = build_norm(h_fc, model.dflash_hidden_norm, NULL, LLM_NORM_RMS, -1);
     cb(h_proj, "dflash_enc_h_proj", -1);
 
     // ---------- per-layer K/V projection + scatter into side store via set_rows ----------

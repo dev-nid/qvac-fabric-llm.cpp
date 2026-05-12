@@ -39,6 +39,21 @@ struct common_speculative_tree {
     int                      n_nodes       = 0;
     int                      main_path_len = 0;
     int                      n_branches    = 1;
+
+    // Phase 5: emit a parent_ids tensor of shape [n_tokens, n_seqs] in
+    // row-major order (out[t + s * n_tokens] = parent of token t in seq s)
+    // matching the layout expected by ggml_gated_delta_net_with_history_tree
+    // and ggml_ssm_conv_tree.
+    //
+    // n_tokens must equal n_nodes + 1 (root + tree nodes). n_seqs is
+    // typically 1 for the single-seq DFS-flattened tree-verify batch the
+    // spec driver constructs; widened entries (s > 0) are set to -1 so
+    // any unused per-seq slabs in the gdn_history buffer treat their
+    // pre-block state as the start (kernel TREE_MODE root sentinel).
+    //
+    // Returns false if `out` is null or the n_tokens argument doesn't
+    // match the tree shape.
+    bool write_parent_ids(int32_t * out, int n_tokens, int n_seqs) const;
 };
 
 // comma separated list of all types

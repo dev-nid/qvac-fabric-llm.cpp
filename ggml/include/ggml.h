@@ -557,6 +557,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
+        GGML_OP_SSM_CONV_TREE,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
         GGML_OP_WIN_UNPART,
@@ -567,6 +568,9 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_GATED_DELTA_NET_WITH_HISTORY,
+        GGML_OP_GATED_DELTA_NET_STATE_SELECT,
+        GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT,
 
         GGML_OP_UNARY,
 
@@ -2430,6 +2434,23 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // DFlash Phase 5: parent-aware variant of ggml_ssm_conv for tree-mode
+    // speculative decoding verify. `parent_ids` is an int32 tensor of shape
+    // [n_tokens, n_seqs] where entry [t, s] is the index within sequence s of
+    // the parent token in the DFS-flattened tree, or -1 when the parent is
+    // before the block (then the K-1 ancestors decay through the old conv
+    // state region). At each new-token i, the kernel walks the parent chain
+    // K-1 times to build the correct conv window per token, instead of using
+    // the sequential [i, i+K-1] slide. Without this, sibling branches share
+    // ancestors that aren't theirs and the conv state cross-contaminates.
+    //
+    // CUDA only. CPU backend aborts with a clear error message.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sx,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * parent_ids);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2549,6 +2570,123 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
+
+    // Same as ggml_gated_delta_net, but the dst tensor also packs a
+    // per-token state-history region of shape [S_v, S_v, H_v, n_tokens, n_seqs]
+    // after the attn-output and final-state regions. Used by DFlash spec-decode
+    // to roll back the recurrent state on partial draft acceptance without a
+    // checkpoint+re-verify round-trip.
+    //
+    // Layout in result->data (floats):
+    //   [ attn_out:       S_v * H * n_tokens * n_seqs
+    //   | final_state:    S_v * S_v * H * n_seqs
+    //   | state_history:  S_v * S_v * H * n_tokens * n_seqs ]
+    //
+    // CUDA only. CPU backend aborts with a clear error message.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_with_history(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state);
+
+    // DFlash Phase 5: tree-mode variant of ggml_gated_delta_net_with_history.
+    // Same op (GGML_OP_GATED_DELTA_NET_WITH_HISTORY) but with two extra srcs:
+    //   src[6] = parent_ids   - int32 [n_tokens, n_seqs]. entry [t, s] is the
+    //                           token index within seq s of t's parent in the
+    //                           DFS-flattened tree, or -1 if t's parent is the
+    //                           pre-block recurrent state (root of branch).
+    //   src[7] = persist_inter - f32 or f16, contiguous, sized at least
+    //                            [S_v, S_v, H, n_tokens, n_seqs]. The kernel
+    //                            spills per-token intermediate states to this
+    //                            buffer and reads back from it at branch
+    //                            points (parent_t != t-1). f16 halves the
+    //                            footprint and is the difference between
+    //                            fitting and not fitting DDTree-22 on the
+    //                            27B target.
+    //
+    // The embedded state-history region inside the result tensor is unused
+    // when persist_inter is non-null but is still allocated (the op shape is
+    // shared with the chain entry point above, kept stable for graph-builder
+    // compatibility).
+    //
+    // CUDA only. CPU backend aborts with the same error as the chain-mode
+    // entry point.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_with_history_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * parent_ids,
+            struct ggml_tensor  * persist_inter);
+
+    // Strided-copy view: returns a tensor containing
+    // state_history[..., k_index, :] (the per-head recurrent state at the
+    // chosen token-position). Shape of the result: [S_v, S_v, H_v, n_seqs] —
+    // identical to the recurrent-state tensor consumed by the next decode.
+    //
+    // `state_history` is a contiguous tensor of shape
+    //   [S_v, S_v, H_v, n_tokens, n_seqs]
+    // (viewed by ggml as 4-D with ne[3] = n_tokens * n_seqs). It is the
+    // persistent buffer the GATED_DELTA_NET_WITH_HISTORY op wrote into.
+    //
+    // `k_index` is an I32 tensor read on-device. Either:
+    //   - 1 element  (chain mode, byte-exact with Phase 4): every seq uses
+    //                 the same scalar k.
+    //   - n_seqs     (Phase 5 tree mode): per-seq k; entry s applied to the
+    //                 slab for sequence s. -1 in any slot triggers the
+    //                 fallback copy for that seq only.
+    //
+    // `fallback` (optional, may be nullptr) is a tensor with the same
+    // shape as the result; if `k_index` is < 0 (e.g. first decode, full
+    // acceptance), the kernel copies `fallback` → result instead of
+    // selecting from state_history. Use this to make the op a graph-level
+    // no-op when fixup is not needed: pass the current
+    // ssm_states_all-slot view as `fallback`, then cpy the result back
+    // to the same slot. The kernel reads `fallback` only when
+    // `*k_index_ptr < 0`.
+    //
+    // CUDA only.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_state_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * state_history,
+            struct ggml_tensor  * k_index,
+            struct ggml_tensor  * fallback);
+
+    // DFlash Phase 4 conv-state fixup. Selects `conv_kernel_size - 1`
+    // contiguous rows from a persistent conv_input history buffer to
+    // recover the convolutional state ending at chain position k_index.
+    //
+    // `conv_history` shape:
+    //   [conv_kernel_size - 1 + max_tokens, conv_channels, n_seqs]
+    // Output shape:
+    //   [conv_kernel_size - 1, conv_channels, n_seqs]
+    //
+    // The kernel reads rows [k_index + 1, k_index + conv_kernel_size)
+    // of conv_history (= 3 consecutive rows for conv_kernel_size = 4).
+    // The result is the conv_states tensor that build_rs would have
+    // produced from the recurrent r_l slot post-rollback.
+    //
+    // `k_index` is an I32 scalar (device-resident; same value used for
+    // the companion GDN state_select).
+    //
+    // `fallback` (may be nullptr) is a tensor with the same element
+    // count as the result; selected when k_index < 0 (no fixup needed,
+    // e.g. first chain-verify decode or full-acceptance iter). When the
+    // caller passes the live conv_states_all slot view as fallback, the
+    // op becomes a graph-level no-op for k_index < 0.
+    //
+    // CUDA only.
+    GGML_API struct ggml_tensor * ggml_dflash_conv_state_history_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * conv_history,
+            struct ggml_tensor  * k_index,
+            struct ggml_tensor  * fallback);
 
     // custom operators
 

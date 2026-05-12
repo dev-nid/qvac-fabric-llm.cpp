@@ -157,4 +157,9 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // DFlash inline encoder (Phase 3). No-op when not enabled or weights/
+    // side-store aren't bound. Emitted after lm_head so the encoder ops
+    // can overlap with the lm_head matmul on the GPU.
+    build_dflash_inline_encoder(model, res->t_dflash_captures_packed);
 }

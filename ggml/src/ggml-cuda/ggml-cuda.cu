@@ -2907,6 +2907,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_CONV:
             ggml_cuda_op_ssm_conv(ctx, dst);
             break;
+        case GGML_OP_SSM_CONV_TREE:
+            ggml_cuda_op_ssm_conv_tree(ctx, dst);
+            break;
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
@@ -2933,6 +2936,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
+            break;
+        case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
+            ggml_cuda_op_gated_delta_net_with_history(ctx, dst);
+            break;
+        case GGML_OP_GATED_DELTA_NET_STATE_SELECT:
+            ggml_cuda_op_gated_delta_net_state_select(ctx, dst);
+            break;
+        case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT:
+            ggml_cuda_op_dflash_conv_state_history_select(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -5139,6 +5151,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
         }
+        case GGML_OP_SSM_CONV_TREE: {
+            // Same threads-per-block as SSM_CONV; same divisibility constraint.
+            // Also restrict to the supported kernel widths.
+            const int64_t nc = op->src[1]->ne[0];
+            const bool nc_ok = (nc == 3 || nc == 4 || nc == 5 || nc == 9);
+            return nc_ok && op->src[0]->ne[1] % 128 == 0;
+        }
         case GGML_OP_CONT:
             return true;
         case GGML_OP_DIAG_MASK_INF:
@@ -5195,12 +5214,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
             //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327
 #ifdef GGML_USE_MUSA
             return false;
 #else
             return true;
 #endif // GGML_USE_MUSA
+        case GGML_OP_GATED_DELTA_NET_STATE_SELECT:
+        case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT:
+            return true;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
