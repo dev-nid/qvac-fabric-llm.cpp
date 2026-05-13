@@ -138,6 +138,26 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
+void llama_memory_hybrid::set_tree_mode_active(bool active) {
+    mem_attn->set_tree_mode_active(active);
+}
+
+bool llama_memory_hybrid::keep_positions_range(
+        llama_seq_id      seq_id,
+        const llama_pos * positions,
+        int32_t           n_positions,
+        llama_pos         p_min) {
+    return mem_attn->keep_positions_range(seq_id, positions, n_positions, p_min);
+}
+
+bool llama_memory_hybrid::keep_cells_dfs_ordinals_range(
+        llama_seq_id    seq_id,
+        const int32_t * dfs_keep,
+        int32_t         n_keep,
+        llama_pos       p_min) {
+    return mem_attn->keep_cells_dfs_ordinals_range(seq_id, dfs_keep, n_keep, p_min);
+}
+
 bool llama_memory_hybrid::seq_rm_partial_tail_state_managed_externally(
         llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // Recurrent half: rewinds the tail cell's pos to p0 - 1 on partial

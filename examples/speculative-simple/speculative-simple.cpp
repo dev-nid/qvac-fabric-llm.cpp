@@ -393,30 +393,126 @@ int main(int argc, char ** argv) {
     const auto t_dec_start = ggml_time_us();
 
     const bool use_tree = params.speculative.dflash_tree;
-    // Single-seq DFS tree-with-GDN-history is OPT-IN via
-    // DFLASH_TREE_GDN_SINGLE_SEQ=1 — the path lands the Phase 5
-    // infrastructure end-to-end but hits llama.cpp's KV cache
-    // monotonic-position constraint: tree-mode wants positions =
-    // tree depth (so same-depth siblings share a position and ROPE
-    // rotation), but the unified cache rejects non-consecutive seq
-    // positions; the DFS-index workaround perturbs ROPE so much that
-    // acceptance collapses on non-trivial trees (HE[0]: ~3 % accept
-    // rate at DDTree-22). Default off until either a multi-seq
-    // packing strategy that engages the WITH_HISTORY kernel without
-    // ubatch fragmentation, or a KV-cache helper that accepts
-    // tree-depth positions, lands. See Session 23 log.
-    bool use_tree_with_gdn_history = false;
-    if (use_tree && use_gdn_history) {
-        const char * e = std::getenv("DFLASH_TREE_GDN_SINGLE_SEQ");
-        use_tree_with_gdn_history =
-            (e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0);
-        if (use_tree_with_gdn_history) {
-            LOG_INF("DFLASH_TREE_GDN_SINGLE_SEQ=1: experimental "
-                    "single-seq DFS tree-with-GDN-history path "
-                    "(accept rate currently degraded by ROPE "
-                    "position perturbation; see logs/core_architecture"
-                    "/12_vulkan_opt_log.md Session 23)\n");
+    // Single-seq DFS tree-with-GDN-history is the default whenever both
+    // --dflash-tree and --dflash-gdn-history are set. Phase 5 + Session 26
+    // wired this path with tree-depth positions (matching lucebox), the
+    // tree-mode apply_ubatch bypass plumbed via llama_set_tree_mask, and
+    // post-accept compaction via llama_memory_keep_positions_range. The
+    // legacy multi-seq tree path (without GDN history) below is still
+    // selected for `--dflash-tree` alone.
+    const bool use_tree_with_gdn_history = use_tree && use_gdn_history;
+
+    // DDTree Session 30: alt-rate-aware budget heuristic. On prompts whose
+    // generation pattern doesn't reward alt-accept (alt-trajectory drifts
+    // the drafter into a poor-fit region, see Session 29 p1 analysis), the
+    // user-supplied tree budget is dropped to alt_decide_fallback for the
+    // rest of generation once the warmup window's alt rate exceeds
+    // alt_decide_threshold. The decision is made ONCE after the warmup —
+    // a sliding window proved too noisy because alt counts on bad-fit
+    // prompts cluster and re-cluster, and per-iter flips lost the chain-
+    // wins on good-fit prompts.
+    //
+    // Disabled when (a) the user-supplied budget is already small (<=
+    // alt_decide_fallback), (b) tree mode without GDN history (legacy
+    // multi-seq path), or (c) the warmup hasn't completed. Override with
+    // DFLASH_TREE_ALT_RATE_DISABLE=1 to A/B against the fixed-budget
+    // config.
+    constexpr int   alt_decide_warmup       = 3;
+    constexpr float alt_decide_threshold    = 0.34f;  // > 1 alt in 3 iters
+    // Session 30 origin: 16 (block_size for Qwen3-DFlash, validated on
+    // CUDA RTX 5090 via the published 5-prompt sweep numbers).
+    // Session 35 measurement on Strix Halo gfx1151 Vulkan (HE-10,
+    // n_gen=256, Qwen3.5-27B Q4_K_M) showed b=18 strictly dominates
+    // b=16 on the 10-prompt mean (27.86 vs 27.21 t/s). To avoid any
+    // behaviour change for CUDA / NVIDIA / Strix Halo HIP setups
+    // (where Session 30's choice of 16 was validated), the fallback
+    // is left at 16 by default and opt-in via env var:
+    //   DFLASH_ALT_FALLBACK_BUDGET=18  → AMD Vulkan / Strix Halo
+    //   DFLASH_ALT_FALLBACK_BUDGET=22  → keep at user-set (no-op
+    //                                    fallback; effectively
+    //                                    disables the heuristic)
+    // Default 16 preserves the existing tested-on-5090 behaviour.
+    int alt_decide_fallback = 16;
+    if (const char * e = std::getenv("DFLASH_ALT_FALLBACK_BUDGET")) {
+        if (e[0] != '\0') {
+            const int v = std::atoi(e);
+            if (v >= 1) {
+                alt_decide_fallback = v;
+            }
         }
+    }
+    const int       alt_orig_budget         = params.speculative.dflash_tree_budget;
+    const bool      alt_heuristic_active = use_tree_with_gdn_history &&
+                                           alt_orig_budget > alt_decide_fallback &&
+                                           [] {
+                                               const char * e = std::getenv("DFLASH_TREE_ALT_RATE_DISABLE");
+                                               return !(e && e[0] != '\0' && std::strcmp(e, "0") != 0);
+                                           }();
+    int     alt_warmup_count           = 0;  // total iters seen so far during warmup
+    int     alt_warmup_alts            = 0;  // alt-accept iters during warmup
+    bool    alt_locked_to_fallback     = false;
+    int64_t alt_n_downscaled_iters     = 0;
+    if (alt_heuristic_active) {
+        LOG_INF("--dflash-tree-budget %d: alt-rate-aware budget heuristic "
+                "active (warmup=%d iters, threshold=%.2f, fallback=%d). "
+                "Disable with DFLASH_TREE_ALT_RATE_DISABLE=1.\n",
+                alt_orig_budget, alt_decide_warmup, (double) alt_decide_threshold,
+                alt_decide_fallback);
+    }
+
+    // DDTree Session 32: warmup-decide between chain and tree mode. Run the
+    // first wd_warmup_iters in chain mode, measure chain accept yield
+    // (n_accept / n_drafted), then lock to chain or tree for the rest of
+    // generation based on the threshold. The hypothesis from the Session
+    // 29 / 30 cross-prompt data: high chain yield (>= wd_yield_threshold)
+    // means the drafter is hitting well in chain — tree expansion just
+    // adds per-iter cost. Low chain yield means the drafter needs the
+    // tree's alternates to land more tokens — tree wins.
+    //
+    // OPT-IN via DFLASH_TREE_WARMUP_DECIDE=1. Default off because the
+    // warmup chain phase costs peak throughput on tree-friendly prompts
+    // (e.g. HE[0]: tree-22 alone 142 t/s vs warmup-decide 125 t/s) in
+    // exchange for rescuing tree-unfriendly prompts (HE[1]: tree-22
+    // alone 95 t/s vs warmup-decide 143 t/s). Workloads with mixed
+    // prompt distributions where worst-case predictability matters
+    // more than peak should enable.
+    constexpr int   wd_warmup_iters       = 3;
+    constexpr float wd_yield_threshold    = 0.50f;
+    const bool      wd_active = use_tree_with_gdn_history && [] {
+        const char * e = std::getenv("DFLASH_TREE_WARMUP_DECIDE");
+        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    bool runtime_use_tree_with_gdn_history = use_tree_with_gdn_history && !wd_active;
+    bool wd_decision_locked      = !wd_active;
+    int  wd_chain_iters_done     = 0;
+    int  wd_chain_n_accept_base  = 0;
+    int  wd_chain_n_drafted_base = 0;
+    // Session 35: optional tree-budget override when warmup-decide locks
+    // to tree mode. Lets AMD Vulkan / Strix Halo users opt into the
+    // measured-best b=18 budget WITHOUT changing the user-facing
+    // --dflash-tree-budget default (so CUDA / NVIDIA / Strix Halo HIP
+    // call sites that set b=22 keep that exact behaviour). Default 0
+    // means "use --dflash-tree-budget as-is" — fully back-compat.
+    int wd_tree_budget_override = 0;
+    if (const char * e = std::getenv("DFLASH_TREE_WD_TREE_BUDGET")) {
+        if (e[0] != '\0') {
+            const int v = std::atoi(e);
+            if (v >= 1) {
+                wd_tree_budget_override = v;
+            }
+        }
+    }
+    if (wd_active) {
+        LOG_INF("--dflash-tree: DFLASH_TREE_WARMUP_DECIDE=1 — warmup-decide "
+                "active (chain warmup=%d iters, yield threshold=%.2f). "
+                "After warmup, locks to tree mode if chain yield <= "
+                "threshold, else stays in chain.%s\n",
+                wd_warmup_iters, (double) wd_yield_threshold,
+                wd_tree_budget_override > 0
+                    ? string_format(" Tree-side budget override "
+                                    "DFLASH_TREE_WD_TREE_BUDGET=%d active.",
+                                    wd_tree_budget_override).c_str()
+                    : "");
     }
 
     while (true) {
@@ -429,44 +525,83 @@ int main(int argc, char ** argv) {
         // tree path below with:
         //   1. Single-seq batch (all tree tokens in seq 0, in DFS
         //      order, positions = n_past_before + tree.depths[i]).
-        //   2. tree_mask (visibility matrix) for attention isolation.
+        //   2. tree_mask (visibility matrix) for attention isolation
+        //      AND apply_ubatch contiguity-purge bypass on the unified
+        //      KV cache (set_tree_mode_active fires from inside
+        //      llama_set_tree_mask).
         //   3. parent_ids buffer for the GDN + conv tree kernels.
-        //   4. Accept walk (unchanged).
-        //   5. seq_rm(0, n_past_before + 1, -1) — keep the root's
-        //      KV cache slot, drop the rest.
-        //   6. Redecode the accepted draft tokens as a chain so the
-        //      unified KV cache picks up canonical positions
-        //      [n_past_before + 1 .. n_past_before + L]. GDN starts
-        //      from gdn_history[..., t=0, s=0] = state-after-root via
-        //      the per-seq fixup with k_indices = {0}.
+        //   4. Accept walk; record the DFS slot of each committed node.
+        //   5. llama_memory_keep_positions_range(seq=0, accepted, p_min):
+        //      keeps the root + accepted-path cells, drops every other
+        //      verify-batch cell, and renames the kept ones to a
+        //      contiguous monotonic block [n_past_before .. n_past_before+L].
+        //      Recurrent half: rewind seq_pos via the partial-tail API
+        //      (the GDN+conv recurrent state itself is fixed up by the
+        //      next iter's state_select op via k_index = commit_n,
+        //      pointing at gdn_history[deepest accepted DFS slot] which
+        //      was just written by the tree-verify kernel).
         //
-        // Reference: lucebox's single-seq tree-verify pattern — see
-        // lucebox/lucebox-hub/dflash/src/qwen35_target_graph.cpp lines
-        // 820-1040 for the graph side, and the equivalent KV-cache
-        // surgery their drafter applies after accept (MIT-licensed,
-        // Copyright 2026 Lucebox). We diverge on the KV-cache side
-        // because llama.cpp's unified cache doesn't support
-        // selective slot-keep — hence the redecode-the-accept-path
-        // step rather than lucebox's direct slot-rewire.
-        if (use_tree_with_gdn_history) {
+        // Reference: lucebox's single-seq tree-verify pattern uses
+        // position = committed + depth (test_dflash.cpp:2560) and a
+        // slot-rewire compaction (test_dflash.cpp:2783-2818). We
+        // achieve the same end state via keep_positions_range, which
+        // performs the equivalent rewrite within llama.cpp's unified
+        // cache.
+        //
+        // Session 32: gated on runtime_use_tree_with_gdn_history (mutated
+        // by the warmup-decide heuristic). During warmup the spec driver
+        // takes the chain path below to measure chain yield; after the
+        // decision it stays locked to chain or tree for the rest of
+        // generation.
+        if (runtime_use_tree_with_gdn_history) {
+            // Pick this iter's tree budget. If the warmup decided to
+            // lock to the fallback, every subsequent iter uses it.
+            // Session 35: if warmup-decide is active AND a tree-budget
+            // override is set, use that override (lets AMD Vulkan
+            // users opt into b=18 without changing user-set b=22 on
+            // 5090 / HIP). The override is composed AFTER alt-rate
+            // fallback so a smaller alt-fallback still wins.
+            int effective_budget = alt_orig_budget;
+            if (wd_active && wd_decision_locked && wd_tree_budget_override > 0) {
+                effective_budget = wd_tree_budget_override;
+            }
+            if (alt_locked_to_fallback) {
+                effective_budget = alt_decide_fallback;
+                ++alt_n_downscaled_iters;
+            }
+            common_params_speculative params_spec_iter = params_spec;
+            params_spec_iter.dflash_tree_budget = effective_budget;
+
             common_speculative_tree tree =
-                common_speculative_draft_tree(spec, params_spec, prompt_tgt, id_last);
+                common_speculative_draft_tree(spec, params_spec_iter, prompt_tgt, id_last);
 
             const int n_past_before = n_past;
             auto * mem = llama_get_memory(ctx_tgt);
 
             common_batch_clear(batch_tgt);
             llama_tokens ids;
+            // Whether this iter took an alt branch (filled inside the
+            // tree-verify branch below; stays false for empty-fallback
+            // iters which are 1-token chain decodes).
+            bool iter_alt_taken = false;
 
             if (tree.n_nodes == 0) {
                 // Drafter returned no tree. Fall back to a single-
                 // token decode + bonus, same as the legacy tree path.
                 // Clear the parent_ids buffer so any prior
                 // tree-shaped value doesn't leak into the chain
-                // fallback graph's set_input.
+                // fallback graph's set_input. We deliberately leave
+                // gdn_history_k_index{,_per_seq} alone — if the
+                // previous iter was a tree verify, the recurrent slot
+                // currently holds the wrong "last DFS slot" state and
+                // needs the state_select fixup to load gdn_history
+                // [commit_n] = state-after-deepest-accepted before this
+                // 1-token AR/fused decode reads it. After this decode,
+                // n_seq_tokens=1 → AR/fused path writes the correct end
+                // state back to the recurrent slot, so we clear k_index
+                // for the next iter.
                 llama_dflash_set_gdn_history_parent_ids(
                     ctx_tgt, nullptr, 0, 0);
-                llama_dflash_set_gdn_history_k_index(ctx_tgt, -1);
                 common_batch_add(batch_tgt, id_last, n_past_before, { 0 }, /*logits=*/true);
                 {
                     DFLASH_GPU_TIMER("target tree-empty fallback decode", ctx_tgt);
@@ -477,27 +612,28 @@ int main(int argc, char ** argv) {
                 common_sampler_accept(smpl.get(), bonus, true);
                 ids.push_back(bonus);
                 n_past = n_past_before + 1;
+                llama_dflash_set_gdn_history_k_index(ctx_tgt, -1);
             } else {
                 const int n_tree_tokens = 1 + tree.n_nodes;
 
                 // (1) Single-seq DFS-flattened verify batch. All tokens
                 // belong to seq 0; attention separation comes from the
-                // tree_mask we install below.
-                //
-                // Positions are assigned by DFS index (n_past_before + i)
-                // rather than tree depth so the seq's position list stays
-                // strictly monotonic — llama.cpp's KV cache requires this
-                // (find_slot rejects non-consecutive seq positions).
-                // ROPE rotation is therefore slightly perturbed from the
-                // semantically-ideal tree-depth scheme, but with budget
-                // ≤22 and same-depth siblings landing one slot apart, the
-                // perturbation is small in practice and doesn't hurt
-                // acceptance (lucebox's spec driver makes the same
-                // trade-off — see test_dflash.cpp::p = committed + i).
+                // tree_mask we install below. Positions are tree depth
+                // (root at n_past_before, depth-1 children at
+                // n_past_before+1, ...) so ROPE rotation between Q at
+                // depth d_q and K at depth d_k matches the d_q - d_k
+                // relative offset the model was trained on. Sibling
+                // tokens at the same depth share a position; the
+                // duplicate writes are tolerated because
+                // llama_set_tree_mask flips the KV cache into tree mode
+                // (apply_ubatch's contiguity-invariant purge is bypassed
+                // for this verify), and the accept walk's
+                // keep_positions_range below compacts the cache back to
+                // a monotonic block. See Session 24 design notes.
                 common_batch_add(batch_tgt, id_last, n_past_before, { 0 }, /*logits=*/true);
                 for (int i = 0; i < tree.n_nodes; ++i) {
                     common_batch_add(batch_tgt, tree.tokens[i],
-                                     n_past_before + 1 + i,
+                                     n_past_before + tree.depths[i],
                                      { 0 }, /*logits=*/true);
                 }
 
@@ -520,11 +656,17 @@ int main(int argc, char ** argv) {
                 llama_dflash_set_gdn_history_parent_ids(
                     ctx_tgt, parent_ids.data(), n_tree_tokens, 1);
 
-                // No GDN-state fixup on entry: the recurrent slot
-                // already holds the right pre-block state from the
-                // previous iteration (post-redecode-of-accept-path or
-                // post-prefill). Clear any stale value.
-                llama_dflash_set_gdn_history_k_index(ctx_tgt, -1);
+                // GDN-state fixup on entry: leave whatever the previous
+                // iter set. After a tree verify the recurrent slot
+                // holds the kernel's end-of-DFS state (= last DFS
+                // slot's state, NOT the deepest-accepted state), so
+                // the previous iter has set k_index_per_seq = [commit_n]
+                // pointing at gdn_history[commit_n] = state-after-leaf;
+                // the state_select op fires here to overwrite the
+                // recurrent slot before with_history_tree reads it for
+                // the new root. On the very first iter after prefill
+                // the value is still the default (-1) so the op is a
+                // no-op and the prefill state is used unchanged.
 
                 if (dflash_prof_cfg.enabled) dflash_prof::profiler::instance().set_phase("verify");
                 {
@@ -532,7 +674,11 @@ int main(int argc, char ** argv) {
                     llama_decode(ctx_tgt, batch_tgt);
                 }
 
-                // (4) Tree-walk accept: root → ... → commit_n.
+                // (4) Tree-walk accept: root → ... → commit_n. Track
+                // each accepted child's DFS slot so step (5) can hand
+                // keep_positions_range the exact accept-path positions.
+                std::vector<int> accepted_dfs;
+                accepted_dfs.reserve((size_t) tree.n_nodes);
                 int current  = 0;
                 int commit_n = 0;
                 while (true) {
@@ -547,96 +693,75 @@ int main(int argc, char ** argv) {
                     }
                     current  = it->second;
                     commit_n = current;
+                    accepted_dfs.push_back(current);
                 }
 
-                // Always done with the tree from here on — clear the
-                // tree mask and parent_ids so the redecode chain runs
-                // through the (graph-builder-level) tree-mode path but
-                // with the chain fallback parent_ids pattern.
+                // Done with the tree-mode visibility + parent_ids — clear
+                // them now so the next iteration's set_input doesn't
+                // pick up stale tree state. clear_tree_mask also flips
+                // set_tree_mode_active(false) on the KV cache so the
+                // next non-tree decode path sees standard contiguity
+                // semantics.
                 llama_clear_tree_mask(ctx_tgt);
                 llama_dflash_set_gdn_history_parent_ids(
                     ctx_tgt, nullptr, 0, 0);
 
-                // L = depth of deepest accepted leaf in the tree. For
-                // commit_n == 0 (only the bonus sampled, no draft
-                // accepted) L = 0. For commit_n in main-path range L
-                // matches the chain accept count; for alt-accept it
-                // matches the alt's tree depth too.
-                const int L = (commit_n > 0) ? tree.depths[commit_n - 1] : 0;
+                // L = number of accepted children (= depth of deepest
+                // accepted leaf along its tree-ancestry, since the accept
+                // walk descends one tree edge per step).
+                const int L = (int) accepted_dfs.size();
                 const bool alt_accepted = (commit_n > tree.main_path_len);
+                iter_alt_taken = alt_accepted;
 
                 if (alt_accepted) {
                     n_tree_alt_taken++;
                     // Hint the spec state to remap captures on next
-                    // extend, same as the legacy alt-accept path. The
-                    // alt_capture_idx here is the DFS batch slot of
-                    // the accepted leaf (which is what the draft uses
-                    // to slice its target-feat captures).
+                    // extend. The alt_capture_idx is the alt leaf's DFS
+                    // batch slot — the draft uses it to slice its
+                    // target-feat captures from the verify in the
+                    // alt-ancestor order. alt_depth = L (= the number of
+                    // committed tokens along the alt branch).
                     common_speculative_record_alt_accept(spec,
                         /*alt_capture_idx=*/commit_n,
                         /*alt_depth=*/L);
                 }
 
-                // (5) KV-cache surgery: keep only the root's slot at
-                // n_past_before, drop everything past. The recurrent
-                // half's seq_pos rewinds — DFlash partial-tail variant
-                // because the recurrent state is about to be
-                // overwritten by the redecode's state_select fixup.
+                // (5) KV-cache compaction by DFS-write ordinal. Cells
+                // identified by their allocation order (= DFS slot)
+                // disambiguates same-position siblings; the kept
+                // cells are renamed to a contiguous monotonic block
+                // [n_past_before .. n_past_before + L].
                 {
-                    const bool ok = llama_dflash_memory_seq_rm_partial_tail_state_managed_externally(
-                        mem, 0, n_past_before + 1, -1);
+                    std::vector<int32_t> dfs_keep;
+                    dfs_keep.reserve(1 + accepted_dfs.size());
+                    dfs_keep.push_back(0);
+                    for (int dfs : accepted_dfs) {
+                        dfs_keep.push_back((int32_t) dfs);
+                    }
+                    const bool ok = llama_memory_keep_cells_dfs_ordinals_range(
+                        mem, /*seq_id=*/0,
+                        dfs_keep.data(),
+                        (int32_t) dfs_keep.size(),
+                        /*p_min=*/n_past_before);
                     GGML_ASSERT(ok);
                 }
 
-                if (L > 0) {
-                    // (6) Redecode the accepted path. ids[0..L-1] are
-                    // the target-sampled (and tree-matched) draft
-                    // tokens; ids[L] is the bonus that goes into the
-                    // next iter's id_last. We only redecode the L
-                    // accepted tokens — the bonus is anchored on the
-                    // next loop.
-                    //
-                    // GDN starts from gdn_history[..., t=0, s=0] =
-                    // state-after-root via the per-seq fixup; that's
-                    // what was just captured by the tree-verify's
-                    // single-seq DFS pass at DFS slot 0.
-                    int32_t k_root = 0;
-                    llama_dflash_set_gdn_history_k_index_per_seq(
-                        ctx_tgt, &k_root, 1);
-
-                    common_batch_clear(batch_tgt);
-                    for (int i = 0; i < L; ++i) {
-                        // logits=true so the DFlash target-feature
-                        // capture runs on the redecode positions. The
-                        // draft's extend_side_store on the next
-                        // iter consumes captures via
-                        // llama_dflash_force_host_readback; if these
-                        // tokens aren't output positions the readback
-                        // size doesn't match the packed tensor.
-                        common_batch_add(batch_tgt, ids[i],
-                                         n_past_before + 1 + i,
-                                         { 0 }, /*logits=*/true);
-                    }
-                    {
-                        DFLASH_GPU_TIMER("tree accept-path redecode", ctx_tgt);
-                        llama_decode(ctx_tgt, batch_tgt);
-                    }
-
-                    // Post-redecode the recurrent slot holds the right
-                    // state-after-accept-leaf; next iter doesn't need
-                    // a fixup.
-                    llama_dflash_set_gdn_history_k_index(ctx_tgt, -1);
-                    n_past = n_past_before + 1 + L;
-                } else {
-                    // L == 0: only the bonus token was sampled; KV
-                    // beyond the root is gone. Next iter's chain
-                    // decode will load state-after-root via the fixup
-                    // (k_index = 0 picks gdn_history[..., t=0, s=0]).
-                    int32_t k_root = 0;
-                    llama_dflash_set_gdn_history_k_index_per_seq(
-                        ctx_tgt, &k_root, 1);
-                    n_past = n_past_before + 1;
+                // Recurrent half: rewind seq_pos to match the
+                // compacted attention cache. The recurrent state
+                // itself is fixed up by the next iter's state_select
+                // op (k_index = commit_n picks gdn_history[deepest
+                // accepted DFS slot]).
+                {
+                    const bool ok = llama_dflash_memory_seq_rm_partial_tail_state_managed_externally(
+                        mem, 0, n_past_before + 1 + L, -1);
+                    GGML_ASSERT(ok);
                 }
+                {
+                    int32_t k_leaf = commit_n;
+                    llama_dflash_set_gdn_history_k_index_per_seq(
+                        ctx_tgt, &k_leaf, 1);
+                }
+                n_past = n_past_before + 1 + L;
             }
 
             n_tree_iters++;
@@ -645,6 +770,29 @@ int main(int argc, char ** argv) {
 
             n_drafted += tree.n_nodes;
             n_accept  += ids.empty() ? 0 : (int) ids.size() - 1;
+
+            // Drive the warmup-decide heuristic. Empty-fallback iters
+            // (tree.n_nodes == 0, iter_alt_taken stays false) count
+            // against the alt-rate.
+            if (alt_heuristic_active && !alt_locked_to_fallback) {
+                ++alt_warmup_count;
+                if (iter_alt_taken) ++alt_warmup_alts;
+                if (alt_warmup_count >= alt_decide_warmup) {
+                    const float alt_rate = (float) alt_warmup_alts /
+                                           (float) alt_warmup_count;
+                    if (alt_rate > alt_decide_threshold) {
+                        alt_locked_to_fallback = true;
+                        LOG_INF("alt-rate heuristic: warmup %d iters "
+                                "saw %d alts (rate %.2f > %.2f); locking "
+                                "tree budget to %d for the rest of "
+                                "generation.\n",
+                                alt_warmup_count, alt_warmup_alts,
+                                (double) alt_rate,
+                                (double) alt_decide_threshold,
+                                alt_decide_fallback);
+                    }
+                }
+            }
 
             // Commit accepted tokens + bonus to id_last, capped at
             // params.n_predict. Same shape as the legacy tree branch
@@ -692,7 +840,14 @@ int main(int argc, char ** argv) {
         // 5. Rollback: drop alt seqs; for main-accept drop rejected
         //    main-path tail; for alt-accept use commit-35 KV surgery
         //    (seq_rm/seq_cp metadata-only) + record_alt_accept hint.
-        if (use_tree) {
+        //
+        // Session 32: gated on `!use_gdn_history` so this strictly
+        // handles the legacy `--dflash-tree` (without GDN history)
+        // case. When use_gdn_history is set, the use_tree_with_gdn_history
+        // path above owns the tree decision (possibly via the warmup-
+        // decide runtime flag) and we don't want to fall through to the
+        // legacy path during the warmup phase.
+        if (use_tree && !use_gdn_history) {
             common_speculative_tree tree =
                 common_speculative_draft_tree(spec, params_spec, prompt_tgt, id_last);
 
@@ -984,6 +1139,32 @@ int main(int argc, char ** argv) {
         n_drafted += n_draft; // note: we ignore the discarded small drafts
         n_accept  += ids.size() - 1;
 
+        // Session 32 warmup-decide: drive the chain → tree/chain lock.
+        // We tracked n_accept/n_drafted via global counters above; subtract
+        // baselines to get the warmup window's deltas.
+        if (wd_active && !wd_decision_locked) {
+            ++wd_chain_iters_done;
+            if (wd_chain_iters_done >= wd_warmup_iters) {
+                const int warmup_accept  = n_accept  - wd_chain_n_accept_base;
+                const int warmup_drafted = n_drafted - wd_chain_n_drafted_base;
+                const float yield = warmup_drafted > 0
+                                  ? (float) warmup_accept / (float) warmup_drafted
+                                  : 0.0f;
+                const bool stay_chain = yield > wd_yield_threshold;
+                if (!stay_chain) {
+                    runtime_use_tree_with_gdn_history = true;
+                }
+                wd_decision_locked = true;
+                LOG_INF("warmup-decide: chain yield %.2f over %d iters "
+                        "(%d/%d accept/drafted); %s for the rest of "
+                        "generation.\n",
+                        (double) yield, wd_chain_iters_done,
+                        warmup_accept, warmup_drafted,
+                        stay_chain ? "staying in chain mode"
+                                   : "switching to tree mode");
+            }
+        }
+
         // Cap at exactly params.n_predict tokens (per-token check inside
         // the loop) so byte-exact comparison against the greedy reference
         // holds. Without this, the last accepted draft chunk can overshoot
@@ -1063,6 +1244,18 @@ int main(int argc, char ** argv) {
     if (use_tree) {
         LOG_INF("tree iters    = %lld\n", (long long) n_tree_iters);
         LOG_INF("tree alt taken = %lld\n", (long long) n_tree_alt_taken);
+        if (alt_heuristic_active) {
+            LOG_INF("tree budget downscaled iters = %lld / %lld (heuristic: warmup=%d iters, threshold=%.2f, fallback=%d, locked=%s)\n",
+                    (long long) alt_n_downscaled_iters, (long long) n_tree_iters,
+                    alt_decide_warmup, (double) alt_decide_threshold,
+                    alt_decide_fallback,
+                    alt_locked_to_fallback ? "yes" : "no");
+        }
+        if (wd_active) {
+            LOG_INF("warmup-decide: locked to %s after %d warmup iters\n",
+                    runtime_use_tree_with_gdn_history ? "tree" : "chain",
+                    wd_chain_iters_done);
+        }
     }
 
     LOG_INF("\n");

@@ -1,0 +1,78 @@
+#version 450
+
+// DFlash Phase 5 (DDTree) tree-mode variant of the GDN state-history fixup.
+// Extends the chain shader (gated_delta_net_state_select.comp) along two
+// axes:
+//   1. SrcT may be F16 (preprocessor INTER_T_F16=1) — kernel widens to F32
+//      on read. Chain mode keeps the F32 variant byte-exact with Phase 4.
+//   2. k_index may be a [n_seqs] vector (push constant k_index_count > 1):
+//      each seq selects its own k. k_index_count == 1 falls back to the
+//      scalar broadcast path (Phase 4 chain-mode shape).
+//
+// CUDA reference: ggml-cuda/gated_delta_net.cu gated_delta_net_state_select_cuda
+// templated on SrcT ∈ {float, __half}. Same dispatch / layout / clamp rules.
+
+#extension GL_EXT_control_flow_attributes : require
+
+#if defined(INTER_T_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#define SRC_TYPE float16_t
+#else
+#define SRC_TYPE float
+#endif
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+
+layout(push_constant) uniform PushConstants {
+    uint S_v;
+    uint H_v;
+    uint n_tokens;
+    uint n_seqs;
+    uint k_index_count;   // 1 (chain) or n_seqs (tree per-seq)
+};
+
+layout(binding = 0) readonly buffer StateHistory { SRC_TYPE state_history[]; };
+layout(binding = 1) readonly buffer KIndex       { int      k_index[];       };
+layout(binding = 2) readonly buffer Fallback     { float    fallback[];      };
+layout(binding = 3)          buffer Dst          { float    dst[];           };
+
+void main() {
+    const uint seq = gl_WorkGroupID.z;
+    const uint h   = gl_WorkGroupID.y;
+    const uint col = gl_WorkGroupID.x;
+
+    if (col >= S_v || h >= H_v || seq >= n_seqs) {
+        return;
+    }
+
+    const uint slab_elems = S_v * S_v;
+    const uint dst_base   = ((seq * H_v) + h) * slab_elems + col * S_v;
+
+    // Per-seq k_index when count > 1; scalar broadcast when 1.
+    const int k_idx = (k_index_count == 1u) ? k_index[0] : k_index[seq];
+
+    if (k_idx < 0) {
+        // No-fixup path: copy fallback -> dst. Same layout as dst.
+        for (uint r = gl_LocalInvocationID.x; r < S_v; r += BLOCK_SIZE) {
+            dst[dst_base + r] = fallback[dst_base + r];
+        }
+        return;
+    }
+
+    // Defensive clamp.
+    uint t = uint(k_idx);
+    if (t >= n_tokens) {
+        t = n_tokens - 1;
+    }
+
+    const uint src_base =
+        ((seq * n_tokens + t) * H_v + h) * slab_elems + col * S_v;
+
+    for (uint r = gl_LocalInvocationID.x; r < S_v; r += BLOCK_SIZE) {
+        // F32: identity cast; F16: widen on read.
+        dst[dst_base + r] = float(state_history[src_base + r]);
+    }
+}

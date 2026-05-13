@@ -143,6 +143,20 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    void set_tree_mode_active(bool active) override;
+
+    bool keep_positions_range(
+            llama_seq_id      seq_id,
+            const llama_pos * positions,
+            int32_t           n_positions,
+            llama_pos         p_min) override;
+
+    bool keep_cells_dfs_ordinals_range(
+            llama_seq_id    seq_id,
+            const int32_t * dfs_keep,
+            int32_t         n_keep,
+            llama_pos       p_min) override;
+
     //
     // llama_kv_cache specific API
     //
@@ -249,6 +263,11 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // DFlash Phase 5 (DDTree): when true, apply_ubatch's contiguity-invariant
+    // purge step is bypassed. Toggled by llama_context::{set,clear}_tree_mask
+    // via set_tree_mode_active. False on every existing chain-mode path.
+    bool tree_mode_active = false;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;

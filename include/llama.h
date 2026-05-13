@@ -774,6 +774,84 @@ extern "C" {
             llama_pos      p0,
             llama_pos      p1);
 
+    // Phase 5 (DDTree): post-accept compaction of the unified KV cache.
+    //
+    // After a tree-verify decode whose ubatch was written with tree-depth
+    // positions (sibling tree nodes share positions, requiring the
+    // tree-mode bypass set by llama_set_tree_mask), this call restores the
+    // contiguous-positions invariant for the accepted path:
+    //
+    //   - Cells with seq_id and pos in positions[0..n_positions-1] are
+    //     RENAMED to consecutive positions [p_min, p_min + n_positions),
+    //     in the same order as supplied. (Each kept cell's existing
+    //     ext / 2D position is preserved.)
+    //   - Cells with seq_id and pos >= p_min that are NOT in positions[]
+    //     are DROPPED.
+    //   - Cells with pos < p_min (the committed prefix) are UNTOUCHED.
+    //
+    // After the call, the seq is contiguous from p_min through
+    // p_min + n_positions - 1, and subsequent decodes can extend
+    // monotonically as the standard cache expects.
+    //
+    // Semantics on edge cases:
+    //   - n_positions == 0   -> equivalent to seq_rm(seq_id, p_min, -1);
+    //                            returns the same status seq_rm would.
+    //   - seq_id  < 0        -> rejected (returns false). Tree compaction
+    //                            is single-seq by construction.
+    //   - positions == NULL with n_positions > 0 -> rejected.
+    //
+    // For composite memory backends (hybrid, iswa, hybrid+iswa), this
+    // forwards to the attention half. Recurrent memory is a no-op: the
+    // GDN+conv state is fixed up via the Phase 4 state_select / conv-
+    // history-select APIs and needs no separate compaction here.
+    //
+    // Returns true on success, false on the rejection cases above or on
+    // structural errors (cell with the requested seq_id alongside other
+    // seq ids — not supported for the single-seq DDTree compaction).
+    LLAMA_API bool llama_memory_keep_positions_range(
+            llama_memory_t    mem,
+            llama_seq_id      seq_id,
+            const llama_pos * positions,
+            int32_t           n_positions,
+            llama_pos         p_min);
+
+    // Phase 5 (DDTree) variant of llama_memory_keep_positions_range that
+    // identifies cells by their cell-walk ordinal (= the order in which
+    // apply_ubatch wrote them during the immediately-preceding tree-mode
+    // ubatch) instead of by position. This disambiguates sibling cells
+    // that legitimately share a position in the tree-depth-position
+    // verify layout: e.g. main-path token at depth d and an alt-branch
+    // token at depth d both have pos = committed + d, and a position-
+    // based keep call would non-deterministically pick the first cell
+    // (typically the main-path one) — wrong on alt-accept.
+    //
+    //   - dfs_keep[] : strictly-increasing list of ordinals to keep.
+    //                  Ordinal 0 = first cell with seq_id and pos >= p_min
+    //                  in cell-index order (= DFS root). Ordinal i = i-th
+    //                  such cell (= DFS slot i for the verify just written).
+    //   - The kept cells are renamed to consecutive positions
+    //     [p_min, p_min + n_keep) matching the order of dfs_keep[].
+    //   - Cells with seq_id and pos >= p_min whose ordinal is not in
+    //     dfs_keep[] are dropped.
+    //   - Cells with pos < p_min are untouched.
+    //
+    // Edge cases:
+    //   - n_keep == 0     -> equivalent to seq_rm(seq_id, p_min, -1)
+    //   - seq_id < 0      -> rejected
+    //   - dfs_keep == NULL with n_keep > 0 -> rejected
+    //   - dfs_keep[] not strictly increasing -> rejected
+    //   - dfs_keep[] references an ordinal that doesn't exist (cell walk
+    //     ran out before reaching it) -> rejected
+    //
+    // Forwards to the attn half on composite backends; recurrent half is
+    // a no-op (state fixup is handled by the Phase 4/5 state_select APIs).
+    LLAMA_API bool llama_memory_keep_cells_dfs_ordinals_range(
+            llama_memory_t  mem,
+            llama_seq_id    seq_id,
+            const int32_t * dfs_keep,
+            int32_t         n_keep,
+            llama_pos       p_min);
+
     // Phase 4 GDN history fixup: set the per-decode k_index that the
     // target's GDN-layer state_select op consumes at the start of the
     // next llama_decode(ctx_tgt, ...).

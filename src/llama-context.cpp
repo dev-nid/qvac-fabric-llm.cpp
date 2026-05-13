@@ -717,13 +717,27 @@ void llama_context::sched_reserve() {
         // F16; chain mode stays F32 unless explicitly requested so the
         // Session-22 byte-exact regression holds.
         if (tree_mode_alloc && !cparams.dflash_gdn_history_f16) {
-            LLAMA_LOG_INFO(
-                "%s: dflash_gdn_history: auto-promoting persistent "
-                "buffer to F16 (tree mode requires it on 27B; "
-                "n_seqs_max=%lld). Pass --dflash-gdn-history-f16 to "
-                "make this explicit.\n",
-                __func__, (long long) n_seqs_max);
-            cparams.dflash_gdn_history_f16 = true;
+            // Session 33: env var DFLASH_GDN_HISTORY_FORCE_F32 disables the
+            // auto-promote for tree mode (used during the Vulkan tree-port
+            // bring-up to compare F32 paths byte-for-byte vs the CUDA
+            // reference without the F16 conversion step in the loop).
+            const char * force_f32 = std::getenv("DFLASH_GDN_HISTORY_FORCE_F32");
+            const bool force_f32_active =
+                force_f32 && force_f32[0] != '\0' && std::strcmp(force_f32, "0") != 0;
+            if (!force_f32_active) {
+                LLAMA_LOG_INFO(
+                    "%s: dflash_gdn_history: auto-promoting persistent "
+                    "buffer to F16 (tree mode requires it on 27B; "
+                    "n_seqs_max=%lld). Pass --dflash-gdn-history-f16 to "
+                    "make this explicit.\n",
+                    __func__, (long long) n_seqs_max);
+                cparams.dflash_gdn_history_f16 = true;
+            } else {
+                LLAMA_LOG_INFO(
+                    "%s: dflash_gdn_history: DFLASH_GDN_HISTORY_FORCE_F32=1; "
+                    "keeping persistent buffer at F32 in tree mode "
+                    "(diagnostic; uses more VRAM).\n", __func__);
+            }
         }
         const ggml_type gdn_history_type = cparams.dflash_gdn_history_f16
             ? GGML_TYPE_F16 : GGML_TYPE_F32;
@@ -2287,13 +2301,37 @@ void llama_context::set_tree_mask(const uint8_t * visibility, int n_tree_tokens)
     GGML_ASSERT(visibility != nullptr);
     GGML_ASSERT(n_tree_tokens > 0);
 
+    // Session 31: avoid the unconditional gf_res_prev->reset(). The
+    // graph-reuse machinery (llm_graph_result::can_reuse +
+    // llm_graph_params::allow_reuse) already handles tree-mask
+    // transitions correctly:
+    //   - Same-shape verify-after-verify: gparams.tree_mask pointer is
+    //     stable (== &this->tree_mask), ubatch dims match, and the
+    //     attn-kv input class's set_input re-applies the visibility
+    //     matrix on every decode — no rebuild needed.
+    //   - chain → tree or tree → chain: gparams.tree_mask flips
+    //     between nullptr and &tree_mask, allow_reuse's pointer
+    //     comparison forces a rebuild on its own.
+    //   - tree-N → tree-M (different n_tree_tokens): forces a rebuild
+    //     via the n_tokens check in allow_reuse / can_reuse_kq_mask.
+    //
+    // The blunt reset that used to fire here invalidated the cache on
+    // every set_tree_mask call — meaning repeated tree-verifies at the
+    // same budget (the common DDTree-22 hot path) paid a graph-rebuild
+    // cost per iter that they didn't need to. This branch leaves
+    // gf_res_prev alone; on the rare cases where downstream code wants
+    // an eager invalidation it can call gf_res_prev->reset() directly.
     tree_mask.active        = true;
     tree_mask.n_tree_tokens = n_tree_tokens;
     const size_t n2         = (size_t) n_tree_tokens * (size_t) n_tree_tokens;
     tree_mask.visibility.assign(visibility, visibility + n2);
 
-    if (gf_res_prev) {
-        gf_res_prev->reset();
+    // DFlash Phase 5 (DDTree): propagate the tree-active state to the
+    // underlying KV cache so apply_ubatch's contiguity-invariant purge
+    // is bypassed for the next verify decode. The keep_positions_range
+    // post-accept call restores monotonicity.
+    if (memory) {
+        memory->set_tree_mode_active(true);
     }
 }
 
@@ -2302,12 +2340,18 @@ void llama_context::clear_tree_mask() {
         return;
     }
 
+    // Session 31: same rationale as set_tree_mask — no eager
+    // gf_res_prev->reset(). After clear_tree_mask, gparams.tree_mask
+    // becomes nullptr; allow_reuse's pointer comparison on the next
+    // decode rebuilds the graph if the next decode runs in chain
+    // mode, and short-circuits to the previous tree-mode cache if the
+    // next call is another set_tree_mask with the same shape.
     tree_mask.active        = false;
     tree_mask.n_tree_tokens = 0;
     tree_mask.visibility.clear();
 
-    if (gf_res_prev) {
-        gf_res_prev->reset();
+    if (memory) {
+        memory->set_tree_mode_active(false);
     }
 }
 
@@ -5047,6 +5091,30 @@ bool llama_dflash_memory_seq_rm_partial_tail_state_managed_externally(
         return r->seq_rm_partial_tail_state_managed_externally(seq_id, p0, p1);
     }
     return mem->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_memory_keep_positions_range(
+        llama_memory_t    mem,
+        llama_seq_id      seq_id,
+        const llama_pos * positions,
+        int32_t           n_positions,
+        llama_pos         p_min) {
+    if (!mem) {
+        return true;
+    }
+    return mem->keep_positions_range(seq_id, positions, n_positions, p_min);
+}
+
+bool llama_memory_keep_cells_dfs_ordinals_range(
+        llama_memory_t  mem,
+        llama_seq_id    seq_id,
+        const int32_t * dfs_keep,
+        int32_t         n_keep,
+        llama_pos       p_min) {
+    if (!mem) {
+        return true;
+    }
+    return mem->keep_cells_dfs_ordinals_range(seq_id, dfs_keep, n_keep, p_min);
 }
 
 void llama_memory_seq_cp(

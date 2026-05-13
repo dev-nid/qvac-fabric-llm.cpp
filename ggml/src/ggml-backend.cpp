@@ -754,16 +754,7 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
-// DFlash Phase 4 chain mode emits one INPUT-flagged k_index tensor per
-// recurrent layer for both the GDN state fixup and the conv-state fixup
-// (build_dflash_gdn_history_fixup_or_null + qwen35.cpp:~395). On
-// Qwen3.5-27B that's 48 layers * 2 = 96 graph inputs, well past the
-// historic 30-input cap once pipeline parallelism is on (n_copies > 1
-// trips the assert in ggml_backend_sched_split_graph). De-duplicating
-// those k_index inputs across layers is a separable graph refactor;
-// until then, raise the per-scheduler input-tracking limit. The cost
-// is ~2 KiB extra in sched->graph_inputs[] / per-split inputs[].
-#define GGML_SCHED_MAX_SPLIT_INPUTS 256
+#define GGML_SCHED_MAX_SPLIT_INPUTS 30
 #endif
 
 #ifndef GGML_SCHED_MAX_COPIES

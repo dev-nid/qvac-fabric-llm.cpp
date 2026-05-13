@@ -492,57 +492,48 @@ void ggml_cuda_op_gated_delta_net_with_history(ggml_backend_cuda_context & ctx, 
     const bool persist_is_f16 = (src_persist_inter != nullptr) && (src_persist_inter->type == GGML_TYPE_F16);
 
     // Pick the spill target for the kernel:
-    //   - external f32/f16 buffer if provided
-    //   - else the f32 embedded region inside dst
-    // Chain-mode (no persist, no tree) takes the embedded path = byte-exact
-    // with Phase 4.
+    //   - tree mode: write into dst's f32 embedded region; the graph
+    //     builder appends a ggml_cpy(state_history_view, persist_inter)
+    //     after the op (build_delta_net_with_history_tree). The in-kernel
+    //     parent-walk reload then reads from the same buffer the kernel
+    //     just wrote to. Unified with Vulkan to dodge a same-thread
+    //     read-after-write hazard on a separate f16 storage buffer on
+    //     RADV (Session 34); CUDA used to write straight to persist_inter
+    //     with InterT picked from its dtype, but writing to the embedded
+    //     region first + cpy is functionally equivalent and keeps the
+    //     two backends on the same path.
+    //   - chain mode + external persist_inter: keep writing straight
+    //     into persist_inter (Phase 4 chain-compatibility path).
+    //   - chain mode without persist_inter: embedded f32 region only
+    //     (= byte-exact baseline).
     #define GDN_LAUNCH(KDA_VAL)                                                                 \
         do {                                                                                    \
-            if (persist_inter_d == nullptr) {                                                   \
-                /* Chain mode: embedded f32 history; tree mode wouldn't reach here per asserts above. */ \
-                if (tree_mode) {                                                                \
-                    launch_gated_delta_net<KDA_VAL, true, float>(                               \
-                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                    \
-                        embedded_history_d, parent_ids_d,                                       \
-                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
-                } else {                                                                        \
-                    launch_gated_delta_net<KDA_VAL, false, float>(                              \
-                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                    \
-                        embedded_history_d, /*parent_ids=*/nullptr,                             \
-                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
-                }                                                                               \
+            if (tree_mode) {                                                                    \
+                launch_gated_delta_net<KDA_VAL, true, float>(                                   \
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                        \
+                    embedded_history_d, parent_ids_d,                                           \
+                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                     \
+                    sb1, sb2, sb3, neqk1, rq3, scale, stream);                                  \
+            } else if (persist_inter_d == nullptr) {                                            \
+                launch_gated_delta_net<KDA_VAL, false, float>(                                  \
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                        \
+                    embedded_history_d, /*parent_ids=*/nullptr,                                 \
+                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                     \
+                    sb1, sb2, sb3, neqk1, rq3, scale, stream);                                  \
             } else if (persist_is_f16) {                                                        \
                 __half * persist_typed = (__half *) persist_inter_d;                            \
-                if (tree_mode) {                                                                \
-                    launch_gated_delta_net<KDA_VAL, true, __half>(                              \
-                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                    \
-                        persist_typed, parent_ids_d,                                            \
-                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
-                } else {                                                                        \
-                    launch_gated_delta_net<KDA_VAL, false, __half>(                             \
-                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                    \
-                        persist_typed, /*parent_ids=*/nullptr,                                  \
-                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
-                }                                                                               \
+                launch_gated_delta_net<KDA_VAL, false, __half>(                                 \
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                        \
+                    persist_typed, /*parent_ids=*/nullptr,                                      \
+                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                     \
+                    sb1, sb2, sb3, neqk1, rq3, scale, stream);                                  \
             } else {                                                                            \
                 float * persist_typed = (float *) persist_inter_d;                              \
-                if (tree_mode) {                                                                \
-                    launch_gated_delta_net<KDA_VAL, true, float>(                               \
-                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                    \
-                        persist_typed, parent_ids_d,                                            \
-                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
-                } else {                                                                        \
-                    launch_gated_delta_net<KDA_VAL, false, float>(                              \
-                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                    \
-                        persist_typed, /*parent_ids=*/nullptr,                                  \
-                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
-                }                                                                               \
+                launch_gated_delta_net<KDA_VAL, false, float>(                                  \
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                        \
+                    persist_typed, /*parent_ids=*/nullptr,                                      \
+                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                     \
+                    sb1, sb2, sb3, neqk1, rq3, scale, stream);                                  \
             }                                                                                   \
         } while (0)
 
@@ -792,4 +783,136 @@ void ggml_cuda_op_dflash_conv_state_history_select(ggml_backend_cuda_context & c
         hist_d, ki_d, fb_d, dst_d,
         (int) conv_state_rows, (int) conv_history_rows,
         (int) conv_channels, (int) n_seqs);
+}
+
+// DFlash Phase 5 (DDTree) tree-aware variant of dflash_conv_state_history_select.
+//
+// Difference from the chain kernel: when k_idx >= 0, instead of picking
+// conv_history rows [k_idx + 1, k_idx + conv_state_rows), walk parent_ids
+// starting from k_idx to compute virt[K-2..0] (K = conv_state_rows + 1):
+//
+//   virt[K-2] = k_idx;
+//   virt[K-3] = parent_ids[virt[K-2]];     // first ancestor (may be -1 = root)
+//   virt[K-4] = parent_ids[virt[K-3]];     // grandparent (or -1 - 1 = -2)
+//   ...
+//
+// Convention: parent_ids[0] = -1 (root sentinel). Once a virt[k+1] is
+// negative, we keep counting down (virt[k] = virt[k+1] - 1) so the row
+// offset (K-1 + virt[k]) lands in the prev_state region (conv_history
+// rows [0, K-2]). Mirrors lucebox's parent walk in
+// dflash/test/test_dflash.cpp:2733-2738. The result row r maps to
+// virt index r (oldest first), so dst[r, c, s] = conv_history[K-1+virt[r], c, s].
+//
+// For chain-shape verifies (parent_ids[i] == i - 1), virt[r] = k_idx -
+// (K-2-r), giving the same K-1 contiguous rows as the non-tree kernel.
+__global__ void dflash_conv_state_history_select_tree_cuda(
+        const float * conv_history,
+        const int   * k_index_ptr,
+        const int   * parent_ids,
+        const float * fallback,
+        float       * dst,
+        int           conv_state_rows,
+        int           conv_history_rows,
+        int           conv_channels,
+        int           n_seqs,
+        int           parent_ids_n_tokens) {
+    const int seq      = blockIdx.y;
+    const int c_chunk  = blockIdx.x;
+    const int c_lane   = threadIdx.x;
+    const int r        = threadIdx.y;
+    const int c        = c_chunk * blockDim.x + c_lane;
+
+    if (c >= conv_channels) return;
+    if (r >= conv_state_rows) return;
+
+    const int k_idx = *k_index_ptr;
+
+    const int64_t dst_idx =
+        ((int64_t) seq * conv_channels + c) * conv_state_rows + r;
+
+    if (k_idx < 0) {
+        const int64_t fb_idx =
+            ((int64_t) seq * conv_channels + c) * conv_state_rows + r;
+        dst[dst_idx] = fallback[fb_idx];
+        return;
+    }
+
+    // Walk parent chain to compute virt[r]. Each thread independently walks
+    // (cheap: at most conv_state_rows hops, conv_state_rows = 3 for the
+    // standard Qwen3.5 conv_kernel_size = 4). All threads in a block walk
+    // the same path so warp-level execution is uniform.
+    int virt_r = k_idx;
+    for (int hop = conv_state_rows - 1; hop > r; --hop) {
+        if (virt_r >= 0 && virt_r < parent_ids_n_tokens) {
+            virt_r = parent_ids[virt_r];
+        } else {
+            // Already past the root sentinel: keep counting down so the
+            // resulting row offset lands deeper into the prev_state region.
+            virt_r = virt_r - 1;
+        }
+    }
+
+    int row_off = (conv_state_rows /* = K-1 */) + virt_r;
+    if (row_off < 0) row_off = 0;
+    const int row_max_excl = conv_history_rows;
+    if (row_off >= row_max_excl) row_off = row_max_excl - 1;
+
+    const int64_t src_idx =
+        ((int64_t) seq * conv_channels + c) * conv_history_rows + row_off;
+
+    dst[dst_idx] = conv_history[src_idx];
+}
+
+void ggml_cuda_op_dflash_conv_state_history_select_tree(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * src_hist    = dst->src[0];
+    ggml_tensor * src_kindex  = dst->src[1];
+    ggml_tensor * src_fb      = dst->src[2];
+    ggml_tensor * src_parents = dst->src[3];
+
+    GGML_ASSERT(src_hist->type    == GGML_TYPE_F32);
+    GGML_ASSERT(src_kindex->type  == GGML_TYPE_I32);
+    GGML_ASSERT(src_fb            != nullptr);
+    GGML_ASSERT(src_fb->type      == GGML_TYPE_F32);
+    GGML_ASSERT(src_parents       != nullptr);
+    GGML_ASSERT(src_parents->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(src_kindex) == 1);
+    GGML_ASSERT(ggml_is_contiguous(src_hist));
+    GGML_ASSERT(ggml_is_contiguous(src_parents));
+
+    const int64_t conv_state_rows   = dst->ne[0];
+    const int64_t conv_channels     = dst->ne[1];
+    const int64_t n_seqs            = dst->ne[2];
+    const int64_t conv_history_rows = src_hist->ne[0];
+
+    GGML_ASSERT(src_hist->ne[1] == conv_channels);
+    GGML_ASSERT(src_hist->ne[2] == n_seqs);
+    GGML_ASSERT(src_fb->ne[0]   == conv_state_rows);
+    GGML_ASSERT(src_fb->ne[1]   == conv_channels);
+    GGML_ASSERT(src_fb->ne[2]   == n_seqs);
+    GGML_ASSERT(conv_history_rows >= conv_state_rows);
+
+    // parent_ids is shaped [n_tokens, n_seqs] in the spec driver; tree-mode
+    // verify is single-seq so n_seqs == 1, total elements = n_tokens.
+    const int64_t parent_ids_total = ggml_nelements(src_parents);
+    GGML_ASSERT(parent_ids_total > 0);
+
+    const float * hist_d    = (const float *) src_hist->data;
+    const int   * ki_d      = (const int   *) src_kindex->data;
+    const float * fb_d      = (const float *) src_fb->data;
+    const int   * parents_d = (const int   *) src_parents->data;
+    float       * dst_d     = (float       *) dst->data;
+
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int rows_per_block = (int) conv_state_rows;
+    const int channels_per_block = warp_size;
+
+    dim3 grid((conv_channels + channels_per_block - 1) / channels_per_block, n_seqs, 1);
+    dim3 block(channels_per_block, rows_per_block, 1);
+
+    cudaStream_t stream = ctx.stream();
+    dflash_conv_state_history_select_tree_cuda<<<grid, block, 0, stream>>>(
+        hist_d, ki_d, parents_d, fb_d, dst_d,
+        (int) conv_state_rows, (int) conv_history_rows,
+        (int) conv_channels, (int) n_seqs,
+        (int) parent_ids_total);
 }

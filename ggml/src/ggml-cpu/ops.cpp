@@ -10701,6 +10701,20 @@ void ggml_compute_forward_dflash_conv_state_history_select(
         "CUDA backend.");
 }
 
+// ggml_compute_forward_dflash_conv_state_history_select_tree (CUDA-only)
+
+void ggml_compute_forward_dflash_conv_state_history_select_tree(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_UNUSED(params);
+    GGML_UNUSED(dst);
+    GGML_ABORT(
+        "GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT_TREE is CUDA-only "
+        "(DFlash Phase 5 tree-aware conv-state fixup). The CPU backend does "
+        "not implement this op. Disable --dflash-tree or run on a CUDA "
+        "backend.");
+}
+
 // ggml_compute_forward_ssm_conv_tree (CUDA-only; CPU aborts)
 
 void ggml_compute_forward_ssm_conv_tree(

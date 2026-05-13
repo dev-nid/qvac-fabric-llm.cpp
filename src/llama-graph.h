@@ -424,6 +424,7 @@ public:
     virtual ~llm_graph_input_dflash() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * kq_mask     = nullptr; // F32 [n_ctx + n_block, n_block_pad, 1, 1]
     ggml_tensor * kq_mask_cnv = nullptr; // f16 cast for flash_attn
@@ -450,6 +451,7 @@ public:
     virtual ~llm_graph_input_dflash_inline_encode() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * pos_new = nullptr; // I32 [n_outputs]
     ggml_tensor * pos_idx = nullptr; // I64 [n_outputs]
@@ -475,6 +477,7 @@ public:
     virtual ~llm_graph_input_dflash_gdn_fixup() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * k_index = nullptr; // I32 [k_index_count]
 
@@ -494,6 +497,7 @@ public:
     virtual ~llm_graph_input_dflash_gdn_parent_ids() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * parent_ids = nullptr; // I32 [n_tokens, n_seqs]
 
@@ -951,6 +955,20 @@ public:
     // when this is null.
     ggml_tensor * t_dflash_captures_packed = nullptr;
 
+    // Phase 4/5 graph-input dedup: cached shared inputs for the per-
+    // layer GDN history fixup (k_index) and parent_ids tensors. Without
+    // dedup, the qwen35-family builder emits one fresh INPUT-flagged
+    // tensor per recurrent layer per fixup type — 48 GDN layers × 2
+    // fixups = 96 input tensors per build, which trips the historic
+    // GGML_SCHED_MAX_SPLIT_INPUTS = 30 cap on multi-GPU pipeline-
+    // parallel paths (Vulkan default, CUDA when ngpus > 1). All those
+    // tensors carry the same scalar/vector value within a single build,
+    // so a single shared input is correct. Raw pointers; the inputs
+    // themselves are owned by `inputs` and freed via that vector.
+    // Cleared in reset() per build.
+    llm_graph_input_dflash_gdn_fixup     * t_dflash_gdn_fixup_shared      = nullptr;
+    llm_graph_input_dflash_gdn_parent_ids * t_dflash_gdn_parent_ids_shared = nullptr;
+
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
     std::map<llama_seq_id, ggml_tensor*> t_sampled;
@@ -1236,6 +1254,18 @@ struct llm_graph_context {
     ggml_tensor * build_dflash_gdn_parent_ids_or_null(
             int64_t n_tokens,
             int64_t n_seqs) const;
+
+    // Phase 4/5 graph-input dedup helper. Returns the shared k_index
+    // graph input tensor (lazily creating + caching on `res` on first
+    // call within a build, then reusing across layers / call sites).
+    // Returns nullptr when dflash + GDN-history isn't active. Used by
+    // both build_dflash_gdn_history_fixup_or_null (GDN state_select)
+    // and the conv_state_history_select site in the qwen35-family
+    // graph builders. All call sites within one build pass the same
+    // k_index_count (chain: 1; tree: n_seqs); shape mismatch falls
+    // back to a fresh input (defensive — shouldn't happen).
+    ggml_tensor * build_dflash_gdn_fixup_k_index_or_null(
+            int32_t k_index_count) const;
 
     //
     // attention

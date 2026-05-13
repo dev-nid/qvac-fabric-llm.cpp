@@ -3581,9 +3581,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: %d, 0 = Stage B shape). Implies --dflash-tree. Tree composition: "
             "chain seed of min(B, block_size-1) main-path nodes, then uniform round-robin "
             "sibling expansion (rank 1, 2, ..., K-1 across all depths) until B nodes total. "
-            "n_branches = 1 + (B - chain_len). Recommended budgets to try: 16 (Stage B), "
-            "18 (small NL win on Qwen3-4B-DFlash), 22 (Lucebox sweet spot on larger "
-            "targets). Strong-correctness preserved at any budget.",
+            "n_branches = 1 + (B - chain_len). Recommended budgets to try (per measured arch): "
+            "16 (Stage B), 18 (Strix Halo gfx1151 Vulkan sweet spot — see Session 35, "
+            "+12.7%% mean over b=22 on Qwen3.5-27B Q4_K_M HE-10), 22 (Lucebox HIP "
+            "sweet spot on RTX 3090 / 5090 / Strix Halo HIP per their HIP_PERF_PLAN.md). "
+            "Strong-correctness preserved at any budget.",
             params.speculative.dflash_tree_budget),
         [](common_params & params, int value) {
             if (value < 0) {

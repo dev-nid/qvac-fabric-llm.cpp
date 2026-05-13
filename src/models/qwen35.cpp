@@ -386,22 +386,29 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     }
 
     if (use_gdn_history_layer) {
-        // k_index input: created lazily per layer (one input per call) —
-        // same pattern as build_dflash_gdn_history_fixup_or_null. In
-        // chain mode this is a scalar; in tree mode it's sized [n_seqs]
-        // and set_input pulls the per-seq vector.
+        // k_index input: shared with build_dflash_gdn_history_fixup_or_null
+        // via build_dflash_gdn_fixup_k_index_or_null. First call per build
+        // allocates the [k_index_count] I32 tensor + adds it to `inputs`;
+        // subsequent calls reuse the cached pointer. Single shared input
+        // across all 48 layers × 2 fixups instead of 96 separate inputs.
         const int32_t k_index_count =
             use_tree_mode_layer ? (int32_t) n_seqs : 1;
-        auto inp_k = std::make_unique<llm_graph_input_dflash_gdn_fixup>(
-            const_cast<llama_dflash *>(dflash), k_index_count);
-        inp_k->k_index = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, k_index_count);
-        ggml_set_input(inp_k->k_index);
-        cb(inp_k->k_index, "dflash_conv_fixup_k_index", il);
-        ggml_tensor * k_index = inp_k->k_index;
-        res->add_input(std::move(inp_k));
+        ggml_tensor * k_index = build_dflash_gdn_fixup_k_index_or_null(k_index_count);
+        GGML_ASSERT(k_index != nullptr &&
+                    "use_gdn_history_layer gate is on but "
+                    "build_dflash_gdn_fixup_k_index_or_null returned null");
 
-        ggml_tensor * conv_states_fixed = ggml_dflash_conv_state_history_select(
-            ctx0, dflash->conv_history[il], k_index, conv_states);
+        // Phase 5 (DDTree): tree-aware variant walks tree.parents[] to
+        // gather the K-1 ancestor input slots from conv_history (alt-accept
+        // iters where the deepest accepted DFS slot's K-1 ancestors are
+        // not its K-1 DFS predecessors). Chain-mode and chain-shape tree
+        // verifies (parents[i] == i-1 along the main path) degenerate to
+        // the same K-1 contiguous rows as the chain op.
+        ggml_tensor * conv_states_fixed = (use_tree_mode_layer && parent_ids != nullptr)
+            ? ggml_dflash_conv_state_history_select_tree(
+                  ctx0, dflash->conv_history[il], k_index, parent_ids, conv_states)
+            : ggml_dflash_conv_state_history_select(
+                  ctx0, dflash->conv_history[il], k_index, conv_states);
         cb(conv_states_fixed, "conv_states_fixed", il);
         conv_states = conv_states_fixed;
     }

@@ -482,18 +482,20 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     }
 
     if (use_gdn_history_layer) {
+        // Shared k_index input across all layers + both fixup sites
+        // (see build_dflash_gdn_fixup_k_index_or_null docstring).
         const int32_t k_index_count =
             use_tree_mode_layer ? (int32_t) n_seqs : 1;
-        auto inp_k = std::make_unique<llm_graph_input_dflash_gdn_fixup>(
-            const_cast<llama_dflash *>(dflash), k_index_count);
-        inp_k->k_index = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, k_index_count);
-        ggml_set_input(inp_k->k_index);
-        cb(inp_k->k_index, "dflash_conv_fixup_k_index", il);
-        ggml_tensor * k_index = inp_k->k_index;
-        res->add_input(std::move(inp_k));
+        ggml_tensor * k_index = build_dflash_gdn_fixup_k_index_or_null(k_index_count);
+        GGML_ASSERT(k_index != nullptr);
 
-        ggml_tensor * conv_states_fixed = ggml_dflash_conv_state_history_select(
-            ctx0, dflash->conv_history[il], k_index, conv_states);
+        // Phase 5 (DDTree) tree-aware variant — see qwen35.cpp for the
+        // commentary; same dispatch logic.
+        ggml_tensor * conv_states_fixed = (use_tree_mode_layer && parent_ids != nullptr)
+            ? ggml_dflash_conv_state_history_select_tree(
+                  ctx0, dflash->conv_history[il], k_index, parent_ids, conv_states)
+            : ggml_dflash_conv_state_history_select(
+                  ctx0, dflash->conv_history[il], k_index, conv_states);
         cb(conv_states_fixed, "conv_states_fixed", il);
         conv_states = conv_states_fixed;
     }

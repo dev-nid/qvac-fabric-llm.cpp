@@ -22,3 +22,4 @@ void ggml_cuda_op_gated_delta_net_state_select(ggml_backend_cuda_context & ctx, 
 // result tensor. When k_index < 0, copies fallback → result instead
 // (no-op rollback path).
 void ggml_cuda_op_dflash_conv_state_history_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_dflash_conv_state_history_select_tree(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

@@ -1067,6 +1067,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_DELTA_NET_WITH_HISTORY",
     "GATED_DELTA_NET_STATE_SELECT",
     "DFLASH_CONV_STATE_HISTORY_SELECT",
+    "DFLASH_CONV_STATE_HISTORY_SELECT_TREE",
 
     "UNARY",
 
@@ -1084,7 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1181,6 +1182,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "gated_delta_net_with_history(q, k, v, g, beta, s)",
     "gated_delta_net_state_select(state_history, k_index)",
     "dflash_conv_state_history_select(conv_history, k_index)",
+    "dflash_conv_state_history_select_tree(conv_history, k_index, parent_ids)",
 
     "unary(x)",
 
@@ -1198,7 +1200,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6472,6 +6474,49 @@ struct ggml_tensor * ggml_dflash_conv_state_history_select(
     result->src[0] = conv_history;
     result->src[1] = k_index;
     result->src[2] = fallback;
+
+    return result;
+}
+
+// ggml_dflash_conv_state_history_select_tree (DFlash Phase 5 / DDTree)
+
+struct ggml_tensor * ggml_dflash_conv_state_history_select_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * conv_history,
+        struct ggml_tensor  * k_index,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * fallback) {
+    GGML_ASSERT(conv_history->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_index->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(k_index) == 1);
+    GGML_ASSERT(ggml_is_contiguous(conv_history));
+
+    GGML_ASSERT(parent_ids != NULL);
+    GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(parent_ids));
+
+    GGML_ASSERT(fallback != NULL);
+    GGML_ASSERT(fallback->type == GGML_TYPE_F32);
+
+    const int64_t conv_state_rows = fallback->ne[0];
+    const int64_t conv_channels   = fallback->ne[1];
+    const int64_t n_seqs          = fallback->ne[2];
+
+    GGML_ASSERT(conv_history->ne[0] >= conv_state_rows);
+    GGML_ASSERT(conv_history->ne[1] == conv_channels);
+    GGML_ASSERT(conv_history->ne[2] == n_seqs);
+    GGML_ASSERT(fallback->ne[0]   == conv_state_rows);
+    GGML_ASSERT(fallback->ne[1]   == conv_channels);
+    GGML_ASSERT(fallback->ne[2]   == n_seqs);
+
+    const int64_t ne[4] = { conv_state_rows, conv_channels, n_seqs, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne);
+
+    result->op     = GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT_TREE;
+    result->src[0] = conv_history;
+    result->src[1] = k_index;
+    result->src[2] = fallback;
+    result->src[3] = parent_ids;
 
     return result;
 }

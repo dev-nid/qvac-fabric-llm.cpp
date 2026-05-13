@@ -1,0 +1,94 @@
+#version 450
+
+// DFlash Phase 5 (DDTree) tree-aware conv-state fixup. Same shape as the
+// chain variant (dflash_conv_state_history_select), but instead of picking
+// the K-1 contiguous rows ending at k_index, walks tree.parents[] starting
+// from k_index to compute the K-1 ANCESTOR offsets virt[K-2..0]. Each
+// invocation independently performs the walk; the path is uniform across
+// threads in the same workgroup so divergence is bounded.
+//
+// CUDA reference: ggml-cuda/gated_delta_net.cu
+//                 dflash_conv_state_history_select_tree_cuda.
+// Lucebox reference: dflash/test/test_dflash.cpp:2733-2738 (virt[] parent walk).
+//
+// Layout matches the chain variant:
+//   conv_history:  [conv_history_rows, conv_channels, n_seqs] f32 contiguous
+//   parent_ids:    [parent_ids_n_tokens] i32 contiguous (n_tokens × n_seqs
+//                  flattened; tree-mode write is single-seq so n_seqs == 1)
+//   fallback:      [conv_state_rows,    conv_channels, n_seqs] f32
+//   dst:           [conv_state_rows,    conv_channels, n_seqs] f32
+//
+// For chain-shape verifies (parent_ids[i] == i - 1), the walk degenerates
+// to virt[r] = k_idx - (K-2-r), giving the same K-1 contiguous rows the
+// chain variant picks — so output is byte-equal in that case.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint conv_state_rows;
+    uint conv_history_rows;
+    uint conv_channels;
+    uint n_seqs;
+    uint parent_ids_n_tokens;
+};
+
+layout(binding = 0) readonly buffer History  { float conv_history[]; };
+layout(binding = 1) readonly buffer KIndex   { int   k_index[];      };
+layout(binding = 2) readonly buffer Fallback { float fallback[];     };
+layout(binding = 3)          buffer Dst      { float dst[];          };
+layout(binding = 4) readonly buffer Parents  { int   parent_ids[];   };
+
+void main() {
+    const uint seq     = gl_WorkGroupID.y;
+    const uint c_chunk = gl_WorkGroupID.x;
+    const uint c_lane  = gl_LocalInvocationID.x;
+    const uint r       = gl_LocalInvocationID.y;
+    const uint c       = c_chunk * gl_WorkGroupSize.x + c_lane;
+
+    if (c >= conv_channels || r >= conv_state_rows || seq >= n_seqs) {
+        return;
+    }
+
+    const int k_idx = k_index[0];
+    const uint dst_idx = (seq * conv_channels + c) * conv_state_rows + r;
+
+    if (k_idx < 0) {
+        dst[dst_idx] = fallback[dst_idx];
+        return;
+    }
+
+    // Parent walk: start at virt = k_idx and hop (conv_state_rows-1-r) times.
+    // Mirrors the CUDA reference `for (hop = K-2; hop > r; --hop)`:
+    //   - r = conv_state_rows-1 (newest row) → 0 hops, virt = k_idx itself.
+    //   - r = 0 (oldest row, deepest ancestor) → K-2 hops back.
+    //
+    // GLSL [[unroll]] requires a fixed-trip loop; use the explicit early-out
+    // pattern so the loop bound is the spec-constant K-2 (small: usually 3).
+    int virt_r = k_idx;
+    [[unroll]] for (int hop = int(conv_state_rows) - 1; hop > 0; --hop) {
+        if (hop > int(r)) {
+            if (virt_r >= 0 && virt_r < int(parent_ids_n_tokens)) {
+                virt_r = parent_ids[virt_r];
+            } else {
+                // Walked past root sentinel (parent_ids[0] == -1 by
+                // convention). Keep counting down so the resulting row
+                // offset lands deeper into the prev_state region.
+                virt_r = virt_r - 1;
+            }
+        }
+    }
+
+    // Row offset into conv_history: (K-1) + virt_r. virt_r in [-K+1, k_idx];
+    // negative values land in the prev_state region [0, K-2]. Defensive
+    // clamp matches the CUDA kernel.
+    int row_off = int(conv_state_rows) + virt_r;
+    if (row_off < 0)                            row_off = 0;
+    if (row_off >= int(conv_history_rows))      row_off = int(conv_history_rows) - 1;
+
+    const uint src_idx =
+        (seq * conv_channels + c) * conv_history_rows + uint(row_off);
+
+    dst[dst_idx] = conv_history[src_idx];
+}

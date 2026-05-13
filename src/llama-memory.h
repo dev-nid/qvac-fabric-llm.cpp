@@ -117,6 +117,73 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    //
+    // DFlash Phase 5 (DDTree): tree-aware ubatch write path
+    //
+
+    // When tree mode is active on the unified KV cache, apply_ubatch skips
+    // the contiguity-invariant purge step (see src/llama-kv-cache.cpp around
+    // the seq_pos_max_rm loop): the caller has installed a tree mask via
+    // llama_set_tree_mask and accepts ownership of intra-batch position
+    // semantics (sibling tree nodes legitimately share positions). After
+    // the accept walk, the caller restores contiguity by calling
+    // llama_memory_keep_positions_range.
+    //
+    // Default: no-op. Memory backends without a unified KV cache (recurrent)
+    // ignore this; composite backends (hybrid, iswa) propagate to the attn
+    // half. Chain-mode callers never set this, so the bypass is dormant.
+    virtual void set_tree_mode_active(bool active) { (void) active; }
+
+    // Compact the cache to keep only the listed (seq_id, pos) cells in the
+    // suffix [p_min, +inf). Cells with seq_id and pos in positions[0..n-1]
+    // are renamed to consecutive positions starting at p_min, in the order
+    // supplied. Cells with seq_id and pos >= p_min that are NOT in
+    // positions[] are dropped. Cells with pos < p_min are untouched.
+    //
+    // Used by the DDTree spec driver after the accept walk: the verify
+    // batch wrote tree-depth positions (with sibling duplicates); after
+    // the sampler picks the accepted path, this call restores the
+    // monotonic-positions invariant the rest of the cache assumes.
+    //
+    // Edge cases:
+    //   - n_positions == 0 -> equivalent to seq_rm(seq_id, p_min, -1)
+    //   - seq_id < 0       -> rejected (returns false); tree compaction is
+    //                          always single-seq
+    //
+    // Default: no-op returning true (recurrent half is no-op since the
+    // GDN+conv state was already fixed up via the Phase 4 state_select APIs).
+    virtual bool keep_positions_range(
+            llama_seq_id      seq_id,
+            const llama_pos * positions,
+            int32_t           n_positions,
+            llama_pos         p_min) {
+        (void) seq_id; (void) positions; (void) n_positions; (void) p_min;
+        return true;
+    }
+
+    // Tree-mode compaction by cell-walk ordinal (= DFS allocation order from
+    // the immediately-preceding tree-mode ubatch write). Like
+    // keep_positions_range, but disambiguates sibling cells that share a
+    // position: for each cell with seq_id and pos >= p_min encountered in
+    // cell-index order, increment a counter; if counter is in dfs_keep[],
+    // keep the cell (renamed to p_min + rank-in-dfs_keep), else drop.
+    //
+    // dfs_keep[] must be strictly increasing. Tree-mode write is single-seq
+    // by construction (seq_id == 0 in the spec driver), seq_id < 0 is
+    // rejected.
+    //
+    // Defaults to no-op = true (recurrent half: GDN+conv state is fixed up
+    // via the Phase 4/5 state_select / conv_state_history_select APIs and
+    // needs no separate compaction here).
+    virtual bool keep_cells_dfs_ordinals_range(
+            llama_seq_id    seq_id,
+            const int32_t * dfs_keep,
+            int32_t         n_keep,
+            llama_pos       p_min) {
+        (void) seq_id; (void) dfs_keep; (void) n_keep; (void) p_min;
+        return true;
+    }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

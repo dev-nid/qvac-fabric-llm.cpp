@@ -75,6 +75,25 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    void set_tree_mode_active(bool active) override;
+
+    // Tree-aware compaction. Forwards to the attn (kv-cache) half. The
+    // recurrent half is a no-op: in DDTree mode the GDN+conv state is
+    // already correct via the Phase 4 state_select fixup APIs (state_select
+    // copies the chosen-branch slab into the seq's slot before the next
+    // verify), so there's no recurrent-side compaction to perform.
+    bool keep_positions_range(
+            llama_seq_id      seq_id,
+            const llama_pos * positions,
+            int32_t           n_positions,
+            llama_pos         p_min) override;
+
+    bool keep_cells_dfs_ordinals_range(
+            llama_seq_id    seq_id,
+            const int32_t * dfs_keep,
+            int32_t         n_keep,
+            llama_pos       p_min) override;
+
     //
     // llama_memory_hybrid specific API
     //

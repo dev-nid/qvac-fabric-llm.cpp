@@ -267,6 +267,11 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# DFlash Phase 5 (DDTree): tree-aware compaction API.
+# Exercises llama_memory_keep_positions_range against the standard test model.
+llama_build_and_test(test-memory-keep-positions.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-memory-keep-positions PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)

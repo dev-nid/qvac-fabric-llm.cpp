@@ -1,0 +1,96 @@
+#version 450
+
+// DFlash Phase 5 (DDTree) tree-aware SSM conv kernel.
+//
+// For each new-token i in a tree-shaped batch, walks parent_ids K-1 times
+// to assemble the K-tap conv window from this token's ANCESTOR slots
+// (along the tree, not DFS order). Mirrors the chain ssm_conv but the
+// stride-based slide is replaced by a per-token parent walk.
+//
+// CUDA reference: ggml-cuda/ssm-conv.cu ssm_conv_tree_f32 templated on
+// d_conv ∈ {3, 4, 5, 9}. Vulkan exposes d_conv as a spec constant so the
+// pipeline can be compiled for the specific kernel size at runtime.
+//
+// Virtual-slot encoding: a non-negative parent index p (= a token earlier
+// in this same verify call) maps to sx slot (K-1 + p). A parent index of
+// -1 means "before the block" — i.e. one of the K-1 carry-in slots. Each
+// further walk decrements by 1 so virtual slot -k maps to sx slot (K-1-k),
+// indexing into the carry region [0, K-1).
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+layout(constant_id = 1) const uint D_CONV     = 4;  // K
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint src0_nb1;     // bytes per channel row in src0 (sx)
+    uint src0_nb2;     // bytes per seq slab in src0
+    uint src1_nb1;     // bytes per channel row in src1 (c)
+    uint dst_nb0;      // bytes per element in dst dim 0 (= sizeof(float))
+    uint dst_nb1;      // bytes per token row in dst (= d_inner * 4)
+    uint dst_nb2;      // bytes per seq slab in dst
+    uint d_inner;      // nr
+    uint n_t;          // tokens per sequence
+    uint n_s;          // number of sequences
+};
+
+layout(binding = 0) readonly buffer Src0      { float src0[];       };
+layout(binding = 1) readonly buffer Src1      { float src1[];       };
+layout(binding = 2) readonly buffer ParentIds { int   parent_ids[]; };
+layout(binding = 3)          buffer Dst       { float dst[];        };
+
+void main() {
+    const uint seq   = gl_WorkGroupID.x;
+    const uint c_wg  = gl_WorkGroupID.y;
+    const uint lane  = gl_LocalInvocationID.x;
+    const uint chan  = c_wg * BLOCK_SIZE + lane;
+
+    if (seq >= n_s || chan >= d_inner) return;
+
+    // sx base for (seq, chan): start of this (channel, seq)'s row in src0.
+    // src0 layout (matching the CUDA ref) is [ncs, d_inner, n_s] where ncs
+    // = K-1 + n_t and the row stride is src0_nb1 (per channel).
+    const uint src0_chan_base = (seq * src0_nb2 / 4u) + (chan * src0_nb1 / 4u);
+
+    // Conv weights for this channel (K taps).
+    float w[16];  // upper bound for d_conv (CUDA supports up to 9)
+    [[unroll]] for (uint k = 0; k < D_CONV; ++k) {
+        w[k] = src1[chan * (src1_nb1 / 4u) + k];
+    }
+
+    const uint parent_seq_base = seq * n_t;
+
+    // dst layout: [d_inner, n_t, n_s] contiguous, dst_nb0 = sizeof(float).
+    const uint dst_chan_base = (seq * dst_nb2 / 4u) + chan;
+
+    for (uint i = 0; i < n_t; ++i) {
+        // Walk parent chain K-1 times.
+        int ancestors[16];  // upper bound
+        ancestors[D_CONV - 1] = int(i);
+        [[unroll]] for (int k = int(D_CONV) - 2; k >= 0; --k) {
+            const int prev = ancestors[k + 1];
+            int next;
+            if (prev >= 0) {
+                next = parent_ids[parent_seq_base + uint(prev)];
+            } else {
+                next = prev - 1;  // decay into carry region
+            }
+            ancestors[k] = next;
+        }
+
+        float sumf = 0.0;
+        [[unroll]] for (uint k = 0; k < D_CONV; ++k) {
+            const int sx_slot = int(D_CONV) - 1 + ancestors[k];
+            // sx_slot is in [0, K-1+n_t); the chain ref uses src0[chan_row + sx_slot]
+            // where chan_row is per-channel. Sx base above already accounts
+            // for chan/seq.
+            sumf += w[k] * src0[src0_chan_base + uint(sx_slot)];
+        }
+
+        // dst[seq, i, chan]: stride 4 (chan), nb1 = d_inner*4 (per i),
+        // nb2 = n_t*d_inner*4 (per seq).
+        dst[dst_chan_base + i * (dst_nb1 / 4u)] = sumf;
+    }
+}

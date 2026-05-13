@@ -571,6 +571,7 @@ extern "C" {
         GGML_OP_GATED_DELTA_NET_WITH_HISTORY,
         GGML_OP_GATED_DELTA_NET_STATE_SELECT,
         GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT,
+        GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT_TREE,
 
         GGML_OP_UNARY,
 
@@ -2686,6 +2687,37 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * conv_history,
             struct ggml_tensor  * k_index,
+            struct ggml_tensor  * fallback);
+
+    // DFlash Phase 5 (DDTree) tree-aware conv state fixup. Same outputs and
+    // shapes as ggml_dflash_conv_state_history_select, but on alt-accept
+    // iters where the deepest accepted DFS slot's K-1 ancestors aren't its
+    // K-1 DFS predecessors (sibling-tree shape), the kernel walks
+    // tree.parents[] to gather the right K-1 ancestor input slots from
+    // conv_history.
+    //
+    // Inputs:
+    //   conv_history : [conv_kernel_size - 1 + max_tokens, conv_channels, n_seqs] f32
+    //   k_index      : I32 scalar; deepest accepted DFS slot (= commit_n in
+    //                  the spec driver). If k_index < 0, falls through to
+    //                  `fallback` like the chain variant.
+    //   parent_ids   : I32 [n_tokens, n_seqs] (== n_nodes + 1 along the
+    //                  first dim). Walked starting from k_index to build
+    //                  the K-1 ancestor virt[] used as row offsets into
+    //                  conv_history. parent_ids[0] must be -1 (root sentinel).
+    //   fallback     : same shape as the result; selected when k_index < 0.
+    //
+    // For chain-shape verify batches the parent walk degenerates to
+    // virt[k] = k_index - (K-2) + k, i.e. the same K-1 contiguous rows the
+    // chain variant picks. The op is byte-equivalent to
+    // ggml_dflash_conv_state_history_select for chain shapes.
+    //
+    // CUDA only (Phase 5 tree mode is CUDA-only as of Session 24 hand-off).
+    GGML_API struct ggml_tensor * ggml_dflash_conv_state_history_select_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * conv_history,
+            struct ggml_tensor  * k_index,
+            struct ggml_tensor  * parent_ids,
             struct ggml_tensor  * fallback);
 
     // custom operators

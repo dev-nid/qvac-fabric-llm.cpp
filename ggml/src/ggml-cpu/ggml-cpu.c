@@ -2059,6 +2059,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dflash_conv_state_history_select(params, tensor);
             } break;
+        case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT_TREE:
+            {
+                ggml_compute_forward_dflash_conv_state_history_select_tree(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2242,6 +2246,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
         case GGML_OP_GATED_DELTA_NET_STATE_SELECT:
         case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT:
+        case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT_TREE:
             {
                 n_tasks = n_threads;
             } break;
@@ -2964,6 +2969,7 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_GATED_DELTA_NET_STATE_SELECT:
                 case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT:
+                case GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT_TREE:
                     {
                         cur = 0;
                     } break;

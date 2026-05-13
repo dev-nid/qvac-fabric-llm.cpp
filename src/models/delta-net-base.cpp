@@ -588,6 +588,35 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
             ggml_row_size(result->type, S_v * S_v * H_v),
             ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
 
+    // DFlash Phase 5: narrow the dst-embedded state_history region (F32)
+    // into the external persist_inter buffer (F32 or F16) so the next
+    // iter's state_select op can read it. Vulkan's TREE_MODE shader
+    // writes the per-token states into dst's embedded region (same path
+    // as chain mode with WRITE_STATE_HISTORY=1) and reads from it for
+    // the in-kernel parent-walk reload; this cpy fans the state out to
+    // persist_inter after the kernel finishes. The CUDA backend writes
+    // straight into persist_inter from inside the kernel, so its copy
+    // is a no-op (the dst region holds the same values).
+    const size_t r_elt = ggml_type_size(result->type);
+    const size_t state_history_offset_bytes =
+        (size_t) (S_v * H_v * n_tokens * n_seqs + S_v * S_v * H_v * n_seqs) * r_elt;
+    ggml_tensor * state_history_view = ggml_view_4d(ctx0, result,
+            S_v, S_v, H_v, n_tokens * n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * S_v),
+            ggml_row_size(result->type, S_v * S_v * H_v),
+            state_history_offset_bytes);
+    cb(state_history_view, "gdn_state_history_view_tree", il);
+
+    ggml_tensor * gdn_hist_dst = ggml_view_4d(ctx0, persist_inter,
+            S_v, S_v, H_v, n_tokens * n_seqs,
+            persist_inter->nb[1],
+            persist_inter->nb[2],
+            persist_inter->nb[3],
+            0);
+
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, state_history_view, gdn_hist_dst));
+
     return {output, new_state};
 }
 

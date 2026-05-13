@@ -348,6 +348,16 @@ void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+bool llm_graph_input_dflash_inline_encode::can_reuse(const llm_graph_params & params) {
+    // pos_new / pos_idx shape: [n_outputs]. Reusable iff the new build's
+    // n_outputs matches what we allocated for (= n_outputs stored on this
+    // instance, equal to params.n_outputs at the original build site).
+    bool res = true;
+    if (pos_new) res &= (pos_new->ne[0] == params.n_outputs);
+    if (pos_idx) res &= (pos_idx->ne[0] == params.n_outputs);
+    return res;
+}
+
 void llm_graph_input_dflash_inline_encode::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
     if (dflash == nullptr) return;
@@ -376,6 +386,17 @@ void llm_graph_input_dflash_inline_encode::set_input(const llama_ubatch * ubatch
         ggml_backend_tensor_set(pos_idx, buf.data(), 0,
                                 (size_t) n_outputs * sizeof(int64_t));
     }
+}
+
+bool llm_graph_input_dflash_gdn_fixup::can_reuse(const llm_graph_params & params) {
+    // k_index shape: [k_index_count]. The k_index_count chosen at build
+    // time (see build_dflash_gdn_fixup_k_index_or_null) depends only on
+    // whether the build is tree-mode (n_seq_max > 1) and the recurrent
+    // ubatch's n_seqs. Reusable iff the new build would pick the same
+    // k_index_count.
+    GGML_UNUSED(params);
+    if (k_index == nullptr) return false;
+    return k_index->ne[0] == k_index_count;
 }
 
 void llm_graph_input_dflash_gdn_fixup::set_input(const llama_ubatch * ubatch) {
@@ -410,6 +431,17 @@ void llm_graph_input_dflash_gdn_fixup::set_input(const llama_ubatch * ubatch) {
     }
     ggml_backend_tensor_set(k_index, buf.data(), 0,
                             sizeof(int32_t) * (size_t) k_index_count);
+}
+
+bool llm_graph_input_dflash_gdn_parent_ids::can_reuse(const llm_graph_params & params) {
+    // parent_ids shape: [n_tokens, n_seqs]. The build site
+    // (build_dflash_gdn_parent_ids_or_null) sizes from the ubatch's
+    // recurrent dims. Reuse iff those still match.
+    if (parent_ids == nullptr) return false;
+    bool res = true;
+    res &= parent_ids->ne[0] == (int64_t) params.ubatch.n_tokens;
+    res &= parent_ids->ne[1] == (int64_t) params.ubatch.n_seqs;
+    return res;
 }
 
 void llm_graph_input_dflash_gdn_parent_ids::set_input(const llama_ubatch * ubatch) {
@@ -461,6 +493,16 @@ void llm_graph_input_dflash_gdn_parent_ids::set_input(const llama_ubatch * ubatc
         }
     }
     ggml_backend_tensor_set(parent_ids, buf.data(), 0, n_byte);
+}
+
+bool llm_graph_input_dflash::can_reuse(const llm_graph_params & params) {
+    // The kq_mask shape is fixed at construction from n_ctx + n_block (both
+    // recorded on this instance) and the FA-padded n_block dim. Neither
+    // depends on per-decode params, and set_input re-populates the content
+    // on every call. Always reusable as long as the per-build dflash
+    // pointer matches (allow_reuse already enforces that).
+    GGML_UNUSED(params);
+    return true;
 }
 
 void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
@@ -992,6 +1034,8 @@ void llm_graph_result::reset() {
     t_dflash_topk_argmax = nullptr;
     t_dflash_captures.clear();
     t_dflash_captures_packed = nullptr;
+    t_dflash_gdn_fixup_shared      = nullptr;
+    t_dflash_gdn_parent_ids_shared = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -2118,6 +2162,43 @@ void llm_graph_context::build_dflash_capture(ggml_tensor * cur, int il) const {
     }
 }
 
+ggml_tensor * llm_graph_context::build_dflash_gdn_fixup_k_index_or_null(
+        int32_t k_index_count) const {
+    if (!cparams.dflash_gdn_history) return nullptr;
+    if (dflash == nullptr) return nullptr;
+    if (k_index_count <= 0) return nullptr;
+
+    // Dedup: every per-layer fixup site within a single graph build
+    // passes the same k_index_count (chain: 1; tree: n_seqs) and reads
+    // from the same host source (dflash->gdn_history_k_indices, mirrored
+    // by llm_graph_input_dflash_gdn_fixup::set_input). Cache the input
+    // on `res` so the 48 GDN layers × 2 fixup-call-sites share a single
+    // INPUT-flagged tensor instead of allocating 96 of them per build.
+    if (res->t_dflash_gdn_fixup_shared != nullptr) {
+        auto * cached = res->t_dflash_gdn_fixup_shared;
+        if (cached->k_index_count == k_index_count && cached->k_index != nullptr) {
+            return cached->k_index;
+        }
+        // Shape mismatch — shouldn't happen given uniform cparams within
+        // a build. Clear the cache and create fresh; old input stays in
+        // `inputs` and gets reset() at end-of-build.
+        res->t_dflash_gdn_fixup_shared = nullptr;
+    }
+
+    auto inp = std::make_unique<llm_graph_input_dflash_gdn_fixup>(
+        const_cast<llama_dflash *>(dflash), k_index_count);
+    inp->k_index = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, k_index_count);
+    ggml_set_input(inp->k_index);
+    cb(inp->k_index, "dflash_gdn_fixup_k_index_shared", -1);
+
+    ggml_tensor * k_index = inp->k_index;
+    auto * raw = inp.get();
+    res->add_input(std::move(inp));
+    res->t_dflash_gdn_fixup_shared = raw;
+
+    return k_index;
+}
+
 ggml_tensor * llm_graph_context::build_dflash_gdn_history_fixup_or_null(
         int           il,
         ggml_tensor * ssm_states_all_slot_view,
@@ -2142,14 +2223,8 @@ ggml_tensor * llm_graph_context::build_dflash_gdn_history_fixup_or_null(
     const bool tree_mode = (cparams.n_seq_max > 1) && (n_seqs > 1);
     const int32_t k_index_count = tree_mode ? (int32_t) n_seqs : 1;
 
-    auto inp = std::make_unique<llm_graph_input_dflash_gdn_fixup>(
-        const_cast<llama_dflash *>(dflash), k_index_count);
-    inp->k_index = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, k_index_count);
-    ggml_set_input(inp->k_index);
-    cb(inp->k_index, "dflash_gdn_fixup_k_index", il);
-
-    ggml_tensor * k_index = inp->k_index;
-    res->add_input(std::move(inp));
+    ggml_tensor * k_index = build_dflash_gdn_fixup_k_index_or_null(k_index_count);
+    if (k_index == nullptr) return nullptr;
 
     ggml_tensor * gdn_hist = dflash->gdn_history[il];
 
@@ -2178,14 +2253,30 @@ ggml_tensor * llm_graph_context::build_dflash_gdn_parent_ids_or_null(
     // and let the caller fall back to non-tree path on those probes.
     if (n_seqs > dflash->gdn_history_n_seqs_max) return nullptr;
 
+    // Dedup: same host source across all layers in a build (set_input
+    // mirrors dflash->gdn_history_parent_ids). Cache the input on `res`
+    // so all GDN layers share one [n_tokens, n_seqs] tensor instead of
+    // allocating one per layer.
+    if (res->t_dflash_gdn_parent_ids_shared != nullptr) {
+        auto * cached = res->t_dflash_gdn_parent_ids_shared;
+        if (cached->parent_ids != nullptr &&
+            cached->parent_ids->ne[0] == n_tokens &&
+            cached->parent_ids->ne[1] == n_seqs) {
+            return cached->parent_ids;
+        }
+        res->t_dflash_gdn_parent_ids_shared = nullptr;
+    }
+
     auto inp = std::make_unique<llm_graph_input_dflash_gdn_parent_ids>(
         const_cast<llama_dflash *>(dflash));
     inp->parent_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens, n_seqs);
     ggml_set_input(inp->parent_ids);
-    cb(inp->parent_ids, "dflash_gdn_parent_ids", -1);
+    cb(inp->parent_ids, "dflash_gdn_parent_ids_shared", -1);
 
     ggml_tensor * parent_ids = inp->parent_ids;
+    auto * raw = inp.get();
     res->add_input(std::move(inp));
+    res->t_dflash_gdn_parent_ids_shared = raw;
 
     return parent_ids;
 }

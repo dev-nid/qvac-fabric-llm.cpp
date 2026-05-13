@@ -1062,20 +1062,31 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
     //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
     //       ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
-    for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
-        if (seq_pos_max_rm[s] == -1) {
-            continue;
-        }
+    //
+    // DFlash Phase 5 (DDTree): when tree_mode_active, the caller (a tree-aware
+    // spec driver that has installed a tree mask via llama_set_tree_mask)
+    // owns the intra-batch position semantics — sibling tree nodes legitimately
+    // share positions, and the contiguity invariant is restored after the
+    // accept walk via llama_memory_keep_positions_range. Skip the purge here
+    // so duplicate-position writes don't fire the cleanup.
+    if (tree_mode_active) {
+        LLAMA_LOG_DEBUG("%s: tree mode active -- skipping contiguity-invariant purge\n", __func__);
+    } else {
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (seq_pos_max_rm[s] == -1) {
+                continue;
+            }
 
-        GGML_ASSERT(s < seq_to_stream.size());
+            GGML_ASSERT(s < seq_to_stream.size());
 
-        auto & cells = v_cells[seq_to_stream[s]];
+            auto & cells = v_cells[seq_to_stream[s]];
 
-        if (cells.seq_pos_min(s) <= seq_pos_max_rm[s]) {
-            LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
-                    __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
+            if (cells.seq_pos_min(s) <= seq_pos_max_rm[s]) {
+                LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
+                        __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
 
-            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+                seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+            }
         }
     }
 
@@ -1085,6 +1096,257 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+}
+
+void llama_kv_cache::set_tree_mode_active(bool active) {
+    if (tree_mode_active == active) {
+        return;
+    }
+
+    LLAMA_LOG_DEBUG("%s: tree_mode_active %d -> %d\n", __func__, (int) tree_mode_active, (int) active);
+
+    tree_mode_active = active;
+}
+
+bool llama_kv_cache::keep_positions_range(
+        llama_seq_id      seq_id,
+        const llama_pos * positions,
+        int32_t           n_positions,
+        llama_pos         p_min) {
+    // Reject all-seqs ("seq_id < 0"): tree compaction is always single-seq,
+    // and the rename-to-suffix semantics aren't well-defined across seqs.
+    if (seq_id < 0) {
+        LLAMA_LOG_ERROR("%s: seq_id < 0 not supported (got %d)\n", __func__, seq_id);
+        return false;
+    }
+    if (seq_id >= (llama_seq_id) seq_to_stream.size()) {
+        LLAMA_LOG_ERROR("%s: seq_id %d out of range [0, %u)\n",
+                __func__, seq_id, (unsigned) seq_to_stream.size());
+        return false;
+    }
+    if (n_positions < 0) {
+        LLAMA_LOG_ERROR("%s: n_positions < 0 (got %d)\n", __func__, n_positions);
+        return false;
+    }
+    if (n_positions > 0 && positions == nullptr) {
+        LLAMA_LOG_ERROR("%s: positions == nullptr but n_positions = %d\n", __func__, n_positions);
+        return false;
+    }
+
+    // n == 0: drop everything in [p_min, +inf) for this seq. The full
+    // contract becomes equivalent to seq_rm(seq_id, p_min, -1).
+    if (n_positions == 0) {
+        return seq_rm(seq_id, p_min, -1);
+    }
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    // Build pos -> new-pos lookup. Sibling-duplicates in positions[] are
+    // not expected (the accepted path is a single linear sequence by
+    // construction), but if the caller passes one, the FIRST occurrence
+    // wins (later occurrences are silently ignored).
+    std::unordered_map<llama_pos, llama_pos> remap;
+    remap.reserve((size_t) n_positions);
+    for (int32_t i = 0; i < n_positions; ++i) {
+        const llama_pos new_pos = p_min + (llama_pos) i;
+        // emplace ignores duplicates — first wins.
+        remap.emplace(positions[i], new_pos);
+    }
+
+    // Two-pass to avoid intermediate-state collisions on shuffled renames
+    // (e.g. positions[] swaps two existing positions). First PASS records
+    // (cell, new_pos) for kept cells and a drop list for unmatched ones;
+    // second PASS applies. Sibling-duplicate cells (multiple cells at the
+    // same (seq, pos), possible after the tree-mode bypass let multiple
+    // verify-tokens land at the same depth) match positions[] entries
+    // first-cell-wins; later same-pos cells fall through to drop.
+    //
+    // Tree-mode compaction is always single-seq by construction (the spec
+    // driver uses seq_id={0} for the entire verify batch). For safety,
+    // we reject cells that carry seq_id alongside other sequences — the
+    // rename can't preserve those other-seq positions because pos is a
+    // per-cell field. In practice this never trips in the DDTree path.
+    struct rename_t { uint32_t cell_idx; llama_pos new_pos; };
+    std::vector<rename_t> renames;
+    std::vector<uint32_t> drops;
+    renames.reserve((size_t) n_positions);
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
+            continue;
+        }
+        const llama_pos pos = cells.pos_get(i);
+        if (pos < p_min) {
+            continue;
+        }
+
+        if (cells.seq_count(i) != 1) {
+            LLAMA_LOG_ERROR(
+                "%s: cell %u has seq_id %d alongside other seqs (count=%d); "
+                "tree-mode compaction is single-seq only\n",
+                __func__, i, seq_id, cells.seq_count(i));
+            return false;
+        }
+
+        auto it = remap.find(pos);
+        if (it == remap.end()) {
+            drops.push_back(i);
+            continue;
+        }
+
+        renames.push_back({ i, it->second });
+        remap.erase(it);
+    }
+
+    auto & head = v_heads[seq_to_stream[seq_id]];
+    uint32_t new_head = cells.size();
+
+    for (uint32_t i : drops) {
+        cells.rm(i);
+        if (new_head == cells.size()) {
+            new_head = i;
+        }
+    }
+
+    // Apply renames via rm + pos_set + seq_add. Captured ext is preserved.
+    for (const auto & r : renames) {
+        const uint32_t i = r.cell_idx;
+        const llama_kv_cell_ext ext = cells.ext_get(i);
+
+        cells.rm(i);
+        cells.pos_set(i, r.new_pos);
+        cells.ext_set(i, ext);
+        cells.seq_add(i, seq_id);
+    }
+
+    // Mirror seq_rm: if the smallest freed slot is below the current head,
+    // back the head pointer up so the next find_slot reuses the freed
+    // slots without a full ring traversal.
+    if (new_head != cells.size() && new_head < head) {
+        head = new_head;
+    }
+
+    return true;
+}
+
+bool llama_kv_cache::keep_cells_dfs_ordinals_range(
+        llama_seq_id    seq_id,
+        const int32_t * dfs_keep,
+        int32_t         n_keep,
+        llama_pos       p_min) {
+    if (seq_id < 0) {
+        LLAMA_LOG_ERROR("%s: seq_id < 0 not supported (got %d)\n", __func__, seq_id);
+        return false;
+    }
+    if (seq_id >= (llama_seq_id) seq_to_stream.size()) {
+        LLAMA_LOG_ERROR("%s: seq_id %d out of range [0, %u)\n",
+                __func__, seq_id, (unsigned) seq_to_stream.size());
+        return false;
+    }
+    if (n_keep < 0) {
+        LLAMA_LOG_ERROR("%s: n_keep < 0 (got %d)\n", __func__, n_keep);
+        return false;
+    }
+    if (n_keep > 0 && dfs_keep == nullptr) {
+        LLAMA_LOG_ERROR("%s: dfs_keep == nullptr but n_keep = %d\n", __func__, n_keep);
+        return false;
+    }
+
+    // Empty keep set: drop the entire suffix [p_min, +inf).
+    if (n_keep == 0) {
+        return seq_rm(seq_id, p_min, -1);
+    }
+
+    // dfs_keep[] must be strictly increasing.
+    for (int32_t i = 1; i < n_keep; ++i) {
+        if (dfs_keep[i] <= dfs_keep[i - 1]) {
+            LLAMA_LOG_ERROR("%s: dfs_keep[] must be strictly increasing "
+                    "(dfs_keep[%d]=%d <= dfs_keep[%d]=%d)\n",
+                    __func__, i, dfs_keep[i], i - 1, dfs_keep[i - 1]);
+            return false;
+        }
+    }
+    if (dfs_keep[0] < 0) {
+        LLAMA_LOG_ERROR("%s: dfs_keep[0] < 0 (got %d)\n", __func__, dfs_keep[0]);
+        return false;
+    }
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    // Walk cells in cell-index order. The i-th cell with seq_id and
+    // pos >= p_min is at DFS-ordinal i (the apply_ubatch write path is
+    // sequential within a single ubatch for a single seq, so the i-th
+    // such cell is the i-th token of the verify batch in DFS order). If
+    // ordinal == dfs_keep[k_ptr], keep the cell (rename to p_min + k_ptr)
+    // and advance k_ptr; otherwise drop.
+    struct rename_t { uint32_t cell_idx; llama_pos new_pos; };
+    std::vector<rename_t> renames;
+    std::vector<uint32_t> drops;
+    renames.reserve((size_t) n_keep);
+
+    int32_t ordinal = 0;
+    int32_t k_ptr   = 0;
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
+            continue;
+        }
+        const llama_pos pos = cells.pos_get(i);
+        if (pos < p_min) {
+            continue;
+        }
+
+        if (cells.seq_count(i) != 1) {
+            LLAMA_LOG_ERROR(
+                "%s: cell %u has seq_id %d alongside other seqs (count=%d); "
+                "tree-mode compaction is single-seq only\n",
+                __func__, i, seq_id, cells.seq_count(i));
+            return false;
+        }
+
+        if (k_ptr < n_keep && ordinal == dfs_keep[k_ptr]) {
+            renames.push_back({ i, p_min + (llama_pos) k_ptr });
+            ++k_ptr;
+        } else {
+            drops.push_back(i);
+        }
+        ++ordinal;
+    }
+
+    if (k_ptr != n_keep) {
+        LLAMA_LOG_ERROR(
+            "%s: dfs_keep[] requested %d cells but only %d kept; "
+            "dfs_keep[] entries beyond the cell-walk frontier (cells with "
+            "ordinal >= %d don't exist for seq_id %d at p_min %d)\n",
+            __func__, n_keep, k_ptr, ordinal, seq_id, p_min);
+        return false;
+    }
+
+    auto & head = v_heads[seq_to_stream[seq_id]];
+    uint32_t new_head = cells.size();
+
+    for (uint32_t i : drops) {
+        cells.rm(i);
+        if (new_head == cells.size()) {
+            new_head = i;
+        }
+    }
+
+    for (const auto & r : renames) {
+        const uint32_t i = r.cell_idx;
+        const llama_kv_cell_ext ext = cells.ext_get(i);
+
+        cells.rm(i);
+        cells.pos_set(i, r.new_pos);
+        cells.ext_set(i, ext);
+        cells.seq_add(i, seq_id);
+    }
+
+    if (new_head != cells.size() && new_head < head) {
+        head = new_head;
+    }
+
+    return true;
 }
 
 bool llama_kv_cache::get_can_shift() const {
