@@ -268,6 +268,14 @@ int main(int argc, char ** argv) {
             id_last = common_sampler_sample(smpl.get(), ctx_tgt, /*idx=*/-1);
             common_sampler_accept(smpl.get(), id_last, true);
 
+            // accept loop invariant: id_last is already emitted and counted.
+            // non-DFlash satisfies this with id_last = inp.back() (echoed during
+            // prompt playback above); the DFlash anchor is a freshly-sampled new
+            // token, so emit + count it here to keep the loop's first iteration
+            // from silently shifting it into prompt_tgt.
+            LOG("%s", common_token_to_piece(ctx_tgt, id_last).c_str());
+            ++n_predict;
+
             prompt_tgt.assign(inp.begin(), inp.end());
             prompt_tgt.reserve(llama_n_ctx(ctx_tgt));
             n_past = (int) inp.size();

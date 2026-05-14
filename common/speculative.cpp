@@ -1395,11 +1395,22 @@ private:
                 }
                 const int32_t rc = llama_dflash_extend_from_ctx(
                     ctx_dft, ctx_tgt, /*src_row_offset=*/0, n_keep, pos_start);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_dflash_extend_from_ctx failed (rc=%d)\n", __func__, rc);
+                if (rc == 0) {
+                    return true;
+                }
+                // device path unavailable (e.g. last_packed_captures was
+                // cleared because the prefill spanned multiple ubatches and
+                // the per-ubatch tensor only holds a subset of the rows);
+                // fall through to the host path below, which is accumulated
+                // correctly across ubatches.
+                if (captures == nullptr || n_outputs < n_keep) {
+                    LOG_ERR("%s: llama_dflash_extend_from_ctx failed (rc=%d) "
+                            "and no host fallback available (captures=%p, "
+                            "n_outputs=%lld, n_keep=%lld)\n",
+                            __func__, rc, (const void *) captures,
+                            (long long) n_outputs, (long long) n_keep);
                     return false;
                 }
-                return true;
             }
         }
 

@@ -3007,15 +3007,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t n_features       = (int64_t) n_layers * n_embd_per_layer;
 
             if (res->t_dflash_captures_packed != nullptr) {
-                // cache pointer for device-to-device consumers
-                dflash.last_packed_captures = res->t_dflash_captures_packed;
+                // multi-ubatch decode: t_dflash_captures_packed only carries
+                // this ubatch's rows (each ubatch ran a fresh graph), so the
+                // device fast path can't reach the earlier ubatches' captures.
+                // Force host accumulation (overriding skip_host_readback) and
+                // null the device pointer so consumers route through the host
+                // buffer instead of reading a partial tensor.
+                const bool multi_ubatch_decode = (n_outputs_all > n_outputs) || (n_outputs_prev > 0);
 
-                // Skip the D2H entirely when the consumer is going to read
-                // straight from the device tensor via
-                // llama_dflash_extend_from_ctx(). captured_features stays
-                // empty in that case; llama_dflash_get_captured_features
-                // returns nullptr until skip_host_readback is cleared.
-                if (!dflash.skip_host_readback) {
+                dflash.last_packed_captures = multi_ubatch_decode
+                    ? nullptr
+                    : res->t_dflash_captures_packed;
+
+                const bool populate_host_buf = !dflash.skip_host_readback || multi_ubatch_decode;
+
+                if (populate_host_buf) {
                     if (n_outputs_prev == 0) {
                         dflash.captured_features.assign(
                             (size_t) n_outputs_all * (size_t) n_features, 0.0f);
