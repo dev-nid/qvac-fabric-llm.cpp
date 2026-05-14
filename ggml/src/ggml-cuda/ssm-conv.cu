@@ -197,7 +197,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 }
 
 // ===========================================================================
-// DFlash Phase 5: tree-mode ssm_conv kernel.
+// DFlash tree-mode ssm_conv kernel.
 //
 // For each new-token i in a tree-shaped batch, walks the parent chain K-1
 // times via parent_ids[] to assemble the K-tap conv window from this token's
@@ -213,7 +213,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 // Each successive walk beyond -1 decrements by 1, so virtual slot -k maps to
 // sx slot (K-1 - k), which indexes into the carry region [0, K-1).
 //
-// Mirrors lucebox/sglang's causal_conv1d HAS_EAGLE_TREE_CUSTOM_ATTN_MASK
+// Equivalent to sglang's causal_conv1d HAS_EAGLE_TREE_CUSTOM_ATTN_MASK
 // path. No bias / silu fusion: callers tag tree mode via a separate op so
 // the chain-mode fusion pipeline stays untouched.
 // ===========================================================================

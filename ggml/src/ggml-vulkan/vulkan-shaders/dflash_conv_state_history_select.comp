@@ -1,7 +1,7 @@
 #version 450
 
-// DFlash Phase 4 conv-state fixup. Picks `conv_state_rows` contiguous rows
-// of conv_history starting at offset (k_index + 1) along dim 0; on
+// DFlash chain-mode conv-state fixup. Picks `conv_state_rows` contiguous
+// rows of conv_history starting at offset (k_index + 1) along dim 0; on
 // k_index < 0 falls back to copying the `fallback` tensor.
 // CUDA reference: ggml-cuda/gated_delta_net.cu
 //                 dflash_conv_state_history_select_cuda.

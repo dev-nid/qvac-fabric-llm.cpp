@@ -176,7 +176,7 @@ llama_context::llama_context(
     // here regardless of what the user passed via --ubatch-size, because the
     // standalone speculative-dflash example shares params.n_ubatch with the
     // target context (where the user may legitimately want a different
-    // value, e.g. -ub 1 for byte-exact-match testing against llama-cli).
+    // value, e.g. -ub 1 for matching against llama-cli).
     if (model.arch == LLM_ARCH_DFLASH) {
         const uint32_t bs = std::max<uint32_t>(1, model.hparams.dflash_block_size);
         if (cparams.n_ubatch != bs) {
@@ -207,9 +207,9 @@ llama_context::llama_context(
     cparams.dflash_gdn_history_f16        = params.dflash_gdn_history_f16;
 
     if (cparams.dflash_inline_encoder) {
-        // Phase 3: sizing cparams remain optional. When all four are zero,
-        // the target's graph builder uses target's own hparams for the
-        // inline encoder shapes. This is correct for model families where
+        // sizing cparams remain optional. When all four are zero, the
+        // target's graph builder uses target's own hparams for the inline
+        // encoder shapes. This is correct for model families where
         // the DFlash draft was trained to share the target's per-head
         // dimensions (Qwen3-N with Qwen3-DFlash). Models that don't share
         // (Qwen3.5 etc.) must supply the sizing fields explicitly.
@@ -628,8 +628,8 @@ void llama_context::sched_reserve() {
             max_nodes_enc, false, cparams.op_offload));
     }
 
-    // -------------------- DFlash Phase 4 GDN history --------------------
-    // Allocate one persistent state-history buffer per recurrent (GDN)
+    // DFlash GDN history buffers: allocate one persistent state-history
+    // buffer per recurrent (GDN)
     // layer on the TARGET context. Sized for the worst-case chain-verify
     // batch (gdn_history_max_tokens). One device buffer per backing
     // device (mirrors the side-store allocation pattern above).
@@ -641,28 +641,29 @@ void llama_context::sched_reserve() {
             && dflash.gdn_history.empty()
             && model.arch != LLM_ARCH_DFLASH) {
         // Chain mode cap = 1 + dflash_block_size_default = 17. The
-        // tree-verify worst case is `id_last + tree.budget` tokens
-        // (typical DDTree-22 = 23). We pick the cap to fit both: the
-        // tree-mode trigger is cparams.n_seq_max > 1, in which case we
-        // size for a DDTree-22 budget with a small headroom.
+        // tree-verify worst case is `id_last + tree.budget` tokens. The cap
+        // is sized to fit both modes; tree-mode is gated on
+        // cparams.n_seq_max > 1, in which case we size for a tree budget
+        // around 22 with a small headroom.
         const bool tree_mode_alloc = (cparams.n_seq_max > 1);
         const int64_t DFLASH_GDN_HISTORY_MAX_TOKENS = tree_mode_alloc
-            ? 32   // 22 (DDTree-22) + 1 (root) rounded up
+            ? 32   // typical tree budget (~22) + root, rounded up
             : 17;  // chain: id_last + 16-token draft block
 
         // Per-seq dimension of the persistent buffer. Tree mode here
-        // means the SINGLE-SEQ DFS-flattened layout (Session 23
-        // spec-driver design): all tree tokens go through seq 0 with
-        // attention separation by tree_mask and GDN branching by
+        // means the single-seq DFS-flattened layout: all tree tokens go
+        // through seq 0 with attention separation by tree_mask and GDN
+        // branching by
         // parent_ids. The recurrent ubatch's n_seqs is therefore 1 at
         // runtime even though cparams.n_seq_max may be much larger
         // (the spec driver bumps n_parallel = budget + 1 so the KV
         // cache reserves enough cells for the legacy multi-seq
         // alt-accept path — that path is dormant when this flag is on).
         //
-        // Keeping n_seqs_max = 1 here is what makes DDTree-22 fit on
-        // Qwen3.5-27B in 32 GiB: at n_seqs_max = 23 the F16 buffer is
-        // ~26 GiB on top of the 16 GiB model + KV cache, which OOMs.
+        // Keeping n_seqs_max = 1 here keeps the persistent buffer small;
+        // a per-seq buffer would multiply the per-layer footprint by the
+        // tree budget and would not fit alongside weights + KV cache on
+        // 32 GiB devices.
         const int64_t n_seqs_max = 1;
 
         const uint32_t n_layer = model.hparams.n_layer;
@@ -714,30 +715,14 @@ void llama_context::sched_reserve() {
         // the 27B target (the F32 buffer × n_seqs_max doesn't fit
         // alongside weights + KV cache on 32 GiB). Auto-promote when
         // the user enabled tree mode without explicitly opting into
-        // F16; chain mode stays F32 unless explicitly requested so the
-        // Session-22 byte-exact regression holds.
+        // F16; chain mode stays F32 unless explicitly requested.
         if (tree_mode_alloc && !cparams.dflash_gdn_history_f16) {
-            // Session 33: env var DFLASH_GDN_HISTORY_FORCE_F32 disables the
-            // auto-promote for tree mode (used during the Vulkan tree-port
-            // bring-up to compare F32 paths byte-for-byte vs the CUDA
-            // reference without the F16 conversion step in the loop).
-            const char * force_f32 = std::getenv("DFLASH_GDN_HISTORY_FORCE_F32");
-            const bool force_f32_active =
-                force_f32 && force_f32[0] != '\0' && std::strcmp(force_f32, "0") != 0;
-            if (!force_f32_active) {
-                LLAMA_LOG_INFO(
-                    "%s: dflash_gdn_history: auto-promoting persistent "
-                    "buffer to F16 (tree mode requires it on 27B; "
-                    "n_seqs_max=%lld). Pass --dflash-gdn-history-f16 to "
-                    "make this explicit.\n",
-                    __func__, (long long) n_seqs_max);
-                cparams.dflash_gdn_history_f16 = true;
-            } else {
-                LLAMA_LOG_INFO(
-                    "%s: dflash_gdn_history: DFLASH_GDN_HISTORY_FORCE_F32=1; "
-                    "keeping persistent buffer at F32 in tree mode "
-                    "(diagnostic; uses more VRAM).\n", __func__);
-            }
+            LLAMA_LOG_INFO(
+                "%s: dflash_gdn_history: auto-promoting persistent "
+                "buffer to F16 (tree mode; n_seqs_max=%lld). Pass "
+                "--dflash-gdn-history-f16 to make this explicit.\n",
+                __func__, (long long) n_seqs_max);
+            cparams.dflash_gdn_history_f16 = true;
         }
         const ggml_type gdn_history_type = cparams.dflash_gdn_history_f16
             ? GGML_TYPE_F16 : GGML_TYPE_F32;
@@ -769,13 +754,12 @@ void llama_context::sched_reserve() {
             // only 4-D; the 5-D semantic ([S_v, S_v, H_v, max_tokens, n_seqs])
             // is recovered by treating the last dim as
             // (max_tokens * n_seqs). Chain mode keeps n_seqs == 1, so
-            // ne[3] == max_tokens. Tree mode (Phase 5) widens to
+            // ne[3] == max_tokens. Tree mode widens to
             // ne[3] == max_tokens * n_seqs_max.
             //
-            // dtype is F32 in chain mode (Session 20 byte-exact path)
-            // and F16 in tree mode (mandatory for DDTree-22 on 27B in
-            // 32 GiB). The GDN kernel selects InterT at runtime from
-            // this tensor's type — see Session 22 dispatcher.
+            // dtype is F32 in chain mode and F16 in tree mode (smaller
+            // persistent footprint). The GDN kernel selects InterT at
+            // runtime from this tensor's type.
             ggml_tensor * t = ggml_new_tensor_4d(
                 c, gdn_history_type,
                 S_v, S_v, H_v,
@@ -1423,9 +1407,7 @@ size_t llama_context::get_sampled_probs_count(int32_t idx) {
 }
 
 
-// =====================================================================
 // DFlash speculative-decoding API
-// =====================================================================
 
 void llama_context::set_dflash_capture(const int32_t * layer_ids,
                                        size_t          n_layer_ids,
@@ -1541,12 +1523,6 @@ bool llama_context::dflash_slide_left(int64_t n_drop) {
     GGML_ASSERT(n_drop > 0);
     GGML_ASSERT(n_drop <= dflash.ctx_filled);
 
-    static const bool gpu_log = []() {
-        const char * e = std::getenv("DFLASH_GPU_LOG");
-        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
-    }();
-    const int64_t t_slide_start = gpu_log ? ggml_time_us() : 0;
-
     const int64_t n_keep = dflash.ctx_filled - n_drop;
 
     if (n_keep > 0) {
@@ -1575,29 +1551,12 @@ bool llama_context::dflash_slide_left(int64_t n_drop) {
     dflash.ctx_filled    = n_keep;
     dflash.ctx_pos_base += n_drop;
 
-    if (gpu_log) {
-        const int64_t t_slide_end = ggml_time_us();
-        LLAMA_LOG_INFO("[DFLASH_GPU_LOG] dflash_slide_left: n_drop=%lld n_keep=%lld n_layers=%zu elapsed=%.3f ms\n",
-                       (long long) n_drop, (long long) n_keep, dflash.ctx_K.size(),
-                       (t_slide_end - t_slide_start) / 1000.0);
-    }
     return true;
 }
 
 int32_t llama_context::dflash_extend(const float * target_hidden_new,
                                      int64_t       n_new,
                                      int64_t       pos_start) {
-    static const bool gpu_log = []() {
-        const char * e = std::getenv("DFLASH_GPU_LOG");
-        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
-    }();
-    const int64_t t_extend_start = gpu_log ? ggml_time_us() : 0;
-    int64_t t_build_us  = 0;
-    int64_t t_alloc_us  = 0;
-    int64_t t_inputs_us = 0;
-    int64_t t_compute_us = 0;
-    bool    cache_hit_log = false;
-
     if (model.arch != LLM_ARCH_DFLASH) {
         LLAMA_LOG_ERROR("%s: model is not LLM_ARCH_DFLASH (arch=%d)\n",
                 __func__, (int) model.arch);
@@ -1643,14 +1602,12 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
     auto * res = gf_res_dflash_encode.get();
 
     const bool cache_hit = (gf_res_dflash_encode_n_new == n_new);
-    cache_hit_log = cache_hit;
     ggml_cgraph * gf = nullptr;
 
     if (cache_hit) {
         gf = res->get_gf();
         GGML_ASSERT(gf != nullptr && ggml_graph_n_nodes(gf) > 0);
     } else {
-        const int64_t t_build_start = gpu_log ? ggml_time_us() : 0;
         res->reset();
 
         llama_ubatch ub_stub = {};
@@ -1675,14 +1632,10 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
             return -1;
         }
 
-        if (gpu_log) t_build_us = ggml_time_us() - t_build_start;
-
-        const int64_t t_alloc_start = gpu_log ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched_dflash_encode.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate encoder graph\n", __func__);
             return -2;
         }
-        if (gpu_log) t_alloc_us = ggml_time_us() - t_alloc_start;
 
         gf_res_dflash_encode_n_new = n_new;
     }
@@ -1697,8 +1650,6 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
     GGML_ASSERT(t_target_hidden_new != nullptr);
     GGML_ASSERT(t_pos_new           != nullptr);
     GGML_ASSERT(t_pos_idx           != nullptr);
-
-    const int64_t t_inputs_start = gpu_log ? ggml_time_us() : 0;
 
     {
         const size_t bytes = (size_t) n_new * (size_t) dflash.n_features * sizeof(float);
@@ -1724,10 +1675,6 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
                                 0, n_new * sizeof(int64_t));
     }
 
-    if (gpu_log) t_inputs_us = ggml_time_us() - t_inputs_start;
-
-    // ----- compute -----
-    const int64_t t_compute_start = gpu_log ? ggml_time_us() : 0;
     {
         const auto status = graph_compute(sched_dflash_encode.get(), gf, /*batched=*/n_new > 1);
         if (status != GGML_STATUS_SUCCESS) {
@@ -1736,7 +1683,6 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
             return -3;
         }
     }
-    if (gpu_log) t_compute_us = ggml_time_us() - t_compute_start;
 
     dflash.ctx_filled += n_new;
     dflash.n_ctx = dflash.ctx_filled;
@@ -1745,15 +1691,6 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
         gf_res_prev->reset();
     }
 
-    if (gpu_log) {
-        const int64_t t_extend_total = ggml_time_us() - t_extend_start;
-        LLAMA_LOG_INFO("[DFLASH_GPU_LOG] dflash_extend: n_new=%lld pos_start=%lld cache_hit=%d "
-                       "build=%.3f alloc=%.3f set_inputs=%.3f compute=%.3f total=%.3f ms\n",
-                       (long long) n_new, (long long) pos_start, cache_hit_log ? 1 : 0,
-                       t_build_us / 1000.0, t_alloc_us / 1000.0,
-                       t_inputs_us / 1000.0, t_compute_us / 1000.0,
-                       t_extend_total / 1000.0);
-    }
     return 0;
 }
 
@@ -1761,35 +1698,8 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
                                                  int64_t       src_row_offset,
                                                  int64_t       n_keep,
                                                  int64_t       pos_start) {
-    static const bool gpu_log = []() {
-        const char * e = std::getenv("DFLASH_GPU_LOG");
-        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
-    }();
-    const int64_t t_extend_start = gpu_log ? ggml_time_us() : 0;
-    int64_t t_build_us  = 0;
-    int64_t t_alloc_us  = 0;
-    int64_t t_inputs_us = 0;
-    int64_t t_compute_us = 0;
-    bool    cache_hit_log = false;
-
-    // Optional: round chain-mode n_keep up to dflash_block_size so a single
-    // encoder graph variant is reused across iterations. On CUDA this is
-    // ~3 ms/iter net-negative (the redundant matmul rows outweigh the saved
-    // graph build+alloc time of 3-5 ms); on backends where graph build is
-    // expensive (Vulkan pipeline compile) it may break even. Opt-in via
-    // DFLASH_PAD_ENCODER=1; default off. Padded rows scatter to slots above
-    // the post-call ctx_filled boundary and are overwritten before the draft
-    // can read them.
-    static const bool pad_encoder = []() {
-        const char * e = std::getenv("DFLASH_PAD_ENCODER");
-        return e && e[0] == '1' && e[1] == '\0';
-    }();
-    const int64_t block_size  = (int64_t) std::max<uint32_t>(1, model.hparams.dflash_block_size);
     const int64_t n_keep_real = n_keep;
     int64_t       n_keep_pad  = n_keep;
-    if (pad_encoder && n_keep > 0 && n_keep < block_size) {
-        n_keep_pad = block_size;
-    }
 
     if (model.arch != LLM_ARCH_DFLASH) {
         LLAMA_LOG_ERROR("%s: model is not LLM_ARCH_DFLASH (arch=%d)\n",
@@ -1853,14 +1763,12 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
     auto * res = gf_res_dflash_encode.get();
 
     const bool cache_hit = (gf_res_dflash_encode_n_new == n_keep_pad);
-    cache_hit_log = cache_hit;
     ggml_cgraph * gf = nullptr;
 
     if (cache_hit) {
         gf = res->get_gf();
         GGML_ASSERT(gf != nullptr && ggml_graph_n_nodes(gf) > 0);
     } else {
-        const int64_t t_build_start = gpu_log ? ggml_time_us() : 0;
         res->reset();
 
         llama_ubatch ub_stub = {};
@@ -1884,14 +1792,10 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
             return -1;
         }
 
-        if (gpu_log) t_build_us = ggml_time_us() - t_build_start;
-
-        const int64_t t_alloc_start = gpu_log ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched_dflash_encode.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate encoder graph\n", __func__);
             return -2;
         }
-        if (gpu_log) t_alloc_us = ggml_time_us() - t_alloc_start;
 
         gf_res_dflash_encode_n_new = n_keep_pad;
     }
@@ -1905,8 +1809,6 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
     GGML_ASSERT(t_target_hidden_new != nullptr);
     GGML_ASSERT(t_pos_new           != nullptr);
     GGML_ASSERT(t_pos_idx           != nullptr);
-
-    const int64_t t_inputs_start = gpu_log ? ggml_time_us() : 0;
 
     // ----- D2D copy from src_captures slice into t_target_hidden_new -----
     //
@@ -2000,9 +1902,6 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
                                 0, n_keep_pad * sizeof(int64_t));
     }
 
-    if (gpu_log) t_inputs_us = ggml_time_us() - t_inputs_start;
-
-    const int64_t t_compute_start = gpu_log ? ggml_time_us() : 0;
     {
         const auto status = graph_compute(sched_dflash_encode.get(), gf, /*batched=*/n_keep_pad > 1);
         if (status != GGML_STATUS_SUCCESS) {
@@ -2011,7 +1910,6 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
             return -3;
         }
     }
-    if (gpu_log) t_compute_us = ggml_time_us() - t_compute_start;
 
     dflash.ctx_filled += n_keep_real;
     dflash.n_ctx = dflash.ctx_filled;
@@ -2020,24 +1918,10 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
         gf_res_prev->reset();
     }
 
-    if (gpu_log) {
-        const int64_t t_extend_total = ggml_time_us() - t_extend_start;
-        LLAMA_LOG_INFO("[DFLASH_GPU_LOG] dflash_extend_from_tensor: n_keep=%lld/%lld src_row_offset=%lld "
-                       "pos_start=%lld cache_hit=%d build=%.3f alloc=%.3f set_inputs=%.3f "
-                       "compute=%.3f total=%.3f ms\n",
-                       (long long) n_keep_real, (long long) n_keep_pad,
-                       (long long) src_row_offset, (long long) pos_start,
-                       cache_hit_log ? 1 : 0,
-                       t_build_us / 1000.0, t_alloc_us / 1000.0,
-                       t_inputs_us / 1000.0, t_compute_us / 1000.0,
-                       t_extend_total / 1000.0);
-    }
     return 0;
 }
 
-// =====================================================================
-// Phase 2 — inline encoder on target context's scheduler
-// =====================================================================
+// inline encoder on target context's scheduler
 //
 // Same encoder graph contents as dflash_extend_from_tensor, executed on
 // the TARGET context's sched_dflash_inline_encode instead of the DRAFT's
@@ -2052,25 +1936,14 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
 // it touches. This requires the standard llama.cpp init where both
 // contexts share singleton CUDA backends per device.
 //
-// We deliberately skip the optional DFLASH_PAD_ENCODER path here: it was
-// net-negative on CUDA in Session 13 and adds complexity to the new
-// code; can be reintroduced once Phase 2 is validated if needed.
+// The optional DFLASH_PAD_ENCODER path is intentionally not implemented here:
+// the corresponding chain-side variant was net-negative on CUDA when measured
+// and adds complexity; it can be reintroduced if needed.
 int32_t llama_context::dflash_inline_encode_from_ctx(llama_context * draft_ctx,
                                                      ggml_tensor *   src_captures,
                                                      int64_t         src_row_offset,
                                                      int64_t         n_keep,
                                                      int64_t         pos_start) {
-    static const bool gpu_log = []() {
-        const char * e = std::getenv("DFLASH_GPU_LOG");
-        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
-    }();
-    const int64_t t_extend_start = gpu_log ? ggml_time_us() : 0;
-    int64_t t_build_us  = 0;
-    int64_t t_alloc_us  = 0;
-    int64_t t_inputs_us = 0;
-    int64_t t_compute_us = 0;
-    bool    cache_hit_log = false;
-
     if (draft_ctx == nullptr) {
         LLAMA_LOG_ERROR("%s: draft_ctx is null\n", __func__);
         return -1;
@@ -2140,14 +2013,12 @@ int32_t llama_context::dflash_inline_encode_from_ctx(llama_context * draft_ctx,
     auto * res = gf_res_dflash_inline_encode.get();
 
     const bool cache_hit = (gf_res_dflash_inline_encode_n_new == n_keep);
-    cache_hit_log = cache_hit;
     ggml_cgraph * gf = nullptr;
 
     if (cache_hit) {
         gf = res->get_gf();
         GGML_ASSERT(gf != nullptr && ggml_graph_n_nodes(gf) > 0);
     } else {
-        const int64_t t_build_start = gpu_log ? ggml_time_us() : 0;
         res->reset();
 
         llama_ubatch ub_stub = {};
@@ -2193,15 +2064,11 @@ int32_t llama_context::dflash_inline_encode_from_ctx(llama_context * draft_ctx,
             return -1;
         }
 
-        if (gpu_log) t_build_us = ggml_time_us() - t_build_start;
-
-        const int64_t t_alloc_start = gpu_log ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched_dflash_inline_encode.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate encoder graph on target sched\n",
                             __func__);
             return -2;
         }
-        if (gpu_log) t_alloc_us = ggml_time_us() - t_alloc_start;
 
         gf_res_dflash_inline_encode_n_new = n_keep;
     }
@@ -2215,8 +2082,6 @@ int32_t llama_context::dflash_inline_encode_from_ctx(llama_context * draft_ctx,
     GGML_ASSERT(t_target_hidden_new != nullptr);
     GGML_ASSERT(t_pos_new           != nullptr);
     GGML_ASSERT(t_pos_idx           != nullptr);
-
-    const int64_t t_inputs_start = gpu_log ? ggml_time_us() : 0;
 
     // src_captures lives in TARGET's buffer (this context); t_target_hidden_new
     // is allocated by THIS sched in target's compute buffer. Same context, so
@@ -2264,9 +2129,6 @@ int32_t llama_context::dflash_inline_encode_from_ctx(llama_context * draft_ctx,
                                 0, n_keep * sizeof(int64_t));
     }
 
-    if (gpu_log) t_inputs_us = ggml_time_us() - t_inputs_start;
-
-    const int64_t t_compute_start = gpu_log ? ggml_time_us() : 0;
     {
         const auto status = graph_compute(sched_dflash_inline_encode.get(), gf,
                                           /*batched=*/n_keep > 1);
@@ -2276,24 +2138,12 @@ int32_t llama_context::dflash_inline_encode_from_ctx(llama_context * draft_ctx,
             return -3;
         }
     }
-    if (gpu_log) t_compute_us = ggml_time_us() - t_compute_start;
 
     // Update draft's side-store bookkeeping. ctx_filled / n_ctx live on
     // draft because the side-store tensors do.
     ddflash.ctx_filled += n_keep;
     ddflash.n_ctx = ddflash.ctx_filled;
 
-    if (gpu_log) {
-        const int64_t t_extend_total = ggml_time_us() - t_extend_start;
-        LLAMA_LOG_INFO("[DFLASH_GPU_LOG] dflash_inline_encode_from_ctx: n_keep=%lld "
-                       "src_row_offset=%lld pos_start=%lld cache_hit=%d "
-                       "build=%.3f alloc=%.3f set_inputs=%.3f compute=%.3f total=%.3f ms\n",
-                       (long long) n_keep, (long long) src_row_offset,
-                       (long long) pos_start, cache_hit_log ? 1 : 0,
-                       t_build_us / 1000.0, t_alloc_us / 1000.0,
-                       t_inputs_us / 1000.0, t_compute_us / 1000.0,
-                       t_extend_total / 1000.0);
-    }
     return 0;
 }
 
@@ -2301,9 +2151,9 @@ void llama_context::set_tree_mask(const uint8_t * visibility, int n_tree_tokens)
     GGML_ASSERT(visibility != nullptr);
     GGML_ASSERT(n_tree_tokens > 0);
 
-    // Session 31: avoid the unconditional gf_res_prev->reset(). The
-    // graph-reuse machinery (llm_graph_result::can_reuse +
-    // llm_graph_params::allow_reuse) already handles tree-mask
+    // avoid the unconditional gf_res_prev->reset(). The graph-reuse machinery
+    // (llm_graph_result::can_reuse + llm_graph_params::allow_reuse) already
+    // handles tree-mask
     // transitions correctly:
     //   - Same-shape verify-after-verify: gparams.tree_mask pointer is
     //     stable (== &this->tree_mask), ubatch dims match, and the
@@ -2316,9 +2166,9 @@ void llama_context::set_tree_mask(const uint8_t * visibility, int n_tree_tokens)
     //     via the n_tokens check in allow_reuse / can_reuse_kq_mask.
     //
     // The blunt reset that used to fire here invalidated the cache on
-    // every set_tree_mask call — meaning repeated tree-verifies at the
-    // same budget (the common DDTree-22 hot path) paid a graph-rebuild
-    // cost per iter that they didn't need to. This branch leaves
+    // every set_tree_mask call, meaning repeated tree-verifies at the
+    // same budget paid a graph-rebuild cost per iter that they didn't
+    // need. This branch leaves
     // gf_res_prev alone; on the rare cases where downstream code wants
     // an eager invalidation it can call gf_res_prev->reset() directly.
     tree_mask.active        = true;
@@ -2326,9 +2176,9 @@ void llama_context::set_tree_mask(const uint8_t * visibility, int n_tree_tokens)
     const size_t n2         = (size_t) n_tree_tokens * (size_t) n_tree_tokens;
     tree_mask.visibility.assign(visibility, visibility + n2);
 
-    // DFlash Phase 5 (DDTree): propagate the tree-active state to the
-    // underlying KV cache so apply_ubatch's contiguity-invariant purge
-    // is bypassed for the next verify decode. The keep_positions_range
+    // tree-mode: propagate the tree-active state to the underlying KV cache
+    // so apply_ubatch's contiguity-invariant purge is bypassed for the next
+    // verify decode. The keep_positions_range
     // post-accept call restores monotonicity.
     if (memory) {
         memory->set_tree_mode_active(true);
@@ -2340,9 +2190,9 @@ void llama_context::clear_tree_mask() {
         return;
     }
 
-    // Session 31: same rationale as set_tree_mask — no eager
-    // gf_res_prev->reset(). After clear_tree_mask, gparams.tree_mask
-    // becomes nullptr; allow_reuse's pointer comparison on the next
+    // same rationale as set_tree_mask: no eager gf_res_prev->reset().
+    // After clear_tree_mask, gparams.tree_mask becomes nullptr;
+    // allow_reuse's pointer comparison on the next
     // decode rebuilds the graph if the next decode runs in chain
     // mode, and short-circuits to the previous tree-mode cache if the
     // next call is another set_tree_mask with the same shape.
@@ -3142,8 +2992,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // DFlash target capture: read back per-layer hidden states.
         //
-        // Phase 1 fast path: when build_dflash_capture finalized a packed
-        // tensor (shape [n_layers*n_embd_per_layer, n_outputs] in the same
+        // fast path: when build_dflash_capture finalized a packed tensor
+        // (shape [n_layers*n_embd_per_layer, n_outputs] in the same
         // row-per-token, all-layers-side-by-side layout the encoder graph
         // consumes), do a single D2H straight into dflash.captured_features
         // — no per-layer staging, no host transpose.
@@ -3157,7 +3007,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t n_features       = (int64_t) n_layers * n_embd_per_layer;
 
             if (res->t_dflash_captures_packed != nullptr) {
-                // Cache pointer for device-to-device consumers (Phase 2/3).
+                // cache pointer for device-to-device consumers
                 dflash.last_packed_captures = res->t_dflash_captures_packed;
 
                 // Skip the D2H entirely when the consumer is going to read
@@ -3299,67 +3149,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // and host-transpose them into the row-per-token, all-layers-side-by-side
     // `captured_features` layout the encoder graph in dflash_extend() expects.
     //
-    // Phase 1: skipped when build_dflash_capture finalized a packed tensor
-    // — in that case the D2H above already wrote straight into
-    // dflash.captured_features in the right layout, no host transpose needed.
+    // skipped when build_dflash_capture finalized a packed tensor: in that
+    // case the D2H above already wrote straight into dflash.captured_features
+    // in the right layout, no host transpose needed.
     // We still sync the scheduler so the D2H is observed before the consumer
     // reads captured_features.
     if (!dflash.capture_layer_ids.empty()
             && dflash.capture_staging.empty()
             && !dflash.captured_features.empty()
             && n_outputs_all > 0) {
-        static const bool gpu_log_capture_packed = []() {
-            const char * e = std::getenv("DFLASH_GPU_LOG");
-            return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
-        }();
-        const int64_t t_sync_start = gpu_log_capture_packed ? ggml_time_us() : 0;
         ggml_backend_sched_synchronize(sched.get());
-        if (gpu_log_capture_packed) {
-            const int64_t t_sync_end = ggml_time_us();
-            const size_t  bytes_d2h  = dflash.captured_features.size() * sizeof(float);
-            LLAMA_LOG_INFO("[DFLASH_GPU_LOG] capture_readback_packed: n_outputs=%lld "
-                           "sync=%.3f ms d2h_bytes=%zu (no host transpose)\n",
-                           (long long) n_outputs_all,
-                           (t_sync_end - t_sync_start) / 1000.0, bytes_d2h);
-        }
     } else if (!dflash.capture_layer_ids.empty()
             && dflash.skip_host_readback
             && dflash.last_packed_captures != nullptr
             && n_outputs_all > 0) {
-        // Phase 3: skip mode — we didn't enqueue a D2H but we still need
+        // skip-host-readback mode: we didn't enqueue a D2H but we still need
         // to synchronize so the packed tensor's compute settles before a
         // downstream consumer (llama_dflash_extend_from_ctx) reads it via
         // a cross-context D2D copy. Without this sync, target compute can
         // race the copy and the draft side store gets stale features.
-        static const bool gpu_log_capture_skip = []() {
-            const char * e = std::getenv("DFLASH_GPU_LOG");
-            return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
-        }();
-        const int64_t t_sync_start = gpu_log_capture_skip ? ggml_time_us() : 0;
         ggml_backend_sched_synchronize(sched.get());
-        if (gpu_log_capture_skip) {
-            const int64_t t_sync_end = ggml_time_us();
-            LLAMA_LOG_INFO("[DFLASH_GPU_LOG] capture_readback_skip: n_outputs=%lld "
-                           "sync=%.3f ms (no D2H, device-resident)\n",
-                           (long long) n_outputs_all,
-                           (t_sync_end - t_sync_start) / 1000.0);
-        }
     } else if (!dflash.capture_layer_ids.empty()
             && !dflash.capture_staging.empty()
             && n_outputs_all > 0) {
-        static const bool gpu_log_capture = []() {
-            const char * e = std::getenv("DFLASH_GPU_LOG");
-            return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
-        }();
-        const int64_t t_sync_start = gpu_log_capture ? ggml_time_us() : 0;
         ggml_backend_sched_synchronize(sched.get());
-        const int64_t t_sync_end   = gpu_log_capture ? ggml_time_us() : 0;
 
         const int64_t n_embd_target = dflash.capture_n_embd;
         const int64_t n_layers_cap  = (int64_t) dflash.capture_layer_ids.size();
         const int64_t n_features    = n_layers_cap * n_embd_target;
-
-        const int64_t t_xpose_start = gpu_log_capture ? ggml_time_us() : 0;
 
         dflash.captured_features.assign((size_t) n_outputs_all * (size_t) n_features, 0.0f);
 
@@ -3373,18 +3190,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     layer_buf.data()                + (size_t) i * (size_t) n_embd_target,
                     (size_t) n_embd_target * sizeof(float));
             }
-        }
-
-        if (gpu_log_capture) {
-            const int64_t t_xpose_end = ggml_time_us();
-            const size_t  bytes_d2h    = (size_t) n_outputs_all * (size_t) n_features * sizeof(float);
-            LLAMA_LOG_INFO("[DFLASH_GPU_LOG] capture_readback: n_outputs=%lld n_layers=%lld n_features=%lld "
-                           "sync=%.3f xpose=%.3f total=%.3f ms d2h_bytes=%zu\n",
-                           (long long) n_outputs_all, (long long) n_layers_cap, (long long) n_features,
-                           (t_sync_end - t_sync_start) / 1000.0,
-                           (t_xpose_end - t_xpose_start) / 1000.0,
-                           (t_xpose_end - t_sync_start) / 1000.0,
-                           bytes_d2h);
         }
     }
 
@@ -5335,9 +5140,7 @@ int32_t llama_decode(
     return ret;
 }
 
-// =====================================================================
 // DFlash speculative-decoding C API
-// =====================================================================
 
 void llama_set_dflash_capture(struct llama_context * ctx,
                               const int32_t * layer_ids,

@@ -5514,7 +5514,7 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
-// ggml_ssm_conv_tree (DFlash Phase 5)
+// ggml_ssm_conv_tree (DFlash tree mode)
 
 struct ggml_tensor * ggml_ssm_conv_tree(
         struct ggml_context * ctx,
@@ -6333,7 +6333,7 @@ struct ggml_tensor * ggml_gated_delta_net_with_history(
     return result;
 }
 
-// ggml_gated_delta_net_with_history_tree (DFlash Phase 5)
+// ggml_gated_delta_net_with_history_tree (DFlash tree mode)
 
 struct ggml_tensor * ggml_gated_delta_net_with_history_tree(
         struct ggml_context * ctx,
@@ -6382,9 +6382,9 @@ struct ggml_tensor * ggml_gated_delta_net_state_select(
         struct ggml_tensor  * state_history,
         struct ggml_tensor  * k_index,
         struct ggml_tensor  * fallback) {
-    // Phase 5: state_history may be F32 (chain, byte-exact with Phase 4)
-    // or F16 (tree mode; halves the persistent buffer's footprint). The
-    // CUDA kernel templates on SrcT to handle both; the F16 read path
+    // state_history may be F32 (chain) or F16 (tree mode; halves the
+    // persistent buffer's footprint). The CUDA kernel templates on SrcT
+    // to handle both; the F16 read path
     // emits a __half2float conversion on each load.
     GGML_ASSERT(state_history->type == GGML_TYPE_F32 ||
                 state_history->type == GGML_TYPE_F16);
@@ -6400,7 +6400,7 @@ struct ggml_tensor * ggml_gated_delta_net_state_select(
     const int64_t H_v = state_history->ne[2];
     GGML_ASSERT(state_history->ne[1] == S_v);
 
-    // chain-mode convention: n_seqs == 1. Tree mode (Phase 5) widens this:
+    // chain-mode convention: n_seqs == 1. Tree mode widens this:
     // state_history->ne[3] == n_tokens * n_seqs, with n_seqs > 1 inferred
     // from k_index nelements (or from the fallback shape).
     const int64_t k_count = ggml_nelements(k_index);
@@ -6478,7 +6478,7 @@ struct ggml_tensor * ggml_dflash_conv_state_history_select(
     return result;
 }
 
-// ggml_dflash_conv_state_history_select_tree (DFlash Phase 5 / DDTree)
+// ggml_dflash_conv_state_history_select_tree (DFlash tree mode)
 
 struct ggml_tensor * ggml_dflash_conv_state_history_select_tree(
         struct ggml_context * ctx,

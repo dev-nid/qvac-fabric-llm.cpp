@@ -1518,9 +1518,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
-    // Phase 3 inline encoder: forward the speculative-level flag onto the
-    // (target) context. The sizing cparams stay at their default 0; the
-    // context relaxes its validation when they're zero and uses target's
+    // forward the speculative-level inline-encoder flag onto the (target)
+    // context. The sizing cparams stay at their default 0; the context
+    // relaxes its validation when they're zero and uses the target's
     // own hparams for the encoder shapes (correct for the Qwen3 family
     // where target and draft share per-head dims). Non-matching families
     // (e.g., Qwen3.5) will need explicit sizing supplied — that path is

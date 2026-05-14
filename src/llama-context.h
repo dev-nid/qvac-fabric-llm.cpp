@@ -84,9 +84,7 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
-    // -----------------------------------------------------------------------
     // DFlash: capture target hidden states for the drafter
-    // -----------------------------------------------------------------------
     void set_dflash_capture(const int32_t * layer_ids,
                             size_t          n_layer_ids,
                             int64_t         n_embd_target);
@@ -118,10 +116,9 @@ struct llama_context {
                                       int64_t       n_keep,
                                       int64_t       pos_start);
 
-    // Phase 2 inline encoder (target-side execution).
-    //
-    // Same encoder graph contents as dflash_extend_from_tensor but executed
-    // on TARGET's scheduler instead of DRAFT's. Called as
+    // inline encoder (target-side execution): same encoder graph contents
+    // as dflash_extend_from_tensor but executed on TARGET's scheduler instead
+    // of DRAFT's. Called as
     //   target_ctx->dflash_inline_encode_from_ctx(draft_ctx, ...)
     // with src_captures resident in target's own buffer (no cross-context
     // D2D needed for the captures). The graph contents reference the draft
@@ -144,14 +141,14 @@ struct llama_context {
     // Reset the K/V side store to empty.
     void dflash_reset_ctx_kv();
 
-    // Phase 2/3 toggle: skip the per-decode D2H of captured_features.
-    // Consumers must use dflash_extend_from_tensor (or
-    // llama_dflash_extend_from_ctx) after this is set.
+    // skip the per-decode D2H of captured_features. Consumers must use
+    // dflash_extend_from_tensor (or llama_dflash_extend_from_ctx) after
+    // this is set.
     void set_dflash_skip_host_readback(bool skip) {
         dflash.skip_host_readback = skip;
     }
 
-    // Phase 2/3: most recent packed-captures tensor produced by decode(),
+    // most recent packed-captures tensor produced by decode(),
     // valid until the next decode on this context.
     ggml_tensor * get_dflash_last_packed_captures() const {
         return dflash.last_packed_captures;
@@ -172,9 +169,7 @@ struct llama_context {
     // Internal: drop the oldest `n_drop` columns of the side store.
     bool dflash_slide_left(int64_t n_drop);
 
-    // -----------------------------------------------------------------------
-    // DDTree (DFlash Phase 2): tree-shaped attention mask
-    // -----------------------------------------------------------------------
+    // DFlash tree-shaped attention mask
     void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
     void clear_tree_mask();
 
@@ -451,7 +446,7 @@ private:
     // (capture install) and dflash_extend() (per-layer K/V side store).
     llama_dflash dflash;
 
-    // DDTree custom attention mask. Inactive (active==false) by default.
+    // DFlash tree-mode custom attention mask. Inactive (active==false) by default.
     llama_tree_mask tree_mask;
 
     // ggml contexts + backend buffers backing the DFlash K/V side store.
@@ -459,7 +454,7 @@ private:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> dflash_kv_ctxs_bufs;
 
     // ggml contexts + backend buffers backing the per-GDN-layer state
-    // history tensors (Phase 4). Populated on the TARGET context when
+    // history tensors. Populated on the TARGET context when
     // cparams.dflash_gdn_history is set and the model has recurrent
     // (GDN) layers; empty otherwise.
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> dflash_gdn_history_ctxs_bufs;
@@ -472,15 +467,13 @@ private:
     llm_graph_result_ptr gf_res_dflash_encode;
     int64_t              gf_res_dflash_encode_n_new = -1;
 
-    // ------------------------------------------------------------------
-    // Phase 2 inline encoder (target-side). When cparams.dflash_inline_encoder
-    // is set, the speculative driver runs the encoder graph on TARGET's
-    // scheduler instead of the DRAFT's. These members live on the target
-    // context; they mirror sched_dflash_encode / gf_res_dflash_encode but
-    // are allocated using the target's backend_ptrs and reference the
-    // draft model's encoder weights + draft context's side store (ctx_K/V)
-    // cross-context. Lazy-init on first call to dflash_inline_encode_from_ctx().
-    // ------------------------------------------------------------------
+    // inline encoder (target-side). When cparams.dflash_inline_encoder is set,
+    // the speculative driver runs the encoder graph on TARGET's scheduler
+    // instead of the DRAFT's. These members live on the target context;
+    // they mirror sched_dflash_encode / gf_res_dflash_encode but are allocated
+    // using the target's backend_ptrs and reference the draft model's encoder
+    // weights + draft context's side store (ctx_K/V) cross-context. Lazy-init
+    // on first call to dflash_inline_encode_from_ctx().
     ggml_backend_sched_ptr sched_dflash_inline_encode;
     llm_graph_result_ptr   gf_res_dflash_inline_encode;
     int64_t                gf_res_dflash_inline_encode_n_new = -1;

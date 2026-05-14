@@ -361,10 +361,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
-    // DFlash Phase 4 conv-state fixup (mirror of qwen35.cpp). Active
-    // for the verify ubatches that fit the persistent buffer. Phase 5
-    // tree mode (cparams.n_seq_max > 1) takes the parallel
-    // ggml_ssm_conv_tree path below using parent_ids.
+    // DFlash conv-state fixup (mirror of qwen35.cpp). Active for verify
+    // ubatches that fit the persistent buffer. Tree mode
+    // (cparams.n_seq_max > 1) takes the parallel ggml_ssm_conv_tree path
+    // below using parent_ids.
     const bool use_gdn_history_layer =
         cparams.dflash_gdn_history &&
         n_seq_tokens > 1 &&
@@ -393,8 +393,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
         ggml_tensor * k_index = build_dflash_gdn_fixup_k_index_or_null(k_index_count);
         GGML_ASSERT(k_index != nullptr);
 
-        // Phase 5 (DDTree) tree-aware variant — see qwen35.cpp for the
-        // commentary; same dispatch logic.
+        // tree-aware variant; see qwen35.cpp for commentary.
         ggml_tensor * conv_states_fixed = (use_tree_mode_layer && parent_ids != nullptr)
             ? ggml_dflash_conv_state_history_select_tree(
                   ctx0, dflash->conv_history[il], k_index, parent_ids, conv_states)
@@ -424,7 +423,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
 
-    // DFlash Phase 4: persist conv_input into the per-layer conv_history.
+    // persist conv_input into the per-layer conv_history.
     if (use_gdn_history_layer) {
         ggml_tensor * conv_hist_dst_full = dflash->conv_history[il];
         ggml_tensor * conv_hist_dst = ggml_view_3d(ctx0, conv_hist_dst_full,
@@ -433,9 +432,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_input, conv_hist_dst));
     }
 
-    // DFlash Phase 4: GDN-state fixup. selected_state (if non-null) is
-    // used directly as the GDN op's state input — bypassing build_rs on
-    // ssm_states_all, same pattern as qwen35.cpp.
+    // DFlash GDN-state fixup. selected_state (if non-null) is used directly
+    // as the GDN op's state input, bypassing build_rs on ssm_states_all
+    // (same pattern as qwen35.cpp).
     ggml_tensor * ssm_states_all_slot_view = ggml_view_2d(
         ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
         kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));

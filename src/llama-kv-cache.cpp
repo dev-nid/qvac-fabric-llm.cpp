@@ -1063,9 +1063,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
     //       ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
     //
-    // DFlash Phase 5 (DDTree): when tree_mode_active, the caller (a tree-aware
-    // spec driver that has installed a tree mask via llama_set_tree_mask)
-    // owns the intra-batch position semantics — sibling tree nodes legitimately
+    // DFlash tree mode: when tree_mode_active, the caller (a tree-aware spec
+    // driver that has installed a tree mask via llama_set_tree_mask) owns the
+    // intra-batch position semantics; sibling tree nodes legitimately
     // share positions, and the contiguity invariant is restored after the
     // accept walk via llama_memory_keep_positions_range. Skip the purge here
     // so duplicate-position writes don't fire the cleanup.
@@ -1165,7 +1165,7 @@ bool llama_kv_cache::keep_positions_range(
     // driver uses seq_id={0} for the entire verify batch). For safety,
     // we reject cells that carry seq_id alongside other sequences — the
     // rename can't preserve those other-seq positions because pos is a
-    // per-cell field. In practice this never trips in the DDTree path.
+    // per-cell field. In practice this never trips in the tree-mode path.
     struct rename_t { uint32_t cell_idx; llama_pos new_pos; };
     std::vector<rename_t> renames;
     std::vector<uint32_t> drops;

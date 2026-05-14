@@ -2435,8 +2435,8 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
-    // DFlash Phase 5: parent-aware variant of ggml_ssm_conv for tree-mode
-    // speculative decoding verify. `parent_ids` is an int32 tensor of shape
+    // tree-mode parent-aware variant of ggml_ssm_conv for DFlash speculative
+    // decoding verify. `parent_ids` is an int32 tensor of shape
     // [n_tokens, n_seqs] where entry [t, s] is the index within sequence s of
     // the parent token in the DFS-flattened tree, or -1 when the parent is
     // before the block (then the K-1 ancestors decay through the old conv
@@ -2593,8 +2593,8 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
 
-    // DFlash Phase 5: tree-mode variant of ggml_gated_delta_net_with_history.
-    // Same op (GGML_OP_GATED_DELTA_NET_WITH_HISTORY) but with two extra srcs:
+    // tree-mode variant of ggml_gated_delta_net_with_history. Same op
+    // (GGML_OP_GATED_DELTA_NET_WITH_HISTORY) but with two extra srcs:
     //   src[6] = parent_ids   - int32 [n_tokens, n_seqs]. entry [t, s] is the
     //                           token index within seq s of t's parent in the
     //                           DFS-flattened tree, or -1 if t's parent is the
@@ -2603,10 +2603,8 @@ extern "C" {
     //                            [S_v, S_v, H, n_tokens, n_seqs]. The kernel
     //                            spills per-token intermediate states to this
     //                            buffer and reads back from it at branch
-    //                            points (parent_t != t-1). f16 halves the
-    //                            footprint and is the difference between
-    //                            fitting and not fitting DDTree-22 on the
-    //                            27B target.
+    //                            points (parent_t != t-1). F16 halves the
+    //                            persistent buffer footprint compared to F32.
     //
     // The embedded state-history region inside the result tensor is unused
     // when persist_inter is non-null but is still allocated (the op shape is
@@ -2637,11 +2635,10 @@ extern "C" {
     // persistent buffer the GATED_DELTA_NET_WITH_HISTORY op wrote into.
     //
     // `k_index` is an I32 tensor read on-device. Either:
-    //   - 1 element  (chain mode, byte-exact with Phase 4): every seq uses
-    //                 the same scalar k.
-    //   - n_seqs     (Phase 5 tree mode): per-seq k; entry s applied to the
-    //                 slab for sequence s. -1 in any slot triggers the
-    //                 fallback copy for that seq only.
+    //   - 1 element  (chain mode): every seq uses the same scalar k.
+    //   - n_seqs     (tree mode):  per-seq k; entry s applied to the slab
+    //                              for sequence s. -1 in any slot triggers
+    //                              the fallback copy for that seq only.
     //
     // `fallback` (optional, may be nullptr) is a tensor with the same
     // shape as the result; if `k_index` is < 0 (e.g. first decode, full
@@ -2659,9 +2656,9 @@ extern "C" {
             struct ggml_tensor  * k_index,
             struct ggml_tensor  * fallback);
 
-    // DFlash Phase 4 conv-state fixup. Selects `conv_kernel_size - 1`
-    // contiguous rows from a persistent conv_input history buffer to
-    // recover the convolutional state ending at chain position k_index.
+    // DFlash conv-state fixup: selects `conv_kernel_size - 1` contiguous rows
+    // from a persistent conv_input history buffer to recover the convolutional
+    // state ending at chain position k_index.
     //
     // `conv_history` shape:
     //   [conv_kernel_size - 1 + max_tokens, conv_channels, n_seqs]
@@ -2689,9 +2686,9 @@ extern "C" {
             struct ggml_tensor  * k_index,
             struct ggml_tensor  * fallback);
 
-    // DFlash Phase 5 (DDTree) tree-aware conv state fixup. Same outputs and
-    // shapes as ggml_dflash_conv_state_history_select, but on alt-accept
-    // iters where the deepest accepted DFS slot's K-1 ancestors aren't its
+    // tree-aware variant of ggml_dflash_conv_state_history_select. Same
+    // outputs and shapes, but on alt-accept iters where the deepest accepted
+    // DFS slot's K-1 ancestors aren't its
     // K-1 DFS predecessors (sibling-tree shape), the kernel walks
     // tree.parents[] to gather the right K-1 ancestor input slots from
     // conv_history.
@@ -2712,7 +2709,7 @@ extern "C" {
     // chain variant picks. The op is byte-equivalent to
     // ggml_dflash_conv_state_history_select for chain shapes.
     //
-    // CUDA only (Phase 5 tree mode is CUDA-only as of Session 24 hand-off).
+    // CUDA only (tree mode is CUDA-only).
     GGML_API struct ggml_tensor * ggml_dflash_conv_state_history_select_tree(
             struct ggml_context * ctx,
             struct ggml_tensor  * conv_history,

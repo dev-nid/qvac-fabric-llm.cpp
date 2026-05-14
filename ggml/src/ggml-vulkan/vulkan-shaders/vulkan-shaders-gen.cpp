@@ -980,16 +980,16 @@ void process_shaders() {
     string_to_spv("gated_delta_net_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
     string_to_spv("gated_delta_net_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
 
-    // DFlash Phase 4: chain-mode WITH_HISTORY variants. Same shader source,
-    // additional WRITE_STATE_HISTORY define enables the per-token state spill
-    // to dst's state_history region.
+    // DFlash chain-mode WITH_HISTORY variants. Same shader source, additional
+    // WRITE_STATE_HISTORY define enables the per-token state spill to dst's
+    // state_history region.
     string_to_spv("gated_delta_net_history_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}, {"WRITE_STATE_HISTORY", "1"}}));
     string_to_spv("gated_delta_net_history_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"WRITE_STATE_HISTORY", "1"}}));
     string_to_spv("gated_delta_net_history_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"WRITE_STATE_HISTORY", "1"}}));
 
-    // DFlash Phase 5 (DDTree) tree-mode WITH_HISTORY_TREE variants. Same shader
-    // source with TREE_MODE=1; one variant per reduction strategy. The
-    // shader writes per-token state to dst's F32 embedded state_history
+    // DFlash tree-mode WITH_HISTORY_TREE variants. Same shader source with
+    // TREE_MODE=1; one variant per reduction strategy. The shader writes
+    // per-token state to dst's F32 embedded state_history
     // region (same path as chain) and reads from it for the parent-walk
     // reload; the graph builder appends a ggml_cpy to narrow the region
     // into the external persist_inter buffer (F32 or F16). There is no
@@ -999,9 +999,9 @@ void process_shaders() {
     string_to_spv("gated_delta_net_history_tree_f32_nocluster",  "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"WRITE_STATE_HISTORY", "1"}, {"TREE_MODE", "1"}}));
     string_to_spv("gated_delta_net_history_tree_f32_shmem",      "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"WRITE_STATE_HISTORY", "1"}, {"TREE_MODE", "1"}}));
 
-    // DFlash Phase 4: state-history fixup + conv-history fixup. Both are
-    // small data-shuffling kernels; chain mode (single scalar k_index, F32
-    // state history) only - F16 InterT and per-seq k_index are Phase 5.
+    // DFlash chain-mode state-history fixup + conv-history fixup. Both are
+    // small data-shuffling kernels; F32 state history with a single scalar
+    // k_index. F16 InterT and per-seq k_index live in the tree-mode variants.
     string_to_spv("gated_delta_net_state_select_f32", "gated_delta_net_state_select.comp", merge_maps(base_dict, {}));
     string_to_spv("dflash_conv_state_history_select_f32", "dflash_conv_state_history_select.comp", merge_maps(base_dict, {}));
     string_to_spv("dflash_conv_state_history_select_tree_f32", "dflash_conv_state_history_select_tree.comp", merge_maps(base_dict, {}));

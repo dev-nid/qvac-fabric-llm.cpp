@@ -405,8 +405,8 @@ void llm_graph_input_dflash_gdn_fixup::set_input(const llama_ubatch * ubatch) {
     if (k_index == nullptr || k_index->buffer == nullptr) return;
 
     if (k_index_count <= 1) {
-        // Chain-mode path (byte-exact with Phase 4): single scalar from
-        // the dflash struct. We still honour any per-seq vector by
+        // Chain-mode path: single scalar from the dflash struct. We still
+        // honour any per-seq vector by
         // promoting its [0] element when the scalar is at its default
         // -1 — the spec driver may set either depending on which
         // surface it's using.
@@ -418,7 +418,7 @@ void llm_graph_input_dflash_gdn_fixup::set_input(const llama_ubatch * ubatch) {
         return;
     }
 
-    // Phase 5 tree-mode: per-seq k_index vector. The spec driver fills
+    // tree-mode per-seq k_index vector. The spec driver fills
     // dflash->gdn_history_k_indices with n_seqs entries before each
     // tree-verify decode. Pad with -1 for any tail entries the driver
     // didn't populate so the state_select op falls back per-seq.
@@ -647,10 +647,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
-    // DDTree (Phase 2 prep): if a tree mask is active, overwrite the
-    // [n × n] tree block of the freshly written attention mask with
-    // `visibility[i*n+j] ? 0.0f : -INFINITY`. Stage A no-op when
-    // tree_mask is null or inactive.
+    // DFlash tree mode: if a tree mask is active, overwrite the [n × n] tree
+    // block of the freshly written attention mask with
+    // `visibility[i*n+j] ? 0.0f : -INFINITY`. No-op when tree_mask is null
+    // or inactive.
     if (tree_mask && tree_mask->active) {
         GGML_ASSERT(self_kq_mask != nullptr);
         GGML_ASSERT(self_k_idxs  != nullptr);
@@ -2143,7 +2143,7 @@ void llm_graph_context::build_dflash_capture(ggml_tensor * cur, int il) const {
     ggml_build_forward_expand(gf, cap);
     res->t_dflash_captures.push_back(cap);
 
-    // Phase 1: once the last expected capture lands, build a packed view of
+    // once the last expected capture lands, build a packed view of
     // shape [n_layers * n_embd_target, n_outputs] by concatenating all
     // captures along dim 0. This matches the row-per-token, all-layers-
     // side-by-side layout the encoder graph in dflash_extend() consumes, so
@@ -2215,10 +2215,9 @@ ggml_tensor * llm_graph_context::build_dflash_gdn_history_fixup_or_null(
     // the probe exceeds that — the fallback build_rs path handles it.
     if (n_seqs > dflash->gdn_history_n_seqs_max) return nullptr;
 
-    // Tree mode (Phase 5) sizes k_index to [n_seqs]; chain mode keeps
-    // the scalar [1] shape so Session 22's PTX stays byte-exact. The
-    // state_select op factory uses k_index->ne[0] to derive the per-seq
-    // path internally (Session 22 plumbed the k_index_count scalar onto
+    // tree mode sizes k_index to [n_seqs]; chain mode keeps the scalar [1]
+    // shape. The state_select op factory uses k_index->ne[0] to derive the
+    // per-seq path internally (the k_index_count scalar lives on
     // the GATED_DELTA_NET_STATE_SELECT kernel).
     const bool tree_mode = (cparams.n_seq_max > 1) && (n_seqs > 1);
     const int32_t k_index_count = tree_mode ? (int32_t) n_seqs : 1;
@@ -2230,8 +2229,8 @@ ggml_tensor * llm_graph_context::build_dflash_gdn_history_fixup_or_null(
 
     // state_select picks gdn_hist[..., k_index, :] (shape
     // [S_v, S_v, H_v, n_seqs]) — or falls back to the slot view when
-    // any k_index entry is < 0. In chain mode (n_seqs == 1) the kernel
-    // is identical to Phase 4.
+    // any k_index entry is < 0. In chain mode (n_seqs == 1) the kernel is
+    // identical to the chain-mode shape.
     ggml_tensor * selected = ggml_gated_delta_net_state_select(
         ctx0, gdn_hist, k_index, ssm_states_all_slot_view);
     cb(selected, "dflash_gdn_fixup_selected", il);
@@ -2336,8 +2335,7 @@ void llm_graph_context::build_dflash_inline_encoder(const llama_model & model,
 
     // ---------- shared projection: h_proj = hidden_norm(fc(packed)) ----------
     // F32 prec is required: dflash_fc has F16 weights and packed_captures
-    // values can exceed the F16 matmul accumulator's range (~6.5e4). See
-    // Session 12 root-cause / fix.
+    // values can exceed the F16 matmul accumulator's range (~6.5e4).
     ggml_tensor * h_fc = build_lora_mm(model.target_dflash_fc, packed_captures);
     ggml_mul_mat_set_prec(h_fc, GGML_PREC_F32);
     cb(h_fc, "dflash_inline_enc_h_fc", -1);
@@ -2345,9 +2343,9 @@ void llm_graph_context::build_dflash_inline_encoder(const llama_model & model,
                                       nullptr, LLM_NORM_RMS, -1);
     cb(h_proj, "dflash_inline_enc_h_proj", -1);
 
-    // Per-head dims and RoPE params: use TARGET's hparams. Correct only when
-    // target and draft share them (Qwen3 family). Phase 3B will add an
-    // explicit-sizing path for Qwen3.5 etc.
+    // per-head dims and RoPE params: use TARGET's hparams. Correct only when
+    // target and draft share them (Qwen3 family); other families need an
+    // explicit-sizing path.
     const int64_t n_embd_head_use = n_embd_head_v;
     const int64_t n_head_kv_use   = n_head_kv;
     GGML_ASSERT(n_embd_head_use * n_head_kv_use ==

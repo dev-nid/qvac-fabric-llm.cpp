@@ -10670,7 +10670,7 @@ void ggml_compute_forward_gated_delta_net_with_history(
     GGML_UNUSED(dst);
     GGML_ABORT(
         "GGML_OP_GATED_DELTA_NET_WITH_HISTORY is CUDA-only "
-        "(DFlash Phase 4 history kernel). The CPU backend does not implement "
+        "(DFlash GDN history kernel). The CPU backend does not implement "
         "this op. Disable --dflash-gdn-history or run on a CUDA backend.");
 }
 
@@ -10683,7 +10683,7 @@ void ggml_compute_forward_gated_delta_net_state_select(
     GGML_UNUSED(dst);
     GGML_ABORT(
         "GGML_OP_GATED_DELTA_NET_STATE_SELECT is CUDA-only "
-        "(DFlash Phase 4 fixup graph). The CPU backend does not implement "
+        "(DFlash GDN state-history fixup). The CPU backend does not implement "
         "this op. Disable --dflash-gdn-history or run on a CUDA backend.");
 }
 
@@ -10696,9 +10696,8 @@ void ggml_compute_forward_dflash_conv_state_history_select(
     GGML_UNUSED(dst);
     GGML_ABORT(
         "GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT is CUDA-only "
-        "(DFlash Phase 4 conv-state fixup). The CPU backend does not "
-        "implement this op. Disable --dflash-gdn-history or run on a "
-        "CUDA backend.");
+        "(DFlash conv-state fixup). The CPU backend does not implement "
+        "this op. Disable --dflash-gdn-history or run on a CUDA backend.");
 }
 
 // ggml_compute_forward_dflash_conv_state_history_select_tree (CUDA-only)
@@ -10710,9 +10709,8 @@ void ggml_compute_forward_dflash_conv_state_history_select_tree(
     GGML_UNUSED(dst);
     GGML_ABORT(
         "GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT_TREE is CUDA-only "
-        "(DFlash Phase 5 tree-aware conv-state fixup). The CPU backend does "
-        "not implement this op. Disable --dflash-tree or run on a CUDA "
-        "backend.");
+        "(DFlash tree-aware conv-state fixup). The CPU backend does not "
+        "implement this op. Disable --dflash-tree or run on a CUDA backend.");
 }
 
 // ggml_compute_forward_ssm_conv_tree (CUDA-only; CPU aborts)
@@ -10724,7 +10722,7 @@ void ggml_compute_forward_ssm_conv_tree(
     GGML_UNUSED(dst);
     GGML_ABORT(
         "GGML_OP_SSM_CONV_TREE is CUDA-only "
-        "(DFlash Phase 5 tree-mode conv kernel). The CPU backend does not "
+        "(DFlash tree-mode conv kernel). The CPU backend does not "
         "implement this op. Run on a CUDA backend or use chain mode.");
 }
 

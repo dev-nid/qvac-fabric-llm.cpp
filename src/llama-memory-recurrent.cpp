@@ -235,7 +235,7 @@ bool llama_memory_recurrent::seq_rm_partial_tail_state_managed_externally(
     if (tail_id >= 0) {
         auto & cell = cells[tail_id];
         // Partial-tail intersection: rewind the tail cell's position
-        // (DFlash Phase 4 fixup overwrites the state buffer). Leave
+        // (the DFlash in-graph fixup overwrites the state buffer). Leave
         // tail_id, seq_id membership, and used-count untouched.
         if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
             cell.pos = p0 - 1;

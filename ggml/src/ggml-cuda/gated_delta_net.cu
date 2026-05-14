@@ -10,12 +10,11 @@
 #endif
 
 // Inter-state load/store helpers. The persistent intermediate-state buffer
-// (used by Phase 5 tree mode for branch-point reloads) can live in either f32
-// or f16 - f16 halves the per-layer footprint, which is the difference between
-// fitting and not fitting DDTree-22 on Qwen3.5-27B inside 32 GiB.
+// (used by tree mode for branch-point reloads) can live in either f32 or
+// f16; f16 halves the per-layer footprint.
 //
 // In chain mode (TREE_MODE=false, InterT=float) the kernel only ever writes
-// here; the helpers compile down to a plain store, byte-exact with Phase 4.
+// here; the helpers compile down to a plain store.
 static __device__ __forceinline__ float load_inter_state(const float * p, int idx) {
     return p[idx];
 }
@@ -38,13 +37,13 @@ gated_delta_net_cuda(const float * q,
                                      const float * beta,
                                      const float * curr_state,
                                      float *       dst,
-                                     // DFlash Phase 4/5: per-token intermediate-state region. Nullable: when null
-                                     // (chain-mode no-history path) the kernel just doesn't write per-token state.
+                                     // per-token intermediate-state region. nullable: when null
+                                     // (chain-mode no-history path) the kernel doesn't write per-token state.
                                      // When non-null and TREE_MODE=true, also acts as the reload source at branch
                                      // points. Memory is owned by the caller (either the appended dst region for
                                      // chain-mode history, or an external persistent buffer for tree mode).
                                      InterT *      inter_states,
-                                     // DFlash Phase 5: parent_ids[n_seqs * n_tokens] int32. Read only when
+                                     // parent_ids[n_seqs * n_tokens] int32, read only when
                                      // TREE_MODE=true. parent_t < 0 signals "reload from curr_state".
                                      const int *   parent_ids,
                                      int64_t       H,
@@ -82,8 +81,7 @@ gated_delta_net_cuda(const float * q,
 
     // Per-(seq, head) base for this block's per-token intermediates at t=0.
     // Advance by S_v * S_v * H each `t` so the layout stays
-    // [S_v, S_v, H, n_tokens, n_seqs] (matches the chain-mode embedded region
-    // and lucebox's external buffer).
+    // [S_v, S_v, H, n_tokens, n_seqs] (matches the chain-mode embedded region).
     InterT * inter_base = (inter_states != nullptr)
         ? inter_states + (sequence * n_tokens * H + h_idx) * S_v * S_v
         : nullptr;
@@ -218,10 +216,10 @@ gated_delta_net_cuda(const float * q,
             }
         }
 
-        // Per-token intermediate-state spill (Phase 4 chain-mode history,
-        // Phase 5 tree-mode reload source). Same transposed layout as the
-        // final-state write below. store_inter_state() compiles to a plain
-        // store for InterT=float (chain) and __float2half for InterT=__half.
+        // per-token intermediate-state spill (chain-mode history, or
+        // tree-mode reload source). Same transposed layout as the final-state
+        // write below. store_inter_state() compiles to a plain store for
+        // InterT=float (chain) and __float2half for InterT=__half.
         if (inter_base != nullptr) {
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
@@ -375,8 +373,8 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     }
 }
 
-// DFlash Phase 4 + 5 entry point. The dst tensor packs a state-history
-// region after attn-output and final-state for chain-mode rollback. Phase 5
+// DFlash GDN-with-history entry point. The dst tensor packs a state-history
+// region after attn-output and final-state for chain-mode rollback. Tree mode
 // optionally adds:
 //   - src[6] = parent_ids (i32, [n_tokens, n_seqs]) -> tree-mode recurrence
 //   - src[7] = persist_inter (f32 or f16, contiguous external buffer for the
@@ -384,8 +382,8 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 //     target). Required to be non-null when src[6] is non-null because the
 //     tree reload reads from this buffer at branch points.
 //
-// Chain mode (src[6] == nullptr, src[7] == nullptr): byte-exact with
-// Phase 4. The intermediate region inside dst is the spill target.
+// Chain mode (src[6] == nullptr, src[7] == nullptr): the intermediate region
+// inside dst is the spill target.
 void ggml_cuda_op_gated_delta_net_with_history(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src_q             = dst->src[0];
     ggml_tensor * src_k             = dst->src[1];
@@ -498,14 +496,14 @@ void ggml_cuda_op_gated_delta_net_with_history(ggml_backend_cuda_context & ctx, 
     //     parent-walk reload then reads from the same buffer the kernel
     //     just wrote to. Unified with Vulkan to dodge a same-thread
     //     read-after-write hazard on a separate f16 storage buffer on
-    //     RADV (Session 34); CUDA used to write straight to persist_inter
-    //     with InterT picked from its dtype, but writing to the embedded
-    //     region first + cpy is functionally equivalent and keeps the
+    //     some Vulkan implementations; CUDA used to write straight to
+    //     persist_inter with InterT picked from its dtype, but writing to
+    //     the embedded region first + cpy is functionally equivalent and
+    //     keeps the
     //     two backends on the same path.
     //   - chain mode + external persist_inter: keep writing straight
-    //     into persist_inter (Phase 4 chain-compatibility path).
-    //   - chain mode without persist_inter: embedded f32 region only
-    //     (= byte-exact baseline).
+    //     into persist_inter (chain-compatibility path).
+    //   - chain mode without persist_inter: embedded f32 region only.
     #define GDN_LAUNCH(KDA_VAL)                                                                 \
         do {                                                                                    \
             if (tree_mode) {                                                                    \
@@ -545,7 +543,7 @@ void ggml_cuda_op_gated_delta_net_with_history(ggml_backend_cuda_context & ctx, 
     #undef GDN_LAUNCH
 }
 
-// DFlash Phase 4/5 fixup: select state_history[..., k_index, :] and copy
+// DFlash state-history fixup: select state_history[..., k_index, :] and copy
 // it into a [S_v, S_v, H_v, n_seqs] result tensor.
 //
 // state_history layout (contiguous floats):
@@ -553,8 +551,7 @@ void ggml_cuda_op_gated_delta_net_with_history(ggml_backend_cuda_context & ctx, 
 //   [S_v, S_v, H_v, n_tokens * n_seqs] by ggml.
 //
 // k_index is an I32 tensor read on-device.
-//   - 1 element  -> chain mode: same scalar k for every seq (Phase 4
-//                   byte-exact path).
+//   - 1 element  -> chain mode: same scalar k for every seq.
 //   - n_seqs     -> tree mode: per-seq k_index; seq `s` reads
 //                   `k_index_ptr[s]`. -1 in any slot triggers the fallback
 //                   copy for that seq.
@@ -563,13 +560,10 @@ void ggml_cuda_op_gated_delta_net_with_history(ggml_backend_cuda_context & ctx, 
 // copies `fallback` -> dst for that seq instead of selecting from
 // state_history. `fallback` is expected to be contiguous and have the same
 // element count as dst. May be nullptr if the caller guarantees k >= 0.
-// Templated on the persistent state-history element type so the kernel
-// can read either F32 (Phase 4 chain mode, byte-exact with Session 20)
-// or F16 (Phase 5 tree mode; the F16 dtype halves the persistent
-// buffer's footprint and is what makes DDTree-22 fit on Qwen3.5-27B in
-// 32 GiB). The dst tensor stays F32 — that's the GDN op's `state` input
-// element type. SrcT = float compiles to a plain load; SrcT = __half
-// emits a __half2float conversion on read.
+// Templated on the persistent state-history element type so the kernel can
+// read either F32 (chain mode) or F16 (tree mode). The dst tensor stays F32
+// (the GDN op's `state` input element type). SrcT = float compiles to a
+// plain load; SrcT = __half emits a __half2float conversion on read.
 template <typename SrcT>
 __global__ void gated_delta_net_state_select_cuda(
         const SrcT  * state_history,
@@ -627,8 +621,8 @@ void ggml_cuda_op_gated_delta_net_state_select(ggml_backend_cuda_context & ctx, 
     ggml_tensor * src_kindex = dst->src[1];
     ggml_tensor * src_fb     = dst->src[2]; // optional fallback
 
-    // Phase 5: src_sh may be F32 (chain) or F16 (tree). Same shape; the
-    // kernel picks the SrcT template at runtime via the dtype below.
+    // src_sh may be F32 (chain) or F16 (tree). Same shape; the kernel picks
+    // the SrcT template at runtime via the dtype below.
     GGML_ASSERT(src_sh->type == GGML_TYPE_F32 || src_sh->type == GGML_TYPE_F16);
     GGML_ASSERT(src_kindex->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(src_sh));
@@ -647,8 +641,7 @@ void ggml_cuda_op_gated_delta_net_state_select(ggml_backend_cuda_context & ctx, 
     GGML_ASSERT(n_tok_x_seqs % n_seqs == 0);
     const int64_t n_tokens = n_tok_x_seqs / n_seqs;
 
-    // k_index is either a scalar (chain mode, byte-exact with Phase 4) or
-    // an [n_seqs] vector (Phase 5 tree mode).
+    // k_index is either a scalar (chain mode) or an [n_seqs] vector (tree mode).
     const int64_t k_index_count = ggml_nelements(src_kindex);
     GGML_ASSERT(k_index_count == 1 || k_index_count == n_seqs);
 
@@ -683,7 +676,7 @@ void ggml_cuda_op_gated_delta_net_state_select(ggml_backend_cuda_context & ctx, 
     }
 }
 
-// DFlash Phase 4 conv-state fixup kernel.
+// DFlash conv-state fixup kernel.
 //
 // Layout (contiguous floats, row-major):
 //   conv_history: [conv_history_rows, conv_channels, n_seqs]
@@ -785,7 +778,7 @@ void ggml_cuda_op_dflash_conv_state_history_select(ggml_backend_cuda_context & c
         (int) conv_channels, (int) n_seqs);
 }
 
-// DFlash Phase 5 (DDTree) tree-aware variant of dflash_conv_state_history_select.
+// tree-aware variant of dflash_conv_state_history_select.
 //
 // Difference from the chain kernel: when k_idx >= 0, instead of picking
 // conv_history rows [k_idx + 1, k_idx + conv_state_rows), walk parent_ids
@@ -799,9 +792,8 @@ void ggml_cuda_op_dflash_conv_state_history_select(ggml_backend_cuda_context & c
 // Convention: parent_ids[0] = -1 (root sentinel). Once a virt[k+1] is
 // negative, we keep counting down (virt[k] = virt[k+1] - 1) so the row
 // offset (K-1 + virt[k]) lands in the prev_state region (conv_history
-// rows [0, K-2]). Mirrors lucebox's parent walk in
-// dflash/test/test_dflash.cpp:2733-2738. The result row r maps to
-// virt index r (oldest first), so dst[r, c, s] = conv_history[K-1+virt[r], c, s].
+// rows [0, K-2]). The result row r maps to virt index r (oldest first),
+// so dst[r, c, s] = conv_history[K-1+virt[r], c, s].
 //
 // For chain-shape verifies (parent_ids[i] == i - 1), virt[r] = k_idx -
 // (K-2-r), giving the same K-1 contiguous rows as the non-tree kernel.

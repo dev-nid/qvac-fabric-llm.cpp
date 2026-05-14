@@ -563,11 +563,6 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
                 "tree-verify n_seqs exceeds gdn_history_n_seqs_max; "
                 "raise n_seq_max so the persistent buffer is widened");
 
-    // Reference: lucebox/lucebox-hub/dflash/src/qwen35_target_graph.cpp
-    // build_delta_net_block (lines 820-1040), specifically the
-    // ggml_gated_delta_net_tree_persist call at line 995. The persist
-    // buffer there is `cap->ssm_intermediate_states`; our analogue is
-    // dflash->gdn_history[il]. MIT-licensed, Copyright 2026 Lucebox.
     ggml_tensor * persist_inter = dflash->gdn_history[il];
     ggml_tensor * result = ggml_gated_delta_net_with_history_tree(
         ctx0, q, k, v, g, b, s, parent_ids, persist_inter);
@@ -588,10 +583,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
             ggml_row_size(result->type, S_v * S_v * H_v),
             ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
 
-    // DFlash Phase 5: narrow the dst-embedded state_history region (F32)
-    // into the external persist_inter buffer (F32 or F16) so the next
-    // iter's state_select op can read it. Vulkan's TREE_MODE shader
-    // writes the per-token states into dst's embedded region (same path
+    // narrow the dst-embedded state_history region (F32) into the external
+    // persist_inter buffer (F32 or F16) so the next iter's state_select op
+    // can read it. The Vulkan tree-mode shader writes the per-token states
+    // into dst's embedded region (same path
     // as chain mode with WRITE_STATE_HISTORY=1) and reads from it for
     // the in-kernel parent-walk reload; this cpy fans the state out to
     // persist_inter after the kernel finishes. The CUDA backend writes

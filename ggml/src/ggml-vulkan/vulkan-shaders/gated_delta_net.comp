@@ -32,9 +32,9 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
 #if WRITE_STATE_HISTORY
-    // DFlash Phase 4: per-token state-history region offset inside dst, in
-    // floats. Only the WITH_HISTORY variant of the pipeline reads this; the
-    // legacy chain pipeline declares an identical struct without the field
+    // per-token state-history region offset inside dst, in floats. Only the
+    // WITH_HISTORY variant of the pipeline reads this; the legacy chain
+    // pipeline declares an identical struct without the field
     // so the byte layout doesn't shift.
     uint sh_off;
 #endif
@@ -48,9 +48,8 @@ layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 #if TREE_MODE
-// DFlash Phase 5 (DDTree) tree-mode inputs. parent_ids carries
-// [n_tokens, n_seqs] i32; for each token t in [1, n_tokens), parent_ids[t]
-// is either:
+// DFlash tree-mode inputs. parent_ids carries [n_tokens, n_seqs] i32;
+// for each token t in [1, n_tokens), parent_ids[t] is either:
 //   - t - 1   : sequential continuation (no extra cost; keep s_shard).
 //   - >= 0    : another token in this same verify; reload state from
 //               the dst-embedded state_history region at that slot.
@@ -62,7 +61,7 @@ layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 // embedded state_history region (the same region the chain shader uses
 // when WRITE_STATE_HISTORY=1). The graph builder appends a
 // ggml_cpy(state_history_view, persist_inter) right after the op so the
-// external Phase 5 buffer (dflash->gdn_history[il]) ends up populated
+// external buffer (dflash->gdn_history[il]) ends up populated
 // for the next iter's state_select. We used to write persist_inter
 // directly from this shader, but cross-iter same-thread read-after-write
 // on a separate F16 storage buffer was producing wrong values on

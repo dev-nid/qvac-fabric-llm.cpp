@@ -1,9 +1,9 @@
-// Unit test for llama_memory_keep_positions_range (Phase 5 DDTree compaction).
+// Unit test for llama_memory_keep_positions_range (DFlash tree compaction).
 //
-// Covers the cases enumerated in Session 24 / Session 25:
-//   1. Basic compact (3 cells, keep 2) with rename to p_min = 0
-//   2. Rename to non-zero p_min (committed prefix preserved)
-//   3. Sibling-duplicate handling (kept first under tree-mode bypass)
+// Cases:
+//   1. basic compact (3 cells, keep 2) with rename to p_min = 0
+//   2. rename to non-zero p_min (committed prefix preserved)
+//   3. sibling-duplicate handling (kept first under tree-mode bypass)
 //   4. n_positions == 0 edge case (delegates to seq_rm)
 //   5. seq_id < 0 rejection
 //

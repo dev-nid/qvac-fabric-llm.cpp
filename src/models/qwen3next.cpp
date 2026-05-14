@@ -455,8 +455,8 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
-    // DFlash Phase 4 conv-state fixup (mirror of qwen35.cpp). Active
-    // only for chain-verify ubatches that fit the persistent buffer.
+    // DFlash conv-state fixup (mirror of qwen35.cpp). Active only for
+    // chain-verify ubatches that fit the persistent buffer.
     // Note: qwen3next is not currently a DFlash-target family (no
     // public DFlash draft trained for it), but the plumbing is wired
     // for symmetry; the path is dormant unless dflash_gdn_history is
@@ -489,8 +489,7 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
         ggml_tensor * k_index = build_dflash_gdn_fixup_k_index_or_null(k_index_count);
         GGML_ASSERT(k_index != nullptr);
 
-        // Phase 5 (DDTree) tree-aware variant — see qwen35.cpp for the
-        // commentary; same dispatch logic.
+        // tree-aware variant; see qwen35.cpp for commentary.
         ggml_tensor * conv_states_fixed = (use_tree_mode_layer && parent_ids != nullptr)
             ? ggml_dflash_conv_state_history_select_tree(
                   ctx0, dflash->conv_history[il], k_index, parent_ids, conv_states)

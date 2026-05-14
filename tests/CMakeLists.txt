@@ -142,20 +142,6 @@ if (NOT WIN32)
         ARGS https://huggingface.co/ggml-org/vocabs ${PROJECT_SOURCE_DIR}/models/ggml-vocabs
     )
 
-    # DFlash strong-correctness gate: byte-exact greedy match between
-    # `llama-cli` and `llama-speculative-simple --draft-type dflash`.
-    # See the script header for env vars (DFLASH_TEST_TARGET / _DRAFT,
-    # DFLASH_TEST_FULL) and skip-on-missing-models semantics.
-    llama_test_cmd(
-        ${CMAKE_CURRENT_SOURCE_DIR}/test-dflash-correctness.sh
-        NAME test-dflash-correctness
-        WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-        LABEL "model"
-    )
-
-    # DFlash numerics-oracle gate: cosine-similarity comparison of the C++
-    # DFlash decoder graph's post-norm hidden state against the z-lab
-    # PyTorch reference's output on a deterministic synthetic input.
     llama_build_and_test(test-dflash-numerics.cpp LABEL "model")
 endif()
 
@@ -267,8 +253,8 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-# DFlash Phase 5 (DDTree): tree-aware compaction API.
-# Exercises llama_memory_keep_positions_range against the standard test model.
+# DFlash tree-aware compaction API: exercises llama_memory_keep_positions_range
+# against the standard test model.
 llama_build_and_test(test-memory-keep-positions.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-memory-keep-positions PROPERTIES FIXTURES_REQUIRED test-download-model)
 

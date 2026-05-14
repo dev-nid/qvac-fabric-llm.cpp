@@ -3559,13 +3559,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--dflash-tree"},
-        "DFlash drafter: enable DDTree Phase 2 multi-seq tree-shaped verify. "
-        "The driver builds a tree of likely continuations from the draft's per-position "
-        "top-K, runs ONE target verify pass with multi-seq tagging (one seq_id per "
-        "branch), walks the accept tree to pick the longest accepted chain, and uses "
-        "per-branch seq_rm rollback. Default tree shape (no --dflash-tree-budget): chain "
-        "seed + 1 alt at depth 1 = block_size nodes (Stage B). Auto-bumps --dflash-topk "
-        "to 2 if needed. Strong-correctness preserved by construction.",
+        "DFlash drafter: enable multi-seq tree-shaped verify. The driver builds a tree "
+        "of likely continuations from the draft's per-position top-K, runs one target "
+        "verify pass with one seq_id per branch, and picks the longest accepted chain. "
+        "Default tree shape (no --dflash-tree-budget): chain seed plus one alt at depth 1, "
+        "totaling block_size nodes. Auto-bumps --dflash-topk to 2 if needed.",
         [](common_params & params) {
             params.speculative.dflash_tree = true;
             if (params.speculative.dflash_topk < 2) {
@@ -3577,15 +3575,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--dflash-tree-budget"}, "B",
         string_format(
-            "DFlash drafter (Stage C): total tree node budget excluding the implicit root "
-            "(default: %d, 0 = Stage B shape). Implies --dflash-tree. Tree composition: "
-            "chain seed of min(B, block_size-1) main-path nodes, then uniform round-robin "
-            "sibling expansion (rank 1, 2, ..., K-1 across all depths) until B nodes total. "
-            "n_branches = 1 + (B - chain_len). Recommended budgets to try (per measured arch): "
-            "16 (Stage B), 18 (Strix Halo gfx1151 Vulkan sweet spot — see Session 35, "
-            "+12.7%% mean over b=22 on Qwen3.5-27B Q4_K_M HE-10), 22 (Lucebox HIP "
-            "sweet spot on RTX 3090 / 5090 / Strix Halo HIP per their HIP_PERF_PLAN.md). "
-            "Strong-correctness preserved at any budget.",
+            "DFlash drafter: total tree node budget excluding the implicit root "
+            "(default: %d, 0 = use --dflash-tree default shape). Implies --dflash-tree. "
+            "Tree composition: chain seed of min(B, block_size-1) main-path nodes, then "
+            "uniform round-robin sibling expansion (rank 1, 2, ..., K-1 across all depths) "
+            "until B nodes total. n_branches = 1 + (B - chain_len).",
             params.speculative.dflash_tree_budget),
         [](common_params & params, int value) {
             if (value < 0) {
@@ -3614,23 +3608,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--dflash-inline-encoder"},
-        "DFlash [EXPERIMENTAL — NOT RECOMMENDED]: emit the encoder ops "
-        "(K/V projection from captured target hidden states) inline in "
-        "the target's decode graph instead of running them in a separate "
-        "post-decode pass on the draft context. Default off. "
-        "Currently only wired for the Qwen3 family (n_head_kv / n_rot "
-        "shared with the draft); aborts via assertion on Qwen3.5 family. "
-        "Measured net-negative on Qwen3-8B HE[0]: the encoder ops run "
-        "unconditionally on n_outputs=16 rows per chain iter even though "
-        "the sampler only keeps the K≈5–6 accepted ones, so the extra "
-        "matmul cost outweighs the saved graph-coordination overhead. "
-        "Kept opt-in for A/B comparison and as the architectural "
-        "prerequisite for future per-iter waste-reduction work. "
-        "Use DFLASH_DISABLE_INLINE_ENCODER=1 to force fallback to the "
-        "legacy path while keeping this flag set. See "
-        "logs/core_architecture/12_vulkan_opt_log.md Session 16 for "
-        "details and Session 17 for the planned follow-up (Phase 4 GDN "
-        "history kernel) that would actually ship a speedup.",
+        "DFlash [experimental, opt-in]: emit the encoder ops (K/V projection from "
+        "captured target hidden states) inline in the target's decode graph instead "
+        "of running them in a separate post-decode pass on the draft context. "
+        "Currently only wired for the Qwen3 family. Default off.",
         [](common_params & params) {
             params.speculative.dflash_inline_encoder = true;
         }
@@ -3638,16 +3619,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--dflash-gdn-history"},
-        "DFlash [EXPERIMENTAL]: Phase 4 GatedDeltaNet history kernel. "
-        "When set, the target's GDN op writes per-token recurrent state "
-        "to a persistent per-layer buffer; on partial draft acceptance, "
-        "the spec driver runs a small fixup graph that selects "
-        "state[K-1] for each GDN layer + standard seq_rm for full-attn "
-        "layers, replacing the FULL-seq_rm checkpoint+re-verify decode "
-        "round-trip. Currently only wired for the Qwen3.5 family (the "
-        "models that hit the FULL-seq_rm path). CUDA only. Default off "
-        "(legacy checkpoint+re-verify path). See "
-        "logs/core_architecture/12_vulkan_opt_log.md Sessions 17–18.",
+        "DFlash [experimental]: GatedDeltaNet history kernel. The target's GDN op "
+        "writes per-token recurrent state to a persistent per-layer buffer; on "
+        "partial draft acceptance, a small fixup graph selects state[K-1] for each "
+        "GDN layer (with standard seq_rm for full-attn layers), replacing the "
+        "checkpoint+re-verify decode round-trip. Currently wired for the Qwen3.5 "
+        "family. CUDA only. Default off.",
         [](common_params & params) {
             params.speculative.dflash_gdn_history = true;
         }
@@ -3655,14 +3632,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--dflash-gdn-history-f16"},
-        "DFlash [EXPERIMENTAL]: Phase 5. Allocate the per-layer GDN "
-        "history persistent buffer as F16 instead of F32. Halves the "
-        "per-layer footprint, which is mandatory for DDTree-22 on "
-        "Qwen3.5-27B in 32 GiB (the F32 buffer doesn't fit alongside "
-        "weights + KV cache). Implies --dflash-gdn-history. Auto-enabled "
-        "when --dflash-gdn-history is combined with --dflash-tree; pass "
-        "this flag explicitly to opt in for chain mode too. See "
-        "logs/core_architecture/12_vulkan_opt_log.md Session 21.",
+        "DFlash [experimental]: allocate the per-layer GDN history buffer as F16 "
+        "instead of F32 (halves its footprint). Implies --dflash-gdn-history. "
+        "Auto-enabled when --dflash-gdn-history is combined with --dflash-tree; "
+        "pass this flag explicitly to opt in for chain mode too.",
         [](common_params & params) {
             params.speculative.dflash_gdn_history_f16 = true;
             params.speculative.dflash_gdn_history     = true;
@@ -3671,15 +3644,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--dflash-tree-best-first"},
-        "DFlash drafter (Stage D): expand the verify tree by cumulative log-probability "
+        "DFlash drafter: expand the verify tree by cumulative log-probability "
         "(max-heap on log-prob from root) instead of the default round-robin uniform "
         "expansion. Same budget B, but every node added is the highest-probability "
-        "un-expanded position — higher expected coverage of the target output, "
-        "higher acceptance rate. Implies --dflash-tree and requires --dflash-topk >= 2. "
+        "un-expanded position. Implies --dflash-tree and requires --dflash-topk >= 2. "
         "Enables full-vocab logit readback on the draft so the host can compute "
-        "per-position log-probs (adds ~10ms total per 128-token generation; "
-        "negligible). Lucebox-style best-first expansion; reference variant in "
-        "lucebox/dflash/test/test_dflash.cpp::build_ddtree.",
+        "per-position log-probs.",
         [](common_params & params) {
             params.speculative.dflash_tree_best_first = true;
             params.speculative.dflash_tree            = true;

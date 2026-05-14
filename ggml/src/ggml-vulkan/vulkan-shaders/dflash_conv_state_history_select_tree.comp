@@ -1,16 +1,14 @@
 #version 450
 
-// DFlash Phase 5 (DDTree) tree-aware conv-state fixup. Same shape as the
-// chain variant (dflash_conv_state_history_select), but instead of picking
-// the K-1 contiguous rows ending at k_index, walks tree.parents[] starting
+// DFlash tree-aware conv-state fixup. Same shape as the chain variant
+// (dflash_conv_state_history_select), but instead of picking the K-1
+// contiguous rows ending at k_index, walks tree.parents[] starting
 // from k_index to compute the K-1 ANCESTOR offsets virt[K-2..0]. Each
 // invocation independently performs the walk; the path is uniform across
 // threads in the same workgroup so divergence is bounded.
 //
 // CUDA reference: ggml-cuda/gated_delta_net.cu
 //                 dflash_conv_state_history_select_tree_cuda.
-// Lucebox reference: dflash/test/test_dflash.cpp:2733-2738 (virt[] parent walk).
-//
 // Layout matches the chain variant:
 //   conv_history:  [conv_history_rows, conv_channels, n_seqs] f32 contiguous
 //   parent_ids:    [parent_ids_n_tokens] i32 contiguous (n_tokens × n_seqs

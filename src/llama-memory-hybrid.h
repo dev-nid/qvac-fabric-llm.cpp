@@ -78,10 +78,10 @@ public:
     void set_tree_mode_active(bool active) override;
 
     // Tree-aware compaction. Forwards to the attn (kv-cache) half. The
-    // recurrent half is a no-op: in DDTree mode the GDN+conv state is
-    // already correct via the Phase 4 state_select fixup APIs (state_select
-    // copies the chosen-branch slab into the seq's slot before the next
-    // verify), so there's no recurrent-side compaction to perform.
+    // recurrent half is a no-op: in tree mode the GDN+conv state is already
+    // correct via the state_select fixup APIs (state_select copies the
+    // chosen-branch slab into the seq's slot before the next verify), so
+    // there's no recurrent-side compaction to perform.
     bool keep_positions_range(
             llama_seq_id      seq_id,
             const llama_pos * positions,
@@ -101,11 +101,11 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
-    // DFlash Phase 4 partial-tail removal (chain mode only). Forwards to
+    // DFlash chain-mode partial-tail removal. Forwards to
     // mem_recr->seq_rm_partial_tail_state_managed_externally for the
     // recurrent half and mem_attn->seq_rm for the attn half. The caller
     // must overwrite recurrent state for the rewound cell before the
-    // next decode (DFlash Phase 4 fixup graph does this).
+    // next decode (the in-graph fixup does this).
     bool seq_rm_partial_tail_state_managed_externally(
             llama_seq_id seq_id,
             llama_pos    p0,

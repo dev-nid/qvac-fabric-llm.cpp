@@ -119,7 +119,7 @@ struct llama_memory_i {
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
 
     //
-    // DFlash Phase 5 (DDTree): tree-aware ubatch write path
+    // DFlash tree-aware ubatch write path
     //
 
     // When tree mode is active on the unified KV cache, apply_ubatch skips
@@ -141,7 +141,7 @@ struct llama_memory_i {
     // supplied. Cells with seq_id and pos >= p_min that are NOT in
     // positions[] are dropped. Cells with pos < p_min are untouched.
     //
-    // Used by the DDTree spec driver after the accept walk: the verify
+    // Used by the tree-mode spec driver after the accept walk: the verify
     // batch wrote tree-depth positions (with sibling duplicates); after
     // the sampler picks the accepted path, this call restores the
     // monotonic-positions invariant the rest of the cache assumes.
@@ -152,7 +152,7 @@ struct llama_memory_i {
     //                          always single-seq
     //
     // Default: no-op returning true (recurrent half is no-op since the
-    // GDN+conv state was already fixed up via the Phase 4 state_select APIs).
+    // GDN+conv state was already fixed up via the state_select APIs).
     virtual bool keep_positions_range(
             llama_seq_id      seq_id,
             const llama_pos * positions,
@@ -174,8 +174,8 @@ struct llama_memory_i {
     // rejected.
     //
     // Defaults to no-op = true (recurrent half: GDN+conv state is fixed up
-    // via the Phase 4/5 state_select / conv_state_history_select APIs and
-    // needs no separate compaction here).
+    // via the state_select / conv_state_history_select APIs and needs no
+    // separate compaction here).
     virtual bool keep_cells_dfs_ordinals_range(
             llama_seq_id    seq_id,
             const int32_t * dfs_keep,

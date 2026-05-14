@@ -348,12 +348,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
-    // DFlash Phase 4 conv-state fixup. Active for the chain-verify
-    // ubatch shape that fits the persistent buffer
-    // (1 < n_seq_tokens * n_seqs <= gdn_history_max_tokens). Phase 5
-    // tree mode (cparams.n_seq_max > 1) takes the parallel
-    // ggml_ssm_conv_tree path below using parent_ids — both arms are
-    // gated by the same dflash/buffer-allocation predicate.
+    // DFlash conv-state fixup. Active for the chain-verify ubatch shape
+    // that fits the persistent buffer
+    // (1 < n_seq_tokens * n_seqs <= gdn_history_max_tokens). Tree mode
+    // (cparams.n_seq_max > 1) takes the parallel ggml_ssm_conv_tree path
+    // below using parent_ids; both arms are gated by the same
+    // dflash/buffer-allocation predicate.
     const bool use_gdn_history_layer =
         cparams.dflash_gdn_history &&
         n_seq_tokens > 1 &&
@@ -365,7 +365,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         n_seq_tokens <= dflash->gdn_history_max_tokens &&
         n_seqs       <= dflash->gdn_history_n_seqs_max;
 
-    // Phase 5 tree-mode predicate: same gate plus n_seq_max > 1 (graph
+    // tree-mode predicate: same gate plus n_seq_max > 1 (graph
     // builder-level signal that the spec driver is wiring a tree). The
     // graph builder fetches parent_ids ONCE per layer; it's the same
     // host source across layers (see set_input in llama-graph.cpp).
@@ -398,10 +398,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
                     "use_gdn_history_layer gate is on but "
                     "build_dflash_gdn_fixup_k_index_or_null returned null");
 
-        // Phase 5 (DDTree): tree-aware variant walks tree.parents[] to
-        // gather the K-1 ancestor input slots from conv_history (alt-accept
-        // iters where the deepest accepted DFS slot's K-1 ancestors are
-        // not its K-1 DFS predecessors). Chain-mode and chain-shape tree
+        // tree-aware variant walks tree.parents[] to gather the K-1 ancestor
+        // input slots from conv_history (alt-accept iters where the deepest
+        // accepted DFS slot's K-1 ancestors are not its K-1 DFS predecessors).
+        // Chain-mode and chain-shape tree
         // verifies (parents[i] == i-1 along the main path) degenerate to
         // the same K-1 contiguous rows as the chain op.
         ggml_tensor * conv_states_fixed = (use_tree_mode_layer && parent_ids != nullptr)
@@ -433,9 +433,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
 
-    // DFlash Phase 4: persist conv_input into the per-layer conv_history
-    // buffer for the NEXT decode to roll back from. Gated by the SAME
-    // condition as the fixup read above — only when this layer's GDN
+    // persist conv_input into the per-layer conv_history buffer for the
+    // NEXT decode to roll back from. Gated by the SAME condition as the
+    // fixup read above; only when this layer's GDN
     // ops will run in chain-verify mode and the persistent buffer is
     // wide enough to hold this iter's conv_input rows.
     if (use_gdn_history_layer) {
@@ -448,7 +448,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_input, conv_hist_dst));
     }
 
-    // DFlash Phase 4: GDN history fixup. When the host has set
+    // DFlash GDN history fixup. When the host has set
     // dflash->gdn_history_k_index >= 0 (partial-acceptance rollback), the
     // state_select op returns state_history[k_index] from the previous
     // chain-verify decode. When k_index < 0 (first decode after prefill,
@@ -478,16 +478,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     }
     cb(state, "state_predelta", il);
 
-    // Phase 5: tree-mode conv path. Replaces ggml_ssm_conv with the
-    // parent-aware variant so sibling tree branches gather their conv
-    // window from their tree-parent token instead of the DFS
-    // predecessor. Without this, branches that diverge from the main
+    // tree-mode conv path. Replaces ggml_ssm_conv with the parent-aware
+    // variant so sibling tree branches gather their conv window from their
+    // tree-parent token instead of the DFS predecessor. Without this,
+    // branches that diverge from the main
     // path mid-tree pull conv inputs from unrelated tokens and the conv
     // output cross-contaminates.
     //
-    // Reference: lucebox/lucebox-hub/dflash/src/qwen35_target_graph.cpp
-    // line ~908 (ggml_ssm_conv_tree call). MIT-licensed, Copyright
-    // 2026 Lucebox.
     ggml_tensor * conv_output_proper = use_tree_mode_layer
         ? ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, parent_ids)
         : ggml_ssm_conv     (ctx0, conv_input, conv_kernel);
@@ -546,13 +543,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    // DFlash Phase 4 chain-history / Phase 5 tree-history path. When
-    // the target context was constructed with cparams.dflash_gdn_history
-    // and we're inside a verify ubatch (n_seq_tokens > 1) that fits the
-    // persistent buffer, use the history-emitting GDN op. Tree mode
-    // (cparams.n_seq_max > 1) routes through the _tree variant which
-    // takes parent_ids + writes intermediates directly into the
-    // persistent buffer (Session 22 kernel design).
+    // DFlash GDN-with-history path (chain or tree). When the target context
+    // was constructed with cparams.dflash_gdn_history and we're inside a
+    // verify ubatch (n_seq_tokens > 1) that fits the persistent buffer, use
+    // the history-emitting GDN op. Tree mode (cparams.n_seq_max > 1) routes
+    // through the _tree variant which takes parent_ids and writes
+    // intermediates directly into the persistent buffer.
     auto attn_out = use_gdn_history_layer
         ? (use_tree_mode_layer
               ? build_delta_net_with_history_tree(q_conv, k_conv, v_conv,

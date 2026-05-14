@@ -8,9 +8,9 @@
 
 struct common_speculative;
 
-// DDTree (DFlash Phase 2): tree of likely continuations the DFlash drafter
-// emits in a single forward pass, used to feed a tree-shaped target verify
-// batch (one decode = up to L+1 accepted tokens for L tree depth).
+// tree of likely continuations the DFlash drafter emits in a single forward
+// pass, used to feed a tree-shaped target verify batch (one decode = up to
+// L+1 accepted tokens for L tree depth)
 //
 // Indexing convention:
 //   * Index 0 is the implicit root (id_last). Carries no entry in
@@ -40,8 +40,8 @@ struct common_speculative_tree {
     int                      main_path_len = 0;
     int                      n_branches    = 1;
 
-    // Phase 5: emit a parent_ids tensor of shape [n_tokens, n_seqs] in
-    // row-major order (out[t + s * n_tokens] = parent of token t in seq s)
+    // parent_ids in row-major [n_tokens, n_seqs] layout
+    // (out[t + s * n_tokens] = parent of token t in seq s),
     // matching the layout expected by ggml_gated_delta_net_with_history_tree
     // and ggml_ssm_conv_tree.
     //
@@ -81,9 +81,9 @@ llama_tokens common_speculative_draft(
                      const llama_tokens & prompt,
                             llama_token   id_last);
 
-// DDTree (DFlash Phase 2): tree-shaped variant of common_speculative_draft.
-// Runs the draft once (same compute as draft) and returns a tree of
-// candidate continuations built from the draft's per-position top-K. The
+// tree-shaped variant of common_speculative_draft. Runs the draft once
+// (same compute as draft) and returns a tree of candidate continuations
+// built from the draft's per-position top-K. The
 // caller is responsible for tagging the verify batch with multi-seq seq_ids
 // (one per branch_id), running ONE target verify, walking the accept tree
 // to pick the longest accepted chain, and the per-branch KV rollback.
@@ -97,9 +97,8 @@ common_speculative_tree common_speculative_draft_tree(
                      const llama_tokens & prompt,
                             llama_token   id_last);
 
-// DDTree Phase 2 Stage C — alt-accept fast path:
-//
-// Tells the speculative state that the most recent tree-verify decode's
+// alt-accept fast path: tells the speculative state that the most recent
+// tree-verify decode's
 // accept walk descended into an alt branch at tree index `alt_capture_idx`
 // (= the alt's output index in the tree-decode batch) and tree depth
 // `alt_depth` (1-based). The next draft_tree call's side-store extend will

@@ -1,7 +1,6 @@
 #include "speculative.h"
 
 #include "common.h"
-#include "dflash-gpu-log.h"
 #include "ggml.h"
 #include "llama.h"
 #include "log.h"
@@ -155,8 +154,7 @@ struct common_speculative_state {
             llama_token id_last,
             llama_tokens & result) = 0;
 
-    // DDTree (DFlash Phase 2): tree-shaped draft.
-    // Default impl returns an empty tree (chain-mode-only states).
+    // tree-shaped draft; default impl returns an empty tree (chain-only states)
     virtual void draft_tree(
             const common_params_speculative & /*params*/,
             const llama_tokens & /*prompt_tgt*/,
@@ -165,8 +163,8 @@ struct common_speculative_state {
         result = {};
     }
 
-    // DDTree Phase 2 Stage C alt-accept fast path. Default impl is a no-op
-    // (DRAFT speculative state has no captures buffer to remap).
+    // alt-accept fast-path hint; default impl is a no-op (DRAFT speculative
+    // state has no captures buffer to remap)
     virtual void record_alt_accept(int /*alt_capture_idx*/, int /*alt_depth*/) {}
 
     virtual void accept(uint16_t n_accepted) = 0;
@@ -959,9 +957,8 @@ struct common_speculative_state_dflash : public common_speculative_state {
     // the DFlash encoder into the draft's per-layer K/V side store.
     int64_t               n_committed_total  = 0;
 
-    // DDTree Phase 2 Stage C — alt-accept fast path.
-    //
-    // When the driver's tree-verify accept walk descends into an alt
+    // alt-accept fast path: when the driver's tree-verify accept walk descends
+    // into an alt
     // branch, it calls record_alt_accept(alt_capture_idx, alt_depth)
     // INSTEAD OF redecoding `[id_last, m_1, ..., m_{d-1}, alt_token]` in
     // seq 0. The fields below stash the hint; the next draft_tree →
@@ -974,14 +971,14 @@ struct common_speculative_state_dflash : public common_speculative_state {
     // remapped captures rows for an alt-accept extend.
     std::vector<float>    alt_remap_buf;
 
-    // Scratch buffers for best-first DDTree expansion (Stage D Phase A).
-    // Hold per-position top-K log-probs and token IDs computed host-side
-    // from the draft's full-vocab logits. Sized to `block_size * topk_K`
+    // scratch buffers for best-first tree expansion: per-position top-K
+    // log-probs and token IDs computed host-side from the draft's full-vocab
+    // logits, sized to `block_size * topk_K`
     // and reused across draft_tree() calls.
     std::vector<float>    best_first_logprobs;
     std::vector<int32_t>  best_first_tokens;
 
-    // Phase 2: when true, the encoder runs on ctx_tgt's scheduler via
+    // when true, the inline encoder runs on ctx_tgt's scheduler via
     // llama_dflash_inline_encode_from_ctx() instead of on ctx_dft's via
     // llama_dflash_extend_from_ctx(). Set from params.dflash_inline_encoder
     // at construction time; immutable for the life of this state.
@@ -1027,19 +1024,13 @@ struct common_speculative_state_dflash : public common_speculative_state {
                                      n_embd_target);
         }
 
-        // Phase 3: enable the device-to-device capture path. The target
-        // skips the per-decode D2H of captured_features; this consumer
-        // pulls captures straight from the target's device-resident packed
-        // tensor via llama_dflash_extend_from_ctx(). The rare alt-remap
-        // path (record_alt_accept) forces a one-shot D2H readback inline.
-        // Can be disabled via DFLASH_DISABLE_DEVICE_CAPTURES=1 for
-        // bisecting if a regression is suspected.
-        {
-            const char * dis = std::getenv("DFLASH_DISABLE_DEVICE_CAPTURES");
-            const bool   disable = dis && dis[0] != '\0' && std::strcmp(dis, "0") != 0;
-            if (!disable && !target_layer_ids.empty()) {
-                llama_dflash_set_skip_host_readback(ctx_tgt, true);
-            }
+        // enable the device-to-device capture path. The target skips the
+        // per-decode D2H of captured_features; this consumer pulls captures
+        // straight from the target's device-resident packed tensor via
+        // llama_dflash_extend_from_ctx(). The rare alt-remap path
+        // (record_alt_accept) forces a one-shot D2H readback inline.
+        if (!target_layer_ids.empty()) {
+            llama_dflash_set_skip_host_readback(ctx_tgt, true);
         }
 
         LOG_INF("%s: dflash spec initialised: block_size=%u, mask_token=%d, "
@@ -1074,7 +1065,6 @@ struct common_speculative_state_dflash : public common_speculative_state {
     // Pre-V2 callers that didn't install capture before their prefill
     // still get the documented re-decode path (kept as a fallback).
     void begin(const llama_tokens & prompt) override {
-        DFLASH_GPU_TIMER("dflash.begin (extend + optional re-decode)", ctx_tgt);
         llama_dflash_reset_ctx_kv(ctx_dft);
         n_committed_total       = 0;
         pending_alt_capture_idx = -1;
@@ -1115,12 +1105,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
         for (int i = 0; i < n_to_decode; ++i) {
             common_batch_add(batch_tgt, prompt[i], (llama_pos) i, { 0 }, /*logits=*/true);
         }
-        {
-            DFLASH_GPU_TIMER("dflash.begin: target prompt re-decode (fallback)", ctx_tgt);
-            if (llama_decode(ctx_tgt, batch_tgt) != 0) {
-                LOG_ERR("%s: target prompt prefill (with capture) failed\n", __func__);
-                return;
-            }
+        if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+            LOG_ERR("%s: target prompt prefill (with capture) failed\n", __func__);
+            return;
         }
 
         if (!extend_side_store(n_to_decode, /*pos_start=*/0)) {
@@ -1178,12 +1165,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
             const llama_token tok = (i == 0) ? id_last : mask_token_id;
             common_batch_add(batch_dft, tok, pos_block_start + i, { 0 }, /*logits=*/true);
         }
-        {
-            DFLASH_GPU_TIMER("draft chain decode", ctx_dft);
-            if (llama_decode(ctx_dft, batch_dft) != 0) {
-                LOG_ERR("%s: draft llama_decode failed\n", __func__);
-                return;
-            }
+        if (llama_decode(ctx_dft, batch_dft) != 0) {
+            LOG_ERR("%s: draft llama_decode failed\n", __func__);
+            return;
         }
 
         // Step 3: read top-K candidates per draft position (bidirectional
@@ -1213,9 +1197,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // of the incoming prompt_tgt; nothing to do here.
     }
 
-    // DDTree (DFlash Phase 2): tree-shaped variant of draft().
-    // Same draft compute (one DFlash forward pass), different post-
-    // processing — the tree builder consumes draft_topk directly instead
+    // tree-shaped variant of draft(): same draft compute (one DFlash forward
+    // pass), different post-processing - the tree builder consumes draft_topk
+    // directly instead
     // of flattening to a chain.
     void draft_tree(
             const common_params_speculative & params,
@@ -1257,12 +1241,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
             const llama_token tok = (i == 0) ? id_last : mask_token_id;
             common_batch_add(batch_dft, tok, pos_block_start + i, { 0 }, /*logits=*/true);
         }
-        {
-            DFLASH_GPU_TIMER("draft tree decode", ctx_dft);
-            if (llama_decode(ctx_dft, batch_dft) != 0) {
-                LOG_ERR("%s: draft llama_decode failed\n", __func__);
-                return;
-            }
+        if (llama_decode(ctx_dft, batch_dft) != 0) {
+            LOG_ERR("%s: draft llama_decode failed\n", __func__);
+            return;
         }
 
         // Read top-K candidates per draft position.
@@ -1275,16 +1256,15 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
-        // Resolve tree budget. 0 = Stage B default (= block_size).
+        // resolve tree budget; 0 = default shape (= block_size)
         const int budget = (params.dflash_tree_budget > 0)
                          ? params.dflash_tree_budget
                          : block_size;
 
         if (params.dflash_tree_best_first && topk_K >= 3) {
-            // Best-first DDTree Phase A: pull full-vocab logits, compute
-            // per-position log-probs (lucebox-style logsumexp) and select
-            // leaf-alts ordered by log-prob instead of round-robin rank.
-            // dflash_emit_logits must have been set on ctx_dft for this to
+            // pull full-vocab logits, compute per-position log-probs (online
+            // logsumexp), and select leaf-alts ordered by log-prob instead of
+            // round-robin rank. dflash_emit_logits must be set on ctx_dft
             // work; if absent we fall through to uniform.
             //
             // Skipped for K<3: with K=2 there is exactly one alt per depth,
@@ -1337,18 +1317,16 @@ private:
     // `n_keep` of them into the draft's per-layer K/V side store at offset
     // `pos_start`. Wraps llama_dflash_extend with a friendlier error path.
     //
-    // Stage C alt-accept fast path: when a record_alt_accept hint is
-    // pending, the captures buffer holds the previous tree-decode outputs
-    // at indices [0..main_path_len, alt_1, ..., alt_n]; we want to push
-    // `[0, 1, ..., d-1, alt_capture_idx]` into the side store (= replace
-    // the rejected m_d capture with the accepted alt's at depth d). The
-    // remap is done host-side into `alt_remap_buf`.
+    // alt-accept fast path: when a record_alt_accept hint is pending, the
+    // captures buffer holds the previous tree-decode outputs at indices
+    // [0..main_path_len, alt_1, ..., alt_n]; push
+    // [0, 1, ..., d-1, alt_capture_idx] into the side store, replacing the
+    // rejected m_d capture with the accepted alt's at depth d. The remap is
+    // done host-side into alt_remap_buf.
     bool extend_side_store(int64_t n_keep, int64_t pos_start) {
-        DFLASH_GPU_TIMER("extend_side_store (capture readback + dflash_extend)", ctx_dft);
-
-        // Phase 3 inline-encoder fast path: the encoder ops already ran
-        // inside the target's main decode graph and wrote n_outputs
-        // captured rows to side-store slots [write_offset..write_offset
+        // inline-encoder fast path: the encoder ops already ran inside the
+        // target's main decode graph and wrote n_outputs captured rows to
+        // side-store slots [write_offset..write_offset
         // + n_outputs - 1]. All we need to do is advance ctx_filled by
         // n_keep (the accepted-token count) so the draft attention sees
         // exactly those rows. Unaccepted rows live above the boundary
@@ -1364,16 +1342,15 @@ private:
             // mode limits don't hit this in practice).
             (void) pos_start;
             llama_dflash_inline_advance_ctx_filled(ctx_dft, n_keep);
-            ::dflash_gpu_log::logger::instance().incr_extend_calls();
             return true;
         }
 
         int64_t n_outputs = 0;
         const float * captures = llama_get_dflash_captured_features(ctx_tgt, &n_outputs);
 
-        // Phase 3: alt-remap path needs host bytes for the row reshuffle.
-        // In skip_host_readback mode the target didn't D2H this iteration,
-        // so issue a one-shot readback. The blocking sync inside is the
+        // alt-remap needs host bytes for the row reshuffle. In
+        // skip_host_readback mode the target didn't D2H this iteration, so
+        // issue a one-shot readback. The blocking sync inside is the
         // (rare) cost for tree-mode alt-accept.
         if (pending_alt_capture_idx >= 0 && captures == nullptr && n_outputs > 0) {
             const int32_t rc = llama_dflash_force_host_readback(ctx_tgt);
@@ -1384,9 +1361,9 @@ private:
             captures = llama_get_dflash_captured_features(ctx_tgt, &n_outputs);
         }
 
-        // Phase 2 device fast path: when no alt-remap is pending, read
-        // straight from the target's device-resident packed captures and
-        // skip the host bounce entirely.
+        // device fast path: when no alt-remap is pending, read straight from
+        // the target's device-resident packed captures and skip the host
+        // bounce entirely.
         const bool can_use_device_path = (pending_alt_capture_idx < 0);
         if (can_use_device_path) {
             // n_outputs may be 0 here if skip_host_readback dropped the
@@ -1403,19 +1380,10 @@ private:
                         __func__, (long long) n_keep, (long long) n_outputs_dev);
                 return false;
             } else {
-                ::dflash_gpu_log::logger::instance().incr_extend_calls();
-                ::dflash_gpu_log::logger::instance().add_h2d_bytes(
-                    (uint64_t) n_keep * (uint64_t) n_features * sizeof(float));
-                // Phase 2: when inline-encoder is requested, run the encoder
-                // on the target's scheduler. Falls back to the draft-side
-                // path on failure so a stricter regression is still possible
-                // (set DFLASH_DISABLE_INLINE_ENCODER=1 to force the fallback
-                // for back-to-back A/B testing).
-                static const bool inline_disable_env = []() {
-                    const char * e = std::getenv("DFLASH_DISABLE_INLINE_ENCODER");
-                    return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
-                }();
-                if (dflash_inline_encoder && !inline_disable_env) {
+                // when inline-encoder is requested, run the encoder on the
+                // target's scheduler. Falls back to the draft-side path on
+                // failure so a stricter regression is still possible.
+                if (dflash_inline_encoder) {
                     const int32_t rc_inline = llama_dflash_inline_encode_from_ctx(
                         ctx_tgt, ctx_dft, /*src_row_offset=*/0, n_keep, pos_start);
                     if (rc_inline == 0) {
@@ -1444,10 +1412,6 @@ private:
                     __func__, (long long) n_keep, (long long) n_outputs);
             return false;
         }
-
-        ::dflash_gpu_log::logger::instance().incr_capture_transpose_calls();
-        ::dflash_gpu_log::logger::instance().add_d2h_bytes(
-            (uint64_t) n_outputs * (uint64_t) n_features * sizeof(float));
 
         const float * extend_buf = captures;
 
@@ -1488,16 +1452,11 @@ private:
                 row_floats * sizeof(float));
             extend_buf = alt_remap_buf.data();
 
-            ::dflash_gpu_log::logger::instance().incr_alt_remap_calls();
-
             // Consume the hint: subsequent extends use the linear path.
             pending_alt_capture_idx = -1;
             pending_alt_depth       = 0;
         }
 
-        ::dflash_gpu_log::logger::instance().incr_extend_calls();
-        ::dflash_gpu_log::logger::instance().add_h2d_bytes(
-            (uint64_t) n_keep * (uint64_t) n_features * sizeof(float));
         const int32_t rc = llama_dflash_extend(ctx_dft, extend_buf, n_keep, pos_start);
         if (rc != 0) {
             LOG_ERR("%s: llama_dflash_extend failed (rc=%d)\n", __func__, rc);
@@ -1506,11 +1465,9 @@ private:
         return true;
     }
 
-    // Host-side top-K + log-prob extraction from raw draft logits. Used by
-    // best-first DDTree expansion (Phase A: leaf-alts ordered by per-(depth,rank)
-    // log-prob). Implements lucebox's `extract_draft_topk` (lucebox/dflash/
-    // test/test_dflash.cpp): single pass over the vocab per position, online
-    // logsumexp + bounded-K heap. Output is descending by log-prob.
+    // host-side top-K + log-prob extraction from raw draft logits, used by
+    // best-first tree expansion: single pass over the vocab per position,
+    // online logsumexp + bounded-K heap. Output is descending by log-prob.
     //
     // Inputs:  logits [n_pos * vocab]
     // Outputs: out_log_probs [n_pos * K], out_token_ids [n_pos * K]
@@ -1565,20 +1522,20 @@ private:
         }
     }
 
-    // Stage D-PhaseA tree shape: chain seed (top-1 at depths 1..bs-1, capped
-    // at budget) + best-first leaf-alt selection from `(depth, rank)` tuples
+    // best-first tree shape: chain seed (top-1 at depths 1..bs-1, capped at
+    // budget) plus best-first leaf-alt selection from (depth, rank) tuples
     // ordered by per-position log-prob.
     //
-    // Same topology family as Stage C (leaf-alts only, compatible with the
-    // existing verify-side seq_id tagging in speculative-simple.cpp); the
-    // difference is *which* alts get included when budget < (K-1)*chain_len.
+    // Same topology family as the uniform-expansion shape (leaf-alts only,
+    // compatible with the verify-side seq_id tagging in speculative-simple.cpp);
+    // the difference is *which* alts get included when budget < (K-1)*chain_len.
     // Uniform expansion fills rank 1 across all depths first, then rank 2,
     // etc. — depth-blind. Best-first picks the (depth, rank) tuples with the
     // highest log-prob regardless of rank, which biases the budget toward
     // alts the draft is most uncertain about.
     //
-    // Deeper alt subtrees (lucebox's full algorithm) require ancestry-aware
-    // seq_id tagging on the verify batch and are deferred to Phase B.
+    // Deeper alt subtrees would require ancestry-aware seq_id tagging on the
+    // verify batch and are deferred.
     static void build_ddtree_tree_bestfirst_leaf(
             const float   * topk_logprobs,
             const int32_t * topk_tokens,
@@ -1678,9 +1635,9 @@ private:
         }
     }
 
-    // Stage C tree shape: chain seed (top-1 at depths 1..bs-1, capped at
-    // budget) + uniform round-robin sibling expansion (rank 1..K-1 across
-    // all depths) until budget is exhausted. Each alt is a LEAF hanging
+    // uniform tree shape: chain seed (top-1 at depths 1..bs-1, capped at
+    // budget) + round-robin sibling expansion (rank 1..K-1 across all depths)
+    // until budget is exhausted. Each alt is a leaf hanging
     // off the main chain at its depth and gets a unique branch_id.
     static void build_ddtree_tree(const int32_t * draft_topk,
                                   int             block_size,
@@ -1728,7 +1685,7 @@ private:
             tree.main_path_len = tree.n_nodes;
         }
 
-        // ----- alt leaves (Stage C uniform expansion) -----
+        // ----- alt leaves (uniform expansion) -----
         if (topk_K >= 2 && tree.n_nodes < budget) {
             int next_branch = 1;
             for (uint32_t rank = 1; rank < topk_K && tree.n_nodes < budget; ++rank) {
@@ -1753,7 +1710,7 @@ private:
             tree.n_branches = next_branch;
         }
 
-        // ----- visibility matrix (Stage A tree-mask compatibility) -----
+        // ----- visibility matrix (used for the verify-side tree mask) -----
         const int n = tree.n_nodes + 1;
         tree.visibility.assign((size_t) n * n, 0);
         tree.visibility[0 * n + 0] = 1;
@@ -1866,12 +1823,11 @@ common_speculative * common_speculative_init(
                     __func__);
         }
 
-        // Phase 1 plumbing for inline DFlash encoder. Populates non-owning
-        // pointers on the target model that reference the draft's encoder
-        // weights (dflash_fc, dflash_hidden_norm, per-layer wk/wv/k_norm).
-        // Phase 3 graph wiring (when --dflash-inline-encoder is set) hooks
-        // these into the target's main decode graph after the final
-        // captured layer.
+        // inline-encoder plumbing: populate non-owning pointers on the target
+        // model that reference the draft's encoder weights (dflash_fc,
+        // dflash_hidden_norm, per-layer wk/wv/k_norm). When
+        // --dflash-inline-encoder is set, the graph builder hooks these into
+        // the target's main decode graph after the final captured layer.
         if (params.dflash_inline_encoder) {
             if (!llama_dflash_bind_encoder(
                     const_cast<llama_model *>(model_tgt),
@@ -1890,9 +1846,9 @@ common_speculative * common_speculative_init(
         }
     }
 
-    // Phase 3 inline encoder: bind draft's side-store K/V tensors onto the
-    // target context so the target's inline encoder ops can set_rows into
-    // them. Done here (after draft context creation) because the side
+    // inline-encoder: bind draft's side-store K/V tensors onto the target
+    // context so the target's inline encoder ops can set_rows into them.
+    // Done here (after draft context creation) because the side
     // store is allocated in the draft context's constructor.
     if (want_dflash && params.dflash_inline_encoder && ctx_dft != nullptr) {
         if (!llama_dflash_bind_inline_side_store(ctx_tgt, ctx_dft)) {

@@ -264,9 +264,9 @@ private:
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
-    // DFlash Phase 5 (DDTree): when true, apply_ubatch's contiguity-invariant
-    // purge step is bypassed. Toggled by llama_context::{set,clear}_tree_mask
-    // via set_tree_mode_active. False on every existing chain-mode path.
+    // DFlash tree mode: when true, apply_ubatch's contiguity-invariant purge
+    // step is bypassed. Toggled by llama_context::{set,clear}_tree_mask via
+    // set_tree_mode_active. False on every chain-mode path.
     bool tree_mode_active = false;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type

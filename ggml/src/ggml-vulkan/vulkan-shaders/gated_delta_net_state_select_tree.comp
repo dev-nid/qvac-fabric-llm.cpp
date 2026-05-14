@@ -1,13 +1,12 @@
 #version 450
 
-// DFlash Phase 5 (DDTree) tree-mode variant of the GDN state-history fixup.
-// Extends the chain shader (gated_delta_net_state_select.comp) along two
-// axes:
-//   1. SrcT may be F16 (preprocessor INTER_T_F16=1) — kernel widens to F32
-//      on read. Chain mode keeps the F32 variant byte-exact with Phase 4.
+// DFlash tree-mode variant of the GDN state-history fixup. Extends the chain
+// shader (gated_delta_net_state_select.comp) along two axes:
+//   1. SrcT may be F16 (preprocessor INTER_T_F16=1); kernel widens to F32 on
+//      read. Chain mode keeps the F32 variant.
 //   2. k_index may be a [n_seqs] vector (push constant k_index_count > 1):
 //      each seq selects its own k. k_index_count == 1 falls back to the
-//      scalar broadcast path (Phase 4 chain-mode shape).
+//      scalar broadcast path.
 //
 // CUDA reference: ggml-cuda/gated_delta_net.cu gated_delta_net_state_select_cuda
 // templated on SrcT ∈ {float, __half}. Same dispatch / layout / clamp rules.

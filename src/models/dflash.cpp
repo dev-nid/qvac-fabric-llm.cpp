@@ -319,7 +319,7 @@ llama_model_dflash::graph::graph(const llama_model & model, const llm_graph_para
     }
     // Default: skip the bs * n_vocab * 4 byte logits readback (chain mode and
     // uniform-expansion tree mode never need it). When dflash_emit_logits is
-    // set (best-first DDTree), emit the full logits so the host can do
+    // set (best-first tree expansion), emit the full logits so the host can do
     // softmax + log-prob top-K for the heap-based tree builder.
     res->t_logits             = cparams.dflash_emit_logits ? logits : nullptr;
     res->t_dflash_topk        = topk;
@@ -334,9 +334,7 @@ llama_model_dflash::graph::graph(const llama_model & model, const llm_graph_para
     }
 }
 
-// =================================================================
 // llama_model_dflash::encode_graph
-// =================================================================
 //
 // One-shot graph that projects newly-committed target features through
 // `fc + hidden_norm + per-layer wk/wv (+k_norm +RoPE for K)` and scatters

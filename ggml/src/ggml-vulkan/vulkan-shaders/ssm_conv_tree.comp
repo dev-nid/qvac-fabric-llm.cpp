@@ -1,6 +1,6 @@
 #version 450
 
-// DFlash Phase 5 (DDTree) tree-aware SSM conv kernel.
+// DFlash tree-aware SSM conv kernel.
 //
 // For each new-token i in a tree-shaped batch, walks parent_ids K-1 times
 // to assemble the K-tap conv window from this token's ANCESTOR slots
