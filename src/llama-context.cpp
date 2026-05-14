@@ -3013,7 +3013,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 // Skip the D2H entirely when the consumer is going to read
                 // straight from the device tensor via
                 // llama_dflash_extend_from_ctx(). captured_features stays
-                // empty in that case; llama_get_dflash_captured_features
+                // empty in that case; llama_dflash_get_captured_features
                 // returns nullptr until skip_host_readback is cleared.
                 if (!dflash.skip_host_readback) {
                     if (n_outputs_prev == 0) {
@@ -5142,7 +5142,7 @@ int32_t llama_decode(
 
 // DFlash speculative-decoding C API
 
-void llama_set_dflash_capture(struct llama_context * ctx,
+void llama_dflash_set_capture(struct llama_context * ctx,
                               const int32_t * layer_ids,
                               size_t          n_layer_ids,
                               int64_t         n_embd_target) {
@@ -5150,7 +5150,7 @@ void llama_set_dflash_capture(struct llama_context * ctx,
     ctx->set_dflash_capture(layer_ids, n_layer_ids, n_embd_target);
 }
 
-const float * llama_get_dflash_captured_features(struct llama_context * ctx,
+const float * llama_dflash_get_captured_features(struct llama_context * ctx,
                                                  int64_t * n_outputs_out) {
     if (ctx == nullptr) {
         if (n_outputs_out) *n_outputs_out = 0;
@@ -5159,7 +5159,7 @@ const float * llama_get_dflash_captured_features(struct llama_context * ctx,
     return ctx->get_dflash_captured_features(n_outputs_out);
 }
 
-const int32_t * llama_get_dflash_draft_topk(struct llama_context * ctx,
+const int32_t * llama_dflash_get_draft_topk(struct llama_context * ctx,
                                             int64_t * n_outputs_out,
                                             uint32_t * topk_out) {
     if (ctx == nullptr) {
@@ -5315,26 +5315,6 @@ void llama_set_tree_mask(struct llama_context * ctx,
 void llama_clear_tree_mask(struct llama_context * ctx) {
     if (ctx == nullptr) return;
     ctx->clear_tree_mask();
-}
-
-void llama_dflash_memory_breakdown(const struct llama_context * ctx,
-                                    struct llama_dflash_memory_buckets * out) {
-    if (out == nullptr) return;
-    *out = {};
-    if (ctx == nullptr) return;
-    const llama_dflash * d = ctx->get_dflash();
-    if (!d) return;
-    out->ctx_capacity = d->ctx_capacity;
-    out->ctx_filled   = d->ctx_filled;
-    out->n_layers     = (int) d->ctx_K.size();
-    for (auto * t : d->ctx_K) if (t) out->side_store_K_total += ggml_nbytes(t);
-    for (auto * t : d->ctx_V) if (t) out->side_store_V_total += ggml_nbytes(t);
-    out->captured_features_bytes = d->captured_features.size() * sizeof(float);
-    size_t staging_total = 0;
-    for (const auto & buf : d->capture_staging) staging_total += buf.size() * sizeof(float);
-    out->capture_staging_bytes  = staging_total;
-    out->draft_topk_bytes       = d->draft_topk.size() * sizeof(int32_t);
-    out->draft_topk_argmax_bytes = d->draft_topk_argmax.size() * sizeof(int32_t);
 }
 
 //

@@ -81,7 +81,7 @@ struct llama_cross {
 //       llama_dflash_extend(). The drafter graph reads `n_ctx` and the side
 //       store tensors `ctx_K[il]` / `ctx_V[il]` to build cross-attention.
 //   (b) On the *target* context — driver writes capture_layer_ids /
-//       capture_n_embd via llama_set_dflash_capture() before any decode.
+//       capture_n_embd via llama_dflash_set_capture() before any decode.
 //       The target graph tees out hidden states at those layer indices.
 struct llama_dflash {
     // ---------- (a) drafter sizing ----------

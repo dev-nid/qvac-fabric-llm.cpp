@@ -13,6 +13,37 @@ The `llama-server` application supports several implementations of speculative d
 A much smaller model (called the _draft model_) generates drafts.
 A draft model is the most used approach in speculative decoding.
 
+### DFlash (`dflash`)
+
+DFlash is a block-parallel speculative decoder. Instead of generating draft
+tokens one at a time, a small DFlash drafter produces a fixed-size block of
+candidate tokens in a single forward pass. The drafter and the target share
+K/V cache state through a per-layer side store, so the drafter does not need
+its own attention K/V over the prompt.
+
+DFlash requires a model pair: a target model plus a DFlash GGUF that carries
+`dflash.block_size` metadata. The drafter is small and is co-trained against
+its target. Currently the Qwen3 and Qwen3.5 families are supported as
+targets.
+
+By default the drafter runs in **chain mode**: each block position emits a
+single greedy candidate, and the target verifies the chain in one decode.
+With `--dflash-tree` (optionally with `--dflash-tree-budget`) the drafter
+produces a top-K per position and the speculative driver builds a tree of
+candidate continuations for the target to verify in a single pass.
+
+For target architectures with GatedDeltaNet layers (Qwen3.5), the
+`--dflash-gdn-history` flag enables an in-graph recurrent-state rollback on
+partial acceptance, replacing the checkpoint + re-verify round-trip. This
+path is implemented on CUDA. The Vulkan port covers chain mode; the Vulkan
+tree-mode GDN kernels are opt-in and may produce incorrect output.
+
+**Example:**
+
+```
+llama-server --model <target.gguf> --model-draft <target.dflash.gguf> --draft-type dflash
+```
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
@@ -145,6 +176,50 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
                                         comma-separated list of devices to use for offloading the draft model
 --spec-draft-replace, --spec-replace    TARGET  DRAFT
                                         translate the string in TARGET into DRAFT if the draft model and main model are not compatible
+```
+
+### DFlash Parameters
+
+```
+--draft-type                            TYPE
+                                        speculative decoding algorithm: 'auto' (default; selected from
+                                        the loaded draft GGUF), 'draft' (small vocab-compatible draft
+                                        model), or 'dflash'
+                                        (env: LLAMA_ARG_DRAFT_TYPE)
+--dflash-max-ctx                        N
+                                        sliding-window cap on the per-layer K/V side store
+                                        (default: -1, -1 = auto-scale, 0 = uncapped, >0 = explicit cap)
+                                        (env: LLAMA_ARG_DFLASH_MAX_CTX)
+--dflash-topk                           K
+                                        number of top-K candidate tokens emitted per draft position
+                                        (default: 1, 1 = chain mode, >=2 = tree mode)
+                                        (env: LLAMA_ARG_DFLASH_TOPK)
+--dflash-tree                           enable multi-seq tree-shaped verify; auto-bumps --dflash-topk
+                                        to 2 if needed
+                                        (env: LLAMA_ARG_DFLASH_TREE)
+--dflash-tree-budget                    B
+                                        total tree node budget excluding the implicit root
+                                        (default: 0, 0 = use --dflash-tree default shape);
+                                        implies --dflash-tree
+                                        (env: LLAMA_ARG_DFLASH_TREE_BUDGET)
+--dflash-tree-best-first                expand the verify tree by cumulative log-probability instead
+                                        of round-robin uniform expansion; implies --dflash-tree and
+                                        requires --dflash-topk >= 2
+                                        (env: LLAMA_ARG_DFLASH_TREE_BEST_FIRST)
+--dflash-gdn-history                    [experimental] in-graph GatedDeltaNet recurrent-state
+                                        rollback on partial acceptance (Qwen3.5 family, CUDA)
+                                        (env: LLAMA_ARG_DFLASH_GDN_HISTORY)
+--dflash-gdn-history-f16                [experimental] allocate the GDN history buffer as F16 instead
+                                        of F32 (halves its footprint); implies --dflash-gdn-history;
+                                        auto-enabled when combined with --dflash-tree
+                                        (env: LLAMA_ARG_DFLASH_GDN_HISTORY_F16)
+--dflash-inline-encoder                 [experimental] emit the encoder K/V projection inline in the
+                                        target's decode graph instead of running it as a separate
+                                        post-decode pass on the draft context (Qwen3 family)
+                                        (env: LLAMA_ARG_DFLASH_INLINE_ENCODER)
+--dflash-no-chat-template               disable auto-wrapping the prompt with the target model's chat
+                                        template (default: on when DFlash is active)
+                                        (env: LLAMA_ARG_DFLASH_NO_CHAT_TEMPLATE)
 ```
 
 ### n-gram Mod Parameters

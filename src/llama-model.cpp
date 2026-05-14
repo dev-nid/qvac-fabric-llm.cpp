@@ -2449,10 +2449,6 @@ int32_t llama_model_dflash_target_layer_id(const struct llama_model * model, int
     return h.dflash_target_layer_ids[i];
 }
 
-int32_t llama_model_dflash_num_target_layers(const struct llama_model * model) {
-    return (int32_t) model->hparams.dflash_num_target_layers;
-}
-
 bool llama_dflash_bind_target(struct llama_model * model_dft, const struct llama_model * model_tgt) {
     if (model_dft == nullptr || model_tgt == nullptr) {
         return false;

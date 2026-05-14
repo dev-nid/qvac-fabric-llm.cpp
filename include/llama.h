@@ -671,9 +671,6 @@ extern "C" {
     // Returns -1 on out-of-range or non-DFlash model.
     LLAMA_API int32_t llama_model_dflash_target_layer_id(const struct llama_model * model, int32_t i);
 
-    // Total number of target-model layers (informational; from training time).
-    LLAMA_API int32_t llama_model_dflash_num_target_layers(const struct llama_model * model);
-
     // DFlash: bind target model's tok_embd + lm_head into the draft
     //
     // Paper §4.2: "the draft model shares the token embedding layer and
@@ -710,16 +707,18 @@ extern "C" {
             struct llama_model *       model_tgt,
             const struct llama_model * model_dft);
 
+    // [EXPERIMENTAL]
     // bind the draft context's per-layer side-store K/V tensors as set_rows
     // destinations on the target context, so the target's graph can write
     // encoder outputs directly into the draft's side store cross-context.
-    // Must be called after both contexts are
-    // constructed. Returns false on null args or if draft side store is
-    // empty (e.g., not a DFlash draft context).
+    // Must be called after both contexts are constructed. Returns false on
+    // null args or if draft side store is empty (e.g., not a DFlash draft
+    // context).
     LLAMA_API bool llama_dflash_bind_inline_side_store(
             struct llama_context * ctx_tgt,
             struct llama_context * ctx_dft);
 
+    // [EXPERIMENTAL]
     // inline-encoder per-decode bookkeeping: set where in the side store to
     // write and the starting RoPE position for the encoder before each
     // llama_decode(ctx_tgt, batch). Read at graph compute time by the inline
@@ -729,12 +728,12 @@ extern "C" {
             int64_t                write_offset,
             int64_t                pos_start);
 
+    // [EXPERIMENTAL]
     // advance the draft context's side-store ctx_filled by n_keep (the
     // accepted-token count). Used after the target's inline encoder has
     // written n_outputs rows to the side store; the speculative driver
-    // calls this with n_keep == accepted
-    // count so subsequent draft reads see only the accepted prefix.
-    // No-op when n_keep <= 0 or ctx is null.
+    // calls this with n_keep == accepted count so subsequent draft reads
+    // see only the accepted prefix. No-op when n_keep <= 0 or ctx is null.
     LLAMA_API void llama_dflash_inline_advance_ctx_filled(
             struct llama_context * ctx_dft,
             int64_t                n_keep);
@@ -800,6 +799,7 @@ extern "C" {
             int32_t           n_positions,
             llama_pos         p_min);
 
+    // [EXPERIMENTAL]
     // tree-aware variant of llama_memory_keep_positions_range that identifies
     // cells by their cell-walk ordinal (= the order in which apply_ubatch
     // wrote them during the immediately-preceding tree-mode ubatch) instead
@@ -837,6 +837,7 @@ extern "C" {
             int32_t         n_keep,
             llama_pos       p_min);
 
+    // [EXPERIMENTAL]
     // GDN history fixup: set the per-decode k_index that the target's
     // GDN-layer state_select op consumes at the start of the next
     // llama_decode(ctx_tgt, ...).
@@ -862,6 +863,7 @@ extern "C" {
             struct llama_context * ctx_tgt,
             int32_t                k_index);
 
+    // [EXPERIMENTAL]
     // tree-mode variant: set per-seq k_index for the next decode.
     // `k_indices` is an array of `n_seqs` int32 entries (one accept depth
     // per branch in the tree-verify). Each entry follows the same
@@ -882,6 +884,7 @@ extern "C" {
             const int32_t *        k_indices,
             int32_t                n_seqs);
 
+    // [EXPERIMENTAL]
     // tree-mode: bind a parent_ids buffer (host-side int32, shape
     // [n_tokens, n_seqs]) for the next decode. Consumed by the
     // ggml_gated_delta_net_with_history_tree + ggml_ssm_conv_tree ops
@@ -908,8 +911,8 @@ extern "C" {
     //
     // Tee out the post-block hidden state at the given target-model layer
     // indices on every llama_decode() call. After decode, retrieve the
-    // captures via llama_get_dflash_captured_features().
-    LLAMA_API void llama_set_dflash_capture(
+    // captures via llama_dflash_get_captured_features().
+    LLAMA_API void llama_dflash_set_capture(
             struct llama_context * ctx,
             const int32_t *        layer_ids,
             size_t                 n_layer_ids,
@@ -917,13 +920,13 @@ extern "C" {
 
     // After llama_decode() on the target context, returns a pointer to the
     // captured features in row-major layout [n_features, n_outputs].
-    LLAMA_API const float * llama_get_dflash_captured_features(
+    LLAMA_API const float * llama_dflash_get_captured_features(
             struct llama_context * ctx,
             int64_t *              n_outputs_out);
 
     // After llama_decode() on a *draft* context, returns top-K candidate
     // tokens per output position. Returns NULL on a non-DFlash context.
-    LLAMA_API const int32_t * llama_get_dflash_draft_topk(
+    LLAMA_API const int32_t * llama_dflash_get_draft_topk(
             struct llama_context * ctx,
             int64_t *              n_outputs_out,
             uint32_t *             topk_out);
@@ -938,6 +941,7 @@ extern "C" {
             int64_t                n_new,
             int64_t                pos_start);
 
+    // [EXPERIMENTAL]
     // Device-to-device variant: reads captures directly from a source
     // (target) context's most recently produced packed-captures tensor,
     // skipping the D2H/H2D bounce that llama_dflash_extend() does via the
@@ -957,6 +961,7 @@ extern "C" {
             int64_t                n_keep,
             int64_t                pos_start);
 
+    // [EXPERIMENTAL]
     // inline-encoder variant of llama_dflash_extend_from_ctx executed on the
     // TARGET context's scheduler instead of the draft's. Reads captures from
     // src_ctx (target) locally, writes K_new/V_new into dst_ctx (draft) side
@@ -971,19 +976,21 @@ extern "C" {
             int64_t                n_keep,
             int64_t                pos_start);
 
+    // [EXPERIMENTAL]
     // Configure the TARGET context to skip the D2H readback of captured
     // features on each llama_decode(). After this is set, consumers MUST
     // use llama_dflash_extend_from_ctx() rather than the host-pointer
-    // variant; llama_get_dflash_captured_features() will return NULL.
+    // variant; llama_dflash_get_captured_features() will return NULL.
     LLAMA_API void llama_dflash_set_skip_host_readback(
             struct llama_context * ctx,
             bool                   skip);
 
+    // [EXPERIMENTAL]
     // One-shot D2H readback of the most recently produced packed captures
     // from the TARGET context. Use this in skip_host_readback mode when
     // the consumer needs host bytes for a specific iteration (e.g., the
     // alt-accept remap path). After this returns successfully,
-    // llama_get_dflash_captured_features() yields valid host bytes for
+    // llama_dflash_get_captured_features() yields valid host bytes for
     // this iteration. Returns 0 on success, negative on error (no captures
     // produced this step, etc).
     LLAMA_API int32_t llama_dflash_force_host_readback(
@@ -999,23 +1006,6 @@ extern "C" {
             int                    n_tree_tokens);
 
     LLAMA_API void llama_clear_tree_mask(struct llama_context * ctx);
-
-    // DFlash memory accounting
-    struct llama_dflash_memory_buckets {
-        size_t side_store_K_total;
-        size_t side_store_V_total;
-        size_t captured_features_bytes;
-        size_t capture_staging_bytes;
-        size_t draft_topk_bytes;
-        size_t draft_topk_argmax_bytes;
-        int64_t ctx_capacity;
-        int64_t ctx_filled;
-        int     n_layers;
-    };
-
-    LLAMA_API void llama_dflash_memory_breakdown(
-            const struct llama_context *         ctx,
-            struct llama_dflash_memory_buckets * out);
 
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);

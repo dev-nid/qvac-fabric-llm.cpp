@@ -929,7 +929,7 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
 // Reads block_size, mask_token_id, target_layer_ids from the draft GGUF;
 // installs hidden-state capture on the target context; runs a single
 // DFlash decoder forward per draft step and reads back the per-position
-// top-K argmax tokens via llama_get_dflash_draft_topk().
+// top-K argmax tokens via llama_dflash_get_draft_topk().
 //
 // Invariants:
 //   * The draft context must be created with cparams.dflash_topk set
@@ -1018,7 +1018,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // Install per-layer hidden-state capture on the target context so
         // every decode tees out the layers the draft was trained against.
         if (!target_layer_ids.empty()) {
-            llama_set_dflash_capture(ctx_tgt,
+            llama_dflash_set_capture(ctx_tgt,
                                      target_layer_ids.data(),
                                      target_layer_ids.size(),
                                      n_embd_target);
@@ -1045,7 +1045,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
     ~common_speculative_state_dflash() override {
         if (ctx_tgt != nullptr) {
-            llama_set_dflash_capture(ctx_tgt, nullptr, 0, 0);
+            llama_dflash_set_capture(ctx_tgt, nullptr, 0, 0);
         }
         llama_perf_context_print(ctx_dft);
         llama_batch_free(batch_tgt);
@@ -1086,7 +1086,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // device path in extend_side_store handles both cases uniformly.
         {
             int64_t n_captures = 0;
-            (void) llama_get_dflash_captured_features(ctx_tgt, &n_captures);
+            (void) llama_dflash_get_captured_features(ctx_tgt, &n_captures);
             if (n_captures >= (int64_t) n_to_decode) {
                 if (extend_side_store(n_to_decode, /*pos_start=*/0)) {
                     n_committed_total = n_to_decode;
@@ -1175,7 +1175,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // i, position 0 is the anchor = id_last).
         int64_t  n_topk_outputs = 0;
         uint32_t topk_K         = 0;
-        const int32_t * draft_topk = llama_get_dflash_draft_topk(ctx_dft, &n_topk_outputs, &topk_K);
+        const int32_t * draft_topk = llama_dflash_get_draft_topk(ctx_dft, &n_topk_outputs, &topk_K);
         if (draft_topk == nullptr || n_topk_outputs < block_size || topk_K < 1) {
             LOG_ERR("%s: draft top-K buffer missing or too small (got n=%lld K=%u, need n>=%d K>=1)\n",
                     __func__, (long long) n_topk_outputs, topk_K, block_size);
@@ -1249,7 +1249,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // Read top-K candidates per draft position.
         int64_t  n_topk_outputs = 0;
         uint32_t topk_K         = 0;
-        const int32_t * draft_topk = llama_get_dflash_draft_topk(ctx_dft, &n_topk_outputs, &topk_K);
+        const int32_t * draft_topk = llama_dflash_get_draft_topk(ctx_dft, &n_topk_outputs, &topk_K);
         if (draft_topk == nullptr || n_topk_outputs < block_size || topk_K < 1) {
             LOG_ERR("%s: draft top-K buffer missing or too small (got n=%lld K=%u, need n>=%d K>=1)\n",
                     __func__, (long long) n_topk_outputs, topk_K, block_size);
@@ -1346,7 +1346,7 @@ private:
         }
 
         int64_t n_outputs = 0;
-        const float * captures = llama_get_dflash_captured_features(ctx_tgt, &n_outputs);
+        const float * captures = llama_dflash_get_captured_features(ctx_tgt, &n_outputs);
 
         // alt-remap needs host bytes for the row reshuffle. In
         // skip_host_readback mode the target didn't D2H this iteration, so
@@ -1358,7 +1358,7 @@ private:
                 LOG_ERR("%s: alt-remap force readback failed (rc=%d)\n", __func__, rc);
                 return false;
             }
-            captures = llama_get_dflash_captured_features(ctx_tgt, &n_outputs);
+            captures = llama_dflash_get_captured_features(ctx_tgt, &n_outputs);
         }
 
         // device fast path: when no alt-remap is pending, read straight from
@@ -1371,7 +1371,7 @@ private:
             // produced via the embedded host-side counter (still kept up
             // to date even when bytes are skipped).
             int64_t n_outputs_dev = 0;
-            (void) llama_get_dflash_captured_features(ctx_tgt, &n_outputs_dev);
+            (void) llama_dflash_get_captured_features(ctx_tgt, &n_outputs_dev);
             if (n_outputs_dev == 0) {
                 // No captures produced this step — fall through to error
                 // path below if we have nothing usable.
