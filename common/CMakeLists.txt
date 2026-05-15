@@ -1,10 +1,8 @@
+# common
+
 find_package(Threads REQUIRED)
 
 llama_add_compile_flags()
-
-#
-# llama-common-base
-#
 
 # Build info header
 
@@ -35,23 +33,15 @@ endif()
 
 set(TEMPLATE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/build-info.cpp.in")
 set(OUTPUT_FILE   "${CMAKE_CURRENT_BINARY_DIR}/build-info.cpp")
-
 configure_file(${TEMPLATE_FILE} ${OUTPUT_FILE})
 
-set(TARGET llama-common-base)
-add_library(${TARGET} STATIC ${OUTPUT_FILE})
-
-target_include_directories(${TARGET} PUBLIC .)
-
+set(TARGET build_info)
+add_library(${TARGET} OBJECT ${OUTPUT_FILE})
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
-#
-# llama-common
-#
-
-set(TARGET llama-common)
+set(TARGET common)
 
 set(${TARGET}_HEADERS
   arg.h
@@ -63,7 +53,6 @@ set(${TARGET}_HEADERS
   console.h
   debug.h
   download.h
-  fit.h
   hf-cache.h
   http.h
   json-partial.h
@@ -79,15 +68,20 @@ set(${TARGET}_HEADERS
   sampling.h
   speculative.h
   unicode.h
+)
+
+set(${TARGET}_JINJA_HEADERS
+  jinja/caps.h
   jinja/lexer.h
   jinja/parser.h
   jinja/runtime.h
-  jinja/value.h
   jinja/string.h
-  jinja/caps.h
+  jinja/utils.h
+  jinja/value.h
 )
 
 list(TRANSFORM ${TARGET}_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
+list(TRANSFORM ${TARGET}_JINJA_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
 
 add_library(${TARGET} STATIC
     arg.cpp
@@ -100,9 +94,6 @@ add_library(${TARGET} STATIC
     console.cpp
     debug.cpp
     download.cpp
-    download.h
-    fit.cpp
-    fit.h
     hf-cache.cpp
     json-partial.cpp
     json-schema-to-grammar.cpp
@@ -125,24 +116,21 @@ add_library(${TARGET} STATIC
     jinja/string.cpp
     jinja/caps.cpp
     ${${TARGET}_HEADERS}
+    ${${TARGET}_JINJA_HEADERS}
     )
 
-set_target_properties(${TARGET} PROPERTIES
-    VERSION ${LLAMA_INSTALL_VERSION}
-    SOVERSION 0
-    MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
-    PUBLIC_HEADER "${${TARGET}_HEADERS}"
-)
+set_target_properties(${TARGET} PROPERTIES PUBLIC_HEADER "${${TARGET}_HEADERS}")
+install(FILES ${${TARGET}_JINJA_HEADERS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/llama/common/jinja)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-    # TODO: make fine-grained exports in the future
-    set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
 
-target_link_libraries(${TARGET} PUBLIC  llama-common-base)
-target_link_libraries(${TARGET} PRIVATE cpp-httplib)
+target_link_libraries(${TARGET} PRIVATE
+    build_info
+    cpp-httplib
+)
 
 if (LLAMA_LLGUIDANCE)
     include(ExternalProject)
