@@ -411,9 +411,17 @@ llama_model_dflash::encode_graph::encode_graph(const llama_model    & model,
     cb(h_proj, "dflash_enc_h_proj", -1);
 
     // ---------- per-layer K/V projection + scatter into side store via set_rows ----------
+    // Same F16-accumulator concern as h_fc above. The wk/wv weights are F16
+    // and on backends with fp16-capable devices the default mat-mul accumulator
+    // is F16. The side-store K/V written here is the only path the captured
+    // target features take into the spec block, so any precision loss in this
+    // projection feeds straight into draft acceptance. Force F32 accumulation
+    // on both projections; cost is a small per-mat-mul precision tax, gain is
+    // the captured features arriving at draft attention without F16 truncation.
     for (int il = 0; il < n_layer; ++il) {
         // K_new = wk · h_proj  → [n_embd_head, n_head_kv, n_new]
         ggml_tensor * K_new = build_lora_mm(model.layers[il].wk, h_proj);
+        ggml_mul_mat_set_prec(K_new, GGML_PREC_F32);
         K_new = ggml_reshape_3d(ctx0, K_new, n_embd_head, n_head_kv, n_new);
         K_new = build_norm(K_new, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
         K_new = ggml_rope_ext(
@@ -424,6 +432,7 @@ llama_model_dflash::encode_graph::encode_graph(const llama_model    & model,
 
         // V_new = wv · h_proj  (no norm, no RoPE)
         ggml_tensor * V_new = build_lora_mm(model.layers[il].wv, h_proj);
+        ggml_mul_mat_set_prec(V_new, GGML_PREC_F32);
         V_new = ggml_reshape_3d(ctx0, V_new, n_embd_head, n_head_kv, n_new);
         cb(V_new, "dflash_enc_V_new", il);
 

@@ -324,8 +324,9 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // overload that runs the graph on a caller-provided scheduler. Used by
-    // `dflash_extend` so the encoder graph runs on its dedicated
-    // `sched_dflash_encode` rather than the regular decode `sched`.
+    // `dflash_extend` so the encoder graph runs on one of its dedicated
+    // `sched_dflash_encode_slots[n_keep_pad]` rather than the regular
+    // decode `sched`.
     ggml_status graph_compute(ggml_backend_sched_t sched_use, ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
@@ -413,12 +414,18 @@ private:
 
     bool sched_need_reserve = true;
 
-    // Dedicated scheduler for the DFlash encoder graph. Allocated alongside
-    // `sched` for DFlash-arch contexts so the encoder + decoder don't
-    // clobber each other's compute-buffer slot assignments. See
-    // `gf_res_dflash_encode` below for the cache-hit fast path that depends
-    // on this isolation.
-    ggml_backend_sched_ptr sched_dflash_encode;
+    // Dedicated scheduler(s) for the DFlash encoder graph. Allocated
+    // alongside `sched` for DFlash-arch contexts so the encoder + decoder
+    // don't clobber each other's compute-buffer slot assignments. See
+    // `gf_res_dflash_encode_slots` below for the per-`n_keep_pad`
+    // cache-hit fast path that depends on this isolation.
+    //
+    // The vector is indexed by n_keep_pad (the per-call extend width).
+    // Index 0 is unused; valid indices are [1, dflash_block_size]. Slots
+    // are lazily populated by ensure_dflash_encode_slot() and pre-warmed
+    // for all valid indices in the constructor (see the warmup loop near
+    // sched_reserve()) so the steady-state extend never rebuilds.
+    std::vector<ggml_backend_sched_ptr> sched_dflash_encode_slots;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
@@ -459,21 +466,37 @@ private:
     // (GDN) layers; empty otherwise.
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> dflash_gdn_history_ctxs_bufs;
 
-    // Encoder-graph result holder, kept across `dflash_extend()` calls so
-    // the same `llm_graph_result` instance is reused. Combined with
-    // `sched_dflash_encode`, this enables per-`n_new` graph caching: when
-    // consecutive extends share the same `n_new` value, dflash_extend skips
-    // graph rebuild and just re-runs `set_inputs + graph_compute`.
-    llm_graph_result_ptr gf_res_dflash_encode;
-    int64_t              gf_res_dflash_encode_n_new = -1;
+    // Encoder-graph result holders, one per `n_keep_pad` slot. Combined
+    // with `sched_dflash_encode_slots`, this enables per-shape graph
+    // caching: a slot is built once for its specific n_keep_pad and reused
+    // across every subsequent extend call with the same width. Required
+    // in chain mode where n_keep_pad varies between 1 and dflash_block_size
+    // each iter (= 1 + accept_count) so consecutive extends typically have
+    // different shapes.
+    //
+    // Index 0 is unused; valid indices are [1, dflash_block_size]. A slot
+    // pointer being null means it has not been built yet. The vector is
+    // sized once at the same time as the side-store K/V buffers (in
+    // sched_reserve(), guarded by model.arch == LLM_ARCH_DFLASH).
+    std::vector<llm_graph_result_ptr> gf_res_dflash_encode_slots;
+
+    // Fallback single-slot encoder cache for `n_new > dflash_block_size`,
+    // used by full-prompt prefill (which extends with n_new = prompt_length,
+    // typically much larger than the per-iter block_size and a one-shot
+    // call). Cache hits only when consecutive calls share the same n_new
+    // value, otherwise rebuild. Lazy-init on first oversized extend.
+    ggml_backend_sched_ptr sched_dflash_encode_fallback;
+    llm_graph_result_ptr   gf_res_dflash_encode_fallback;
+    int64_t                gf_res_dflash_encode_fallback_n_new = -1;
 
     // inline encoder (target-side). When cparams.dflash_inline_encoder is set,
     // the speculative driver runs the encoder graph on TARGET's scheduler
     // instead of the DRAFT's. These members live on the target context;
-    // they mirror sched_dflash_encode / gf_res_dflash_encode but are allocated
-    // using the target's backend_ptrs and reference the draft model's encoder
-    // weights + draft context's side store (ctx_K/V) cross-context. Lazy-init
-    // on first call to dflash_inline_encode_from_ctx().
+    // they mirror the sched_dflash_encode_slots[] / gf_res_dflash_encode_slots[]
+    // pair above but are allocated using the target's backend_ptrs and
+    // reference the draft model's encoder weights + draft context's side
+    // store (ctx_K/V) cross-context. Single-slot, lazy-init on first call
+    // to dflash_inline_encode_from_ctx().
     ggml_backend_sched_ptr sched_dflash_inline_encode;
     llm_graph_result_ptr   gf_res_dflash_inline_encode;
     int64_t                gf_res_dflash_inline_encode_n_new = -1;

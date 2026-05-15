@@ -1055,15 +1055,15 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
     // begin() runs at start of each new generation.
     //
-    // V2 (2026-05-08): if `common_speculative_init` runs BEFORE the
-    // user's prefill (as `speculative-simple` now does post-V2), DFlash
-    // capture is already installed and the user's prefill — provided
-    // it requested logits at every prompt position — populated
-    // `dflash.captured_features` for the entire prompt. We can push
-    // those captures straight into the side store without re-decoding.
+    // Fast path: when `common_speculative_init` ran before the caller's
+    // prefill, DFlash capture is already installed on ctx_tgt. Provided
+    // the prefill requested logits at every prompt position, the
+    // captured features for the entire prompt are already in
+    // `dflash.captured_features`; push them straight into the side store
+    // without re-decoding.
     //
-    // Pre-V2 callers that didn't install capture before their prefill
-    // still get the documented re-decode path (kept as a fallback).
+    // Slow path: callers that did not install capture before prefill
+    // still get the re-decode path as a fallback.
     void begin(const llama_tokens & prompt) override {
         llama_dflash_reset_ctx_kv(ctx_dft);
         n_committed_total       = 0;

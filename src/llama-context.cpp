@@ -423,15 +423,16 @@ llama_context::llama_context(
             }
         }
 
-        // V6: DFlash encoder warmup. The first call to `dflash_extend` for
-        // any given `n_new` shape compiles backend pipelines (cold cost
+        // DFlash encoder warmup. The first call to `dflash_extend` for any
+        // given `n_new` shape compiles backend pipelines (cold cost
         // ~100-300 ms on Vulkan, paid lazily on the first user
-        // generation). Pre-warming with the two most common values
-        // (block_size and 1) here amortises that cost into context
-        // construction so the first generation runs at steady-state
-        // throughput.
+        // generation). The per-`n_keep_pad` slot cache in
+        // `gf_res_dflash_encode_slots` retains a built graph per width;
+        // this loop populates every valid index in [1, dflash_block_size]
+        // so steady-state chain mode (where n_keep_pad = 1 + accept_count
+        // varies per iter) never rebuilds the encoder.
         //
-        // The warmup pushes block_size+1 zero rows then `dflash_reset_ctx_kv()`
+        // Each warmup call pushes `bs` zero rows then `dflash_reset_ctx_kv()`
         // restores ctx_filled/ctx_pos_base to 0; the side-store data
         // bytes remain zero but are not visible to subsequent extends
         // (n_ctx is reset as well).
@@ -443,19 +444,23 @@ llama_context::llama_context(
             std::vector<float> zero_buf((size_t) bs * (size_t) nf, 0.0f);
 
             const int64_t t_warm_start = ggml_time_us();
-            // Warm n_new=block_size first (the common steady-state shape
-            // for full-block extends). Then n_new=1 (the common
-            // chain-mode shape for single-token committed extends).
-            int rc1 = dflash_extend(zero_buf.data(), (int64_t) bs, 0);
-            int rc2 = (rc1 == 0) ? dflash_extend(zero_buf.data(), 1, (int64_t) bs) : -1;
-            dflash_reset_ctx_kv();
+            int n_warmed = 0;
+            int n_failed = 0;
+            // Warm in descending order so n_new=bs (largest) is built
+            // first; subsequent smaller n_new builds reuse the same
+            // backend buffer pool layout where possible.
+            for (int64_t n = (int64_t) bs; n >= 1; --n) {
+                const int rc = dflash_extend(zero_buf.data(), n, /*pos_start=*/ 0);
+                dflash_reset_ctx_kv();
+                if (rc == 0) ++n_warmed; else ++n_failed;
+            }
 
             const int64_t t_warm_us = ggml_time_us() - t_warm_start;
-            if (rc1 != 0 || rc2 != 0) {
-                LLAMA_LOG_WARN("%s: DFlash encoder warmup partially failed (rc1=%d rc2=%d) — first generation may incur cold pipeline-compile cost\n",
-                               __func__, rc1, rc2);
+            if (n_failed > 0) {
+                LLAMA_LOG_WARN("%s: DFlash encoder warmup partially failed (warmed=%d failed=%d of %u) — first generation may incur cold pipeline-compile cost\n",
+                               __func__, n_warmed, n_failed, bs);
             } else {
-                LLAMA_LOG_INFO("%s: DFlash encoder warmup: pre-compiled pipelines for n_new={%u, 1} in %.2f ms\n",
+                LLAMA_LOG_INFO("%s: DFlash encoder warmup: pre-compiled pipelines for n_new=[1..%u] in %.2f ms\n",
                                __func__, bs, t_warm_us / 1000.0);
             }
         }
@@ -622,10 +627,22 @@ void llama_context::sched_reserve() {
                     (int) n_layer, (uint32_t) ctx_capacity);
         }
 
-        // Allocate dedicated scheduler for the encoder graph.
+        // Allocate dedicated scheduler(s) for the encoder graph. One slot
+        // per `n_keep_pad` ∈ [1, dflash_block_size]; index 0 is unused so
+        // the slot index can be the n_keep_pad value directly. Each slot
+        // gets its own scheduler because compute-buffer sizing is shape-
+        // dependent and `ggml_backend_sched_alloc_graph` is one-shot per
+        // scheduler. Lazily filled by ensure_dflash_encode_slot() and
+        // pre-warmed for the full range below in the same lifecycle pass.
         const int max_nodes_enc = std::max<int>(8192, (int) model.hparams.n_layer * 32);
-        sched_dflash_encode.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
-            max_nodes_enc, false, cparams.op_offload));
+        const uint32_t bs_enc = std::max<uint32_t>(1, model.hparams.dflash_block_size);
+        sched_dflash_encode_slots.resize((size_t) bs_enc + 1);
+        gf_res_dflash_encode_slots.resize((size_t) bs_enc + 1);
+        for (uint32_t i = 1; i <= bs_enc; ++i) {
+            sched_dflash_encode_slots[i].reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                max_nodes_enc, /*parallel=*/ false, cparams.op_offload));
+        }
     }
 
     // DFlash GDN history buffers: allocate one persistent state-history
@@ -1591,17 +1608,40 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
 
     const int64_t write_offset = dflash.ctx_filled;
 
-    if (!gf_res_dflash_encode) {
-        gf_res_dflash_encode.reset(new llm_graph_result(graph_max_nodes(cparams.n_ubatch)));
+    // Slot lookup: per-shape cache for n_new in [1, dflash_block_size]
+    // (= the chain-mode steady-state range), plus a single fallback slot
+    // for n_new > dflash_block_size (used by full-prompt prefill, which
+    // is one-shot per prompt and doesn't benefit from caching).
+    bool                  cache_hit = false;
+    ggml_backend_sched_t  sched_slot = nullptr;
+    llm_graph_result    * res        = nullptr;
+    if ((size_t) n_new < sched_dflash_encode_slots.size()
+            && sched_dflash_encode_slots[(size_t) n_new]) {
+        sched_slot = sched_dflash_encode_slots[(size_t) n_new].get();
+        if (!gf_res_dflash_encode_slots[(size_t) n_new]) {
+            gf_res_dflash_encode_slots[(size_t) n_new].reset(
+                new llm_graph_result(graph_max_nodes(cparams.n_ubatch)));
+        }
+        res       = gf_res_dflash_encode_slots[(size_t) n_new].get();
+        cache_hit = (res->get_gf() != nullptr) && (ggml_graph_n_nodes(res->get_gf()) > 0);
+    } else {
+        // Fallback path: lazy-init the single shared slot used for any
+        // n_new outside [1, block_size]. Same single-slot semantics as
+        // before the multi-slot cache was added.
+        if (!sched_dflash_encode_fallback) {
+            sched_dflash_encode_fallback.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                graph_max_nodes(cparams.n_ubatch), /*parallel=*/ false, cparams.op_offload));
+        }
+        if (!gf_res_dflash_encode_fallback) {
+            gf_res_dflash_encode_fallback.reset(
+                new llm_graph_result(graph_max_nodes(cparams.n_ubatch)));
+        }
+        sched_slot = sched_dflash_encode_fallback.get();
+        res        = gf_res_dflash_encode_fallback.get();
+        cache_hit  = (gf_res_dflash_encode_fallback_n_new == n_new);
     }
-    if (!sched_dflash_encode) {
-        sched_dflash_encode.reset(ggml_backend_sched_new(
-            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
-            graph_max_nodes(cparams.n_ubatch), /*parallel=*/ false, cparams.op_offload));
-    }
-    auto * res = gf_res_dflash_encode.get();
 
-    const bool cache_hit = (gf_res_dflash_encode_n_new == n_new);
     ggml_cgraph * gf = nullptr;
 
     if (cache_hit) {
@@ -1619,8 +1659,8 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
         const auto gparams = graph_params(res, ub_stub, /*mctx=*/nullptr,
                                           LLM_GRAPH_TYPE_DEFAULT);
 
-        ggml_backend_sched_reset(sched_dflash_encode.get());
-        ggml_backend_sched_set_eval_callback(sched_dflash_encode.get(),
+        ggml_backend_sched_reset(sched_slot);
+        ggml_backend_sched_set_eval_callback(sched_slot,
             cparams.cb_eval, cparams.cb_eval_user_data);
 
         // Build the encoder graph directly (bypasses model.build_graph dispatch).
@@ -1632,12 +1672,16 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
             return -1;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched_dflash_encode.get(), gf)) {
+        if (!ggml_backend_sched_alloc_graph(sched_slot, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate encoder graph\n", __func__);
             return -2;
         }
 
-        gf_res_dflash_encode_n_new = n_new;
+        // Track the cache key for the fallback (single-slot) path. Per-shape
+        // slots don't need a key — once their gf is built they always hit.
+        if (sched_slot == sched_dflash_encode_fallback.get()) {
+            gf_res_dflash_encode_fallback_n_new = n_new;
+        }
     }
 
     // ----- set inputs on the allocated graph -----
@@ -1676,7 +1720,7 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
     }
 
     {
-        const auto status = graph_compute(sched_dflash_encode.get(), gf, /*batched=*/n_new > 1);
+        const auto status = graph_compute(sched_slot, gf, /*batched=*/n_new > 1);
         if (status != GGML_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: encoder graph compute failed (%d)\n",
                     __func__, (int) status);
@@ -1752,17 +1796,37 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
 
     const int64_t write_offset = dflash.ctx_filled;
 
-    if (!gf_res_dflash_encode) {
-        gf_res_dflash_encode.reset(new llm_graph_result(graph_max_nodes(cparams.n_ubatch)));
+    // Slot lookup: per-shape cache for n_keep_pad in [1, dflash_block_size]
+    // (chain-mode steady state), single fallback slot for larger widths
+    // (full-prompt prefill, one-shot per prompt). Same shape as the
+    // dflash_extend() variant above; both share the slot vectors.
+    bool                  cache_hit  = false;
+    ggml_backend_sched_t  sched_slot = nullptr;
+    llm_graph_result    * res        = nullptr;
+    if ((size_t) n_keep_pad < sched_dflash_encode_slots.size()
+            && sched_dflash_encode_slots[(size_t) n_keep_pad]) {
+        sched_slot = sched_dflash_encode_slots[(size_t) n_keep_pad].get();
+        if (!gf_res_dflash_encode_slots[(size_t) n_keep_pad]) {
+            gf_res_dflash_encode_slots[(size_t) n_keep_pad].reset(
+                new llm_graph_result(graph_max_nodes(cparams.n_ubatch)));
+        }
+        res       = gf_res_dflash_encode_slots[(size_t) n_keep_pad].get();
+        cache_hit = (res->get_gf() != nullptr) && (ggml_graph_n_nodes(res->get_gf()) > 0);
+    } else {
+        if (!sched_dflash_encode_fallback) {
+            sched_dflash_encode_fallback.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                graph_max_nodes(cparams.n_ubatch), /*parallel=*/ false, cparams.op_offload));
+        }
+        if (!gf_res_dflash_encode_fallback) {
+            gf_res_dflash_encode_fallback.reset(
+                new llm_graph_result(graph_max_nodes(cparams.n_ubatch)));
+        }
+        sched_slot = sched_dflash_encode_fallback.get();
+        res        = gf_res_dflash_encode_fallback.get();
+        cache_hit  = (gf_res_dflash_encode_fallback_n_new == n_keep_pad);
     }
-    if (!sched_dflash_encode) {
-        sched_dflash_encode.reset(ggml_backend_sched_new(
-            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
-            graph_max_nodes(cparams.n_ubatch), /*parallel=*/ false, cparams.op_offload));
-    }
-    auto * res = gf_res_dflash_encode.get();
 
-    const bool cache_hit = (gf_res_dflash_encode_n_new == n_keep_pad);
     ggml_cgraph * gf = nullptr;
 
     if (cache_hit) {
@@ -1780,8 +1844,8 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
         const auto gparams = graph_params(res, ub_stub, /*mctx=*/nullptr,
                                           LLM_GRAPH_TYPE_DEFAULT);
 
-        ggml_backend_sched_reset(sched_dflash_encode.get());
-        ggml_backend_sched_set_eval_callback(sched_dflash_encode.get(),
+        ggml_backend_sched_reset(sched_slot);
+        ggml_backend_sched_set_eval_callback(sched_slot,
             cparams.cb_eval, cparams.cb_eval_user_data);
 
         llama_model_dflash::encode_graph encode(model, gparams);
@@ -1792,12 +1856,14 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
             return -1;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched_dflash_encode.get(), gf)) {
+        if (!ggml_backend_sched_alloc_graph(sched_slot, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate encoder graph\n", __func__);
             return -2;
         }
 
-        gf_res_dflash_encode_n_new = n_keep_pad;
+        if (sched_slot == sched_dflash_encode_fallback.get()) {
+            gf_res_dflash_encode_fallback_n_new = n_keep_pad;
+        }
     }
 
     ggml_tensor * t_target_hidden_new =
@@ -1903,7 +1969,7 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
     }
 
     {
-        const auto status = graph_compute(sched_dflash_encode.get(), gf, /*batched=*/n_keep_pad > 1);
+        const auto status = graph_compute(sched_slot, gf, /*batched=*/n_keep_pad > 1);
         if (status != GGML_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: encoder graph compute failed (%d)\n",
                     __func__, (int) status);
@@ -1925,7 +1991,7 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
 //
 // Same encoder graph contents as dflash_extend_from_tensor, executed on
 // the TARGET context's sched_dflash_inline_encode instead of the DRAFT's
-// sched_dflash_encode. Called as
+// sched_dflash_encode_slots[]. Called as
 //   target_ctx->dflash_inline_encode_from_ctx(draft_ctx, ...)
 // with src_captures being target_ctx->dflash.last_packed_captures (i.e.
 // a tensor in target's own buffer — the captures read is now local, no
@@ -1935,10 +2001,6 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
 // each op onto whichever ggml_backend_t owns the buffer of the tensor
 // it touches. This requires the standard llama.cpp init where both
 // contexts share singleton CUDA backends per device.
-//
-// The optional DFLASH_PAD_ENCODER path is intentionally not implemented here:
-// the corresponding chain-side variant was net-negative on CUDA when measured
-// and adds complexity; it can be reintroduced if needed.
 int32_t llama_context::dflash_inline_encode_from_ctx(llama_context * draft_ctx,
                                                      ggml_tensor *   src_captures,
                                                      int64_t         src_row_offset,
@@ -2151,10 +2213,9 @@ void llama_context::set_tree_mask(const uint8_t * visibility, int n_tree_tokens)
     GGML_ASSERT(visibility != nullptr);
     GGML_ASSERT(n_tree_tokens > 0);
 
-    // avoid the unconditional gf_res_prev->reset(). The graph-reuse machinery
-    // (llm_graph_result::can_reuse + llm_graph_params::allow_reuse) already
-    // handles tree-mask
-    // transitions correctly:
+    // No gf_res_prev->reset() here. The graph-reuse machinery
+    // (llm_graph_result::can_reuse + llm_graph_params::allow_reuse) handles
+    // tree-mask transitions correctly:
     //   - Same-shape verify-after-verify: gparams.tree_mask pointer is
     //     stable (== &this->tree_mask), ubatch dims match, and the
     //     attn-kv input class's set_input re-applies the visibility
@@ -2165,12 +2226,8 @@ void llama_context::set_tree_mask(const uint8_t * visibility, int n_tree_tokens)
     //   - tree-N → tree-M (different n_tree_tokens): forces a rebuild
     //     via the n_tokens check in allow_reuse / can_reuse_kq_mask.
     //
-    // The blunt reset that used to fire here invalidated the cache on
-    // every set_tree_mask call, meaning repeated tree-verifies at the
-    // same budget paid a graph-rebuild cost per iter that they didn't
-    // need. This branch leaves
-    // gf_res_prev alone; on the rare cases where downstream code wants
-    // an eager invalidation it can call gf_res_prev->reset() directly.
+    // Callers wanting eager invalidation can call gf_res_prev->reset()
+    // directly.
     tree_mask.active        = true;
     tree_mask.n_tree_tokens = n_tree_tokens;
     const size_t n2         = (size_t) n_tree_tokens * (size_t) n_tree_tokens;
