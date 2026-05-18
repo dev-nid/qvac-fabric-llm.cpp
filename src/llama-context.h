@@ -342,7 +342,14 @@ private:
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const;
 
-    llm_graph_cb graph_get_cb() const;
+    // Returns the per-tensor graph callback. Names tensors and pins
+    // per-layer "norm" tensors to their layer's device on `sched_for_cb`,
+    // so callers must pass the scheduler the graph will actually run on:
+    // the main `sched` for the regular decoder, the chosen
+    // `sched_dflash_encode_slots[n]` / `sched_dflash_encode_fallback`
+    // for the DFlash encoder paths, and `sched_dflash_inline_encode`
+    // for the inline encoder.
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_for_cb) const;
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);

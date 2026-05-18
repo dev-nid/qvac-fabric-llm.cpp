@@ -56,6 +56,48 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    // Gemma-family DFlash drafts carry extra hparams. All optional so
+    // non-Gemma DFlash GGUFs (Qwen3, Qwen3.5, LLaMA-3.1 etc.) load unchanged.
+    //
+    // final_logit_softcapping (scalar): consumed by the draft graph after lm_head
+    // sliding_window (scalar):          window width for SWA layers
+    // sliding_window_pattern (array):   per-layer SWA layer-type marker
+    ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING, hparams.f_final_logit_softcapping, false);
+
+    uint32_t n_swa_local = 0;
+    if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, n_swa_local, false) && n_swa_local > 0) {
+        hparams.n_swa    = n_swa_local;
+        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+
+        // sliding_window_pattern can be either a length-n_layer boolean
+        // array (Gemma-4-style per-layer types) or absent. We try the
+        // full per-layer read first and on any error fall back to "all
+        // layers SWA" so abbreviated / mismatched GGUFs still load. The
+        // SWA mask itself is a no-op for prompts within n_swa, so the
+        // fallback only affects long-context correctness.
+        try {
+            ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,
+                              hparams.swa_layers, hparams.n_layer, false);
+        } catch (const std::runtime_error & e) {
+            LLAMA_LOG_WARN("%s: dflash SWA pattern array shape mismatch, "
+                           "marking all layers SWA (%s)\n", __func__, e.what());
+            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                hparams.swa_layers[il] = 1;
+            }
+        }
+
+        // Keep the invariant llama_model::create_memory expects:
+        // swa_type != NONE iff is_swa_any(). Some GGUFs carry the
+        // sliding_window key without a usable per-layer pattern (or
+        // with a pattern that ends up all-zero); in that case revert
+        // to NONE so the non-SWA KV cache path is selected and the
+        // assertion at llama-model.cpp doesn't fire.
+        if (!hparams.is_swa_any()) {
+            hparams.n_swa    = 0;
+            hparams.swa_type = LLAMA_SWA_TYPE_NONE;
+        }
+    }
+
     // type tag (use Qwen3-ish heuristics; not load-bearing for DFlash drafts)
     switch (hparams.n_layer) {
         case 1:  type = LLM_TYPE_UNKNOWN; break;
@@ -137,7 +179,8 @@ llama_model_dflash::graph::graph(const llama_model & model, const llm_graph_para
 
     // ---------- DFlash drafter inputs ----------
     auto * inp_dflash = build_inp_dflash();
-    ggml_tensor * kq_mask = inp_dflash->kq_mask_cnv;
+    ggml_tensor * kq_mask     = inp_dflash->kq_mask_cnv;
+    ggml_tensor * kq_mask_swa = inp_dflash->kq_mask_swa_cnv;
 
     const int64_t n_ctx_dft = dflash->n_ctx;
 
@@ -245,9 +288,15 @@ llama_model_dflash::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * K4 = ggml_reshape_4d(ctx0, Kcur, Kcur->ne[0], Kcur->ne[1], Kcur->ne[2], 1);
             ggml_tensor * V4 = ggml_reshape_4d(ctx0, Vcur, Vcur->ne[0], Vcur->ne[1], Vcur->ne[2], 1);
 
+            // Gemma-family drafts interleave SWA (local) and full
+            // (global) attention layers; pick the matching mask per
+            // layer. Non-SWA drafts have kq_mask_swa == nullptr and
+            // always use the dense mask.
+            ggml_tensor * mask_use = (kq_mask_swa && hparams.is_swa(il)) ? kq_mask_swa : kq_mask;
+
             cur = build_attn_mha(Q4, K4, V4,
                                  /*kq_b=*/   nullptr,
-                                 /*kq_mask=*/ kq_mask,
+                                 /*kq_mask=*/ mask_use,
                                  /*sinks=*/  nullptr,
                                  /*v_mla=*/  nullptr,
                                  /*kq_scale=*/ 1.0f / sqrtf(float(n_embd_head)),
@@ -302,6 +351,20 @@ llama_model_dflash::graph::graph(const llama_model & model, const llm_graph_para
     GGML_ASSERT(lm_head_use != nullptr && "DFlash drafter: no lm_head found.");
     ggml_tensor * logits = build_lora_mm(lm_head_use, cur);
     cb(logits, "result_output", -1);
+
+    // Gemma-family targets apply a tanh-based final-logit softcap after lm_head.
+    // The shared lm_head matmul gives the same raw logits as the target's,
+    // but softcapping is a separate post-process - without it the draft
+    // produces uncapped logits while the target produces capped ones.
+    // Monotonic, so chain-mode argmax / top-K selection is unchanged at T=0,
+    // but it does change absolute logit values used by T>0 sampling and
+    // log-prob paths.
+    if (hparams.f_final_logit_softcapping) {
+        logits = ggml_scale(ctx0, logits, 1.0f / hparams.f_final_logit_softcapping);
+        logits = ggml_tanh(ctx0, logits);
+        logits = ggml_scale(ctx0, logits, hparams.f_final_logit_softcapping);
+        cb(logits, "result_output_softcapped", -1);
+    }
 
     // In-graph top-K to eliminate the bs * n_vocab * 4 byte PCIe transfer per block.
     const uint32_t K = cparams.dflash_topk == 0 ? 1 : cparams.dflash_topk;

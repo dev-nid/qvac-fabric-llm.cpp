@@ -361,6 +361,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        // DFlash: tee out this layer's hidden state if requested.
+        // No-op when the context isn't being used as a DFlash target.
+        build_dflash_capture(cur, il);
+
         // input for next layer
         inpL = cur;
     }

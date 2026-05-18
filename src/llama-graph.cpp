@@ -512,6 +512,10 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         return;
     }
 
+    const int64_t n_real    = std::min<int64_t>(dflash->n_ctx, n_ctx);
+    const int64_t n_kv      = n_ctx + n_block;
+    const int64_t pos_base  = dflash->inline_pos_start;
+
     // kq_mask shape: [n_kv = n_ctx + n_block, n_block_pad, 1, 1].
     // Rows q in [0, n_block):
     //   * ctx slot k in [0, n_ctx)        — open if k < n_real, else -inf
@@ -520,13 +524,46 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
     if (kq_mask && kq_mask->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
         float * data            = (float *) kq_mask->data;
-        const int64_t n_real    = std::min<int64_t>(dflash->n_ctx, n_ctx);
-        const int64_t n_kv      = n_ctx + n_block;
-        const int64_t n_block_p = kq_mask->ne[1]; // actual second-dim shape (may be padded by FA)
+        const int64_t n_block_p = kq_mask->ne[1];
         for (int64_t q = 0; q < n_block; ++q) {
             for (int64_t k = 0; k < n_kv; ++k) {
                 if (k < n_ctx) {
                     data[q * n_kv + k] = (k < n_real) ? 0.0f : -INFINITY;
+                } else {
+                    data[q * n_kv + k] = 0.0f;
+                }
+            }
+        }
+        for (int64_t q = n_block; q < n_block_p; ++q) {
+            for (int64_t k = 0; k < n_kv; ++k) {
+                data[q * n_kv + k] = -INFINITY;
+            }
+        }
+    }
+
+    // SWA variant. Same layout, but additionally masks ctx slots whose
+    // absolute position is further than n_swa behind the query (per
+    // llama_hparams::is_masked_swa). Within the proposal block all
+    // positions are within n_swa of each other for any realistic
+    // block_size << n_swa, so proposal-to-proposal stays bidirectional.
+    if (kq_mask_swa && kq_mask_swa->buffer && swa_type != LLAMA_SWA_TYPE_NONE) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask_swa->buffer));
+        float * data            = (float *) kq_mask_swa->data;
+        const int64_t n_block_p = kq_mask_swa->ne[1];
+        for (int64_t q = 0; q < n_block; ++q) {
+            const llama_pos p_q = (llama_pos) (pos_base + q);
+            for (int64_t k = 0; k < n_kv; ++k) {
+                llama_pos p_k;
+                bool valid;
+                if (k < n_ctx) {
+                    p_k   = (llama_pos) k;
+                    valid = (k < n_real);
+                } else {
+                    p_k   = (llama_pos) (pos_base + (k - n_ctx));
+                    valid = true;
+                }
+                if (!valid || llama_hparams::is_masked_swa(n_swa, swa_type, p_k, p_q)) {
+                    data[q * n_kv + k] = -INFINITY;
                 } else {
                     data[q * n_kv + k] = 0.0f;
                 }
@@ -2402,7 +2439,8 @@ llm_graph_input_dflash * llm_graph_context::build_inp_dflash() const {
 
     GGML_ASSERT(n_block > 0 && "DFlash: n_block must be > 0");
 
-    auto inp = std::make_unique<llm_graph_input_dflash>(dflash, n_ctx_dft, n_block);
+    auto inp = std::make_unique<llm_graph_input_dflash>(
+        dflash, n_ctx_dft, n_block, hparams.n_swa, hparams.swa_type);
 
     // kq_mask: [n_kv = n_ctx + n_block, n_block, 1, 1].
     // Note: upstream removed GGML_KQ_MASK_PAD; flash-attention kernels now
@@ -2413,6 +2451,19 @@ llm_graph_input_dflash * llm_graph_context::build_inp_dflash() const {
     cb(inp->kq_mask, "dflash_kq_mask", -1);
 
     inp->kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->kq_mask, GGML_TYPE_F16) : inp->kq_mask;
+
+    // SWA variant: only allocated when at least one draft layer is
+    // marked SWA in hparams.swa_layers (== this is a Gemma-family draft).
+    // Saves graph nodes and host memory on Qwen/LLaMA drafts.
+    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE && hparams.is_swa_any()) {
+        inp->kq_mask_swa = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, n_block, 1, 1);
+        ggml_set_input(inp->kq_mask_swa);
+        cb(inp->kq_mask_swa, "dflash_kq_mask_swa", -1);
+
+        inp->kq_mask_swa_cnv = cparams.flash_attn
+            ? ggml_cast(ctx0, inp->kq_mask_swa, GGML_TYPE_F16)
+            : inp->kq_mask_swa;
+    }
 
     auto * inp_ptr = inp.get();
     res->add_input(std::move(inp));

@@ -1656,8 +1656,12 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
         ub_stub.n_seqs       = 1;
         ub_stub.n_seqs_unq   = 1;
 
-        const auto gparams = graph_params(res, ub_stub, /*mctx=*/nullptr,
-                                          LLM_GRAPH_TYPE_DEFAULT);
+        auto gparams = graph_params(res, ub_stub, /*mctx=*/nullptr,
+                                    LLM_GRAPH_TYPE_DEFAULT);
+        // Encoder graph runs on the per-size slot (or fallback) selected
+        // above; rebind cb so the per-layer norm pin lands on the actual
+        // scheduler this graph will execute on.
+        gparams.cb = graph_get_cb(sched_slot);
 
         ggml_backend_sched_reset(sched_slot);
         ggml_backend_sched_set_eval_callback(sched_slot,
@@ -1841,8 +1845,12 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
         ub_stub.n_seqs       = 1;
         ub_stub.n_seqs_unq   = 1;
 
-        const auto gparams = graph_params(res, ub_stub, /*mctx=*/nullptr,
-                                          LLM_GRAPH_TYPE_DEFAULT);
+        auto gparams = graph_params(res, ub_stub, /*mctx=*/nullptr,
+                                    LLM_GRAPH_TYPE_DEFAULT);
+        // Encoder graph runs on the per-size slot (or fallback) selected
+        // above; rebind cb so the per-layer norm pin lands on the actual
+        // scheduler this graph will execute on.
+        gparams.cb = graph_get_cb(sched_slot);
 
         ggml_backend_sched_reset(sched_slot);
         ggml_backend_sched_set_eval_callback(sched_slot,
@@ -2110,7 +2118,7 @@ int32_t llama_context::dflash_inline_encode_from_ctx(llama_context * draft_ctx,
             /*.tree_mask   =*/ nullptr,
             /*.samplers    =*/ draft_ctx->sampling.samplers,
             /*.n_outputs   =*/ (uint32_t) n_keep,
-            /*.cb          =*/ draft_ctx->graph_get_cb(),
+            /*.cb          =*/ draft_ctx->graph_get_cb(sched_dflash_inline_encode.get()),
             /*.res         =*/ res,
         };
 
@@ -3597,7 +3605,7 @@ llm_graph_params llama_context::graph_params(
         /*.tree_mask   =*/ tree_mask.active ? &tree_mask : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
+        /*.cb          =*/ graph_get_cb(sched.get()),
         /*.res         =*/ res,
     };
 }
@@ -3638,8 +3646,8 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
-llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_for_cb) const {
+    return [this, sched_for_cb](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -3655,7 +3663,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            ggml_backend_sched_set_tensor_backend(sched_for_cb, cur, backend.get());
                         }
                     }
                 }

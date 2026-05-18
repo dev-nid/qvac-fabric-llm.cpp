@@ -83,6 +83,11 @@ int main(int argc, char ** argv) {
     model_tgt = llama_init_tgt->model();
     ctx_tgt   = llama_init_tgt->context();
 
+    if (model_tgt == nullptr || ctx_tgt == nullptr) {
+        LOG_ERR("%s: failed to init target model/context\n", __func__);
+        return 1;
+    }
+
     // check if the context supports partial sequence removal
     const auto ctx_seq_rm = common_context_can_seq_rm(ctx_tgt);
     bool use_ckpt = (ctx_seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);

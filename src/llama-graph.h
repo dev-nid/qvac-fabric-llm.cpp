@@ -416,22 +416,36 @@ public:
 
 // DFlash drafter context input.
 // Builds the non-causal kq_mask for the drafter's cross-attention over
-// the [side-store K/V | proposal] segments.
+// the [side-store K/V | proposal] segments. When the draft model has
+// SWA layers (Gemma-family targets), a second mask kq_mask_swa is also
+// built; the draft graph selects per-layer between the two masks.
 class llm_graph_input_dflash : public llm_graph_input_i {
 public:
-    llm_graph_input_dflash(const llama_dflash * dflash, int64_t n_ctx, int64_t n_block)
-        : dflash(dflash), n_ctx(n_ctx), n_block(n_block) {}
+    llm_graph_input_dflash(const llama_dflash * dflash, int64_t n_ctx, int64_t n_block,
+                           uint32_t n_swa = 0, llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE)
+        : dflash(dflash), n_ctx(n_ctx), n_block(n_block),
+          n_swa(n_swa), swa_type(swa_type) {}
     virtual ~llm_graph_input_dflash() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * kq_mask     = nullptr; // F32 [n_ctx + n_block, n_block_pad, 1, 1]
-    ggml_tensor * kq_mask_cnv = nullptr; // f16 cast for flash_attn
+    ggml_tensor * kq_mask         = nullptr; // F32 [n_ctx + n_block, n_block_pad, 1, 1]
+    ggml_tensor * kq_mask_cnv     = nullptr; // f16 cast for flash_attn
+
+    // Optional SWA-restricted variant; nullptr on models with no SWA
+    // layers. Same layout as kq_mask, but additionally masks ctx slots
+    // whose absolute position is further than n_swa behind the query
+    // (using llama_hparams::is_masked_swa for the cutoff rule).
+    ggml_tensor * kq_mask_swa     = nullptr;
+    ggml_tensor * kq_mask_swa_cnv = nullptr;
 
     const llama_dflash * dflash;
     int64_t              n_ctx;
     int64_t              n_block;
+
+    uint32_t             n_swa;
+    llama_swa_type       swa_type;
 };
 
 // inline-encoder input class. Holds the pos_new (RoPE positions) and pos_idx

@@ -4822,6 +4822,37 @@ class Qwen3Model(Qwen2Model):
 class DFlashModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.DFLASH
 
+    def _is_gemma_family(self):
+        # z-lab publishes DFlash drafts for several target families. The
+        # Gemma-family marker is a final_logit_softcapping value in the
+        # draft's own config (Qwen drafts don't carry this).
+        return "final_logit_softcapping" in self.hparams
+
+    def set_vocab(self):
+        if self._is_gemma_family():
+            # Mirror Gemma4Model.set_vocab: HF Llama-style tokenizer
+            # (tokenizer.json + tokenizer.model), no BPE merges path.
+            vocab = gguf.LlamaHfVocab(self.dir_model)
+            tokens, scores, toktypes = [], [], []
+            for text, score, toktype in vocab.all_tokens():
+                tokens.append(text)
+                scores.append(score)
+                toktypes.append(toktype)
+            assert len(tokens) == vocab.vocab_size
+
+            self.gguf_writer.add_tokenizer_model("gemma4")
+            self.gguf_writer.add_token_list(tokens)
+            self.gguf_writer.add_token_scores(scores)
+            self.gguf_writer.add_token_types(toktypes)
+
+            special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+            special_vocab.add_to_gguf(self.gguf_writer)
+            self.gguf_writer.add_add_space_prefix(False)
+            self.gguf_writer.add_add_bos_token(True)
+            return
+
+        super().set_vocab()
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
@@ -4851,6 +4882,31 @@ class DFlashModel(Qwen3Model):
                     for i in range(n_draft_layers)
                 ]
         self.gguf_writer.add_dflash_target_layer_ids([int(x) for x in target_layer_ids])
+
+        # Gemma-family draft extras: logit softcap + SWA layout. The C++
+        # loader treats these as optional, so Qwen-family DFlash GGUFs
+        # stay byte-identical to before.
+        if self._is_gemma_family():
+            self.gguf_writer.add_final_logit_softcapping(
+                float(cfg["final_logit_softcapping"]))
+
+            sliding_window = cfg.get("sliding_window")
+            if sliding_window:
+                self.gguf_writer.add_sliding_window(int(sliding_window))
+
+            # Per-layer SWA layout. Prefer the explicit layer_types list
+            # the HF config carries; fall back to the boolean array form
+            # if present. Skip writing when neither is available — the
+            # loader will then mark all layers SWA (correct for
+            # Gemma-family targets where the global layer is the
+            # exception, not the rule).
+            layer_types = cfg.get("layer_types")
+            if layer_types is not None:
+                swa_layers = [t == "sliding_attention" for t in layer_types]
+                self.gguf_writer.add_sliding_window_pattern(swa_layers)
+            elif isinstance(cfg.get("sliding_window_pattern"), list):
+                self.gguf_writer.add_sliding_window_pattern(
+                    cfg["sliding_window_pattern"])
 
     def modify_tensors(self, data_torch, name, bid):
         # Paper §4.2: DFlash drafts share embed_tokens and lm_head with the
