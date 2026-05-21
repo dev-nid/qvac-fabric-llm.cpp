@@ -201,6 +201,19 @@ llama_model_dflash::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // ---------- decoder stack ----------
+    // Force F32 accumulation on the lm_head matmul (the final projection that
+    // produces logits → argmax → draft token choices). Intermediate decoder
+    // layers stay at default precision (F16 on Vulkan coopmat, BF16 on CUDA
+    // tensor cores) for throughput. Only the lm_head determines argmax, so
+    // forcing F32 there is sufficient for deterministic draft predictions
+    // across driver versions. Cost: ~2% on the lm_head matmul only (one of
+    // ~15 total matmuls in the 5-layer decoder; negligible).
+    auto build_lora_mm_f32 = [&](ggml_tensor * w, ggml_tensor * cur_in) -> ggml_tensor * {
+        ggml_tensor * r = build_lora_mm(w, cur_in);
+        ggml_mul_mat_set_prec(r, GGML_PREC_F32);
+        return r;
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -319,7 +332,7 @@ llama_model_dflash::graph::graph(const llama_model & model, const llm_graph_para
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
-        // ---------- FFN (Qwen3-style SwiGLU) ----------
+        // ---------- FFN (Qwen3-style SwiGLU, inlined for F32 prec) ----------
         cur = build_norm(ffn_inp,
                 model.layers[il].ffn_norm, NULL,
                 LLM_NORM_RMS, il);
@@ -349,7 +362,7 @@ llama_model_dflash::graph::graph(const llama_model & model, const llm_graph_para
     // Paper §4.2: lm_head is shared with the target.
     ggml_tensor * lm_head_use = model.target_output ? model.target_output : model.output;
     GGML_ASSERT(lm_head_use != nullptr && "DFlash drafter: no lm_head found.");
-    ggml_tensor * logits = build_lora_mm(lm_head_use, cur);
+    ggml_tensor * logits = build_lora_mm_f32(lm_head_use, cur);
     cb(logits, "result_output", -1);
 
     // Gemma-family targets apply a tanh-based final-logit softcap after lm_head.

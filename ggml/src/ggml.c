@@ -1065,6 +1065,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "GATED_DELTA_NET_WITH_HISTORY",
+    "GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST",
     "GATED_DELTA_NET_STATE_SELECT",
     "DFLASH_CONV_STATE_HISTORY_SELECT",
     "DFLASH_CONV_STATE_HISTORY_SELECT_TREE",
@@ -1085,7 +1086,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1180,6 +1181,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "gated_delta_net_with_history(q, k, v, g, beta, s)",
+    "gated_delta_net_with_history_tree_persist(q, k, v, g, beta, s, parent_ids, persist_inter)",
     "gated_delta_net_state_select(state_history, k_index)",
     "dflash_conv_state_history_select(conv_history, k_index)",
     "dflash_conv_state_history_select_tree(conv_history, k_index, parent_ids)",
@@ -1200,7 +1202,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6369,6 +6371,51 @@ struct ggml_tensor * ggml_gated_delta_net_with_history_tree(
     const int64_t H   = v->ne[1];
     GGML_ASSERT(ggml_nelements(persist_inter) >= S_v * S_v * H * n_tokens * n_seqs);
 
+    result->src[6] = parent_ids;
+    result->src[7] = persist_inter;
+
+    return result;
+}
+
+// ggml_gated_delta_net_with_history_tree_persist
+//
+// Shape-identical to ggml_gated_delta_net_with_history_tree but uses a
+// distinct opcode so backends can route the call to the kernel that writes
+// per-token state_history straight into persist_inter (= no follow-up cpy
+// from the embedded region needed). Graph builder MUST NOT emit a cpy from
+// the result's embedded state-history region to persist_inter after this op.
+
+struct ggml_tensor * ggml_gated_delta_net_with_history_tree_persist(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * persist_inter) {
+    struct ggml_tensor * result =
+        ggml_gated_delta_net_with_history(ctx, q, k, v, g, beta, state);
+
+    GGML_ASSERT(parent_ids != NULL);
+    GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(parent_ids));
+
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+    GGML_ASSERT(ggml_nelements(parent_ids) == n_tokens * n_seqs);
+
+    GGML_ASSERT(persist_inter != NULL);
+    GGML_ASSERT(persist_inter->type == GGML_TYPE_F32 ||
+                persist_inter->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(persist_inter));
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H   = v->ne[1];
+    GGML_ASSERT(ggml_nelements(persist_inter) >= S_v * S_v * H * n_tokens * n_seqs);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST;
     result->src[6] = parent_ids;
     result->src[7] = persist_inter;
 

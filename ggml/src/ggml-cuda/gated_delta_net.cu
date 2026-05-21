@@ -489,24 +489,47 @@ void ggml_cuda_op_gated_delta_net_with_history(ggml_backend_cuda_context & ctx, 
     void * persist_inter_d = (src_persist_inter != nullptr) ? src_persist_inter->data : nullptr;
     const bool persist_is_f16 = (src_persist_inter != nullptr) && (src_persist_inter->type == GGML_TYPE_F16);
 
-    // Pick the spill target for the kernel:
-    //   - tree mode: write into dst's f32 embedded region; the graph
-    //     builder appends a ggml_cpy(state_history_view, persist_inter)
-    //     after the op (build_delta_net_with_history_tree). The in-kernel
-    //     parent-walk reload then reads from the same buffer the kernel
-    //     just wrote to. Unified with Vulkan to dodge a same-thread
-    //     read-after-write hazard on a separate f16 storage buffer on
-    //     some Vulkan implementations; CUDA used to write straight to
-    //     persist_inter with InterT picked from its dtype, but writing to
-    //     the embedded region first + cpy is functionally equivalent and
-    //     keeps the
-    //     two backends on the same path.
+    // Distinguish the two tree-mode contracts via dst->op:
+    //   - WITH_HISTORY (tree mode) + cpy after: write into dst's f32 embedded
+    //     region; the graph builder appends a ggml_cpy(state_history_view,
+    //     persist_inter) after the op. Unified path with Vulkan to dodge a
+    //     same-thread read-after-write hazard on a separate f16 storage buffer
+    //     on some Vulkan implementations.
+    //   - WITH_HISTORY_TREE_PERSIST: write per-token states straight into
+    //     persist_inter (f16 or f32, in-kernel type-converted). No follow-up
+    //     cpy. Saves ~9 ms/iter on tree-budget-22 Qwen3.5-27B; lucebox
+    //     reference: `ggml_gated_delta_net_tree_persist`. CUDA-only — see
+    //     the `case GGML_OP_GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST` arm
+    //     in `ggml_backend_cuda_device_supports_op`.
     //   - chain mode + external persist_inter: keep writing straight
     //     into persist_inter (chain-compatibility path).
     //   - chain mode without persist_inter: embedded f32 region only.
+    const bool tree_persist_op =
+        (dst->op == GGML_OP_GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST);
+    GGML_ASSERT(!tree_persist_op || tree_mode);
+    GGML_ASSERT(!tree_persist_op || persist_inter_d != nullptr);
+
     #define GDN_LAUNCH(KDA_VAL)                                                                 \
         do {                                                                                    \
-            if (tree_mode) {                                                                    \
+            if (tree_persist_op) {                                                              \
+                /* CUDA-only fast tree path: kernel writes per-token states */                  \
+                /* directly into persist_inter (no follow-up cpy needed). */                    \
+                if (persist_is_f16) {                                                           \
+                    __half * persist_typed = (__half *) persist_inter_d;                        \
+                    launch_gated_delta_net<KDA_VAL, true, __half>(                              \
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                    \
+                        persist_typed, parent_ids_d,                                            \
+                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
+                } else {                                                                        \
+                    float * persist_typed = (float *) persist_inter_d;                          \
+                    launch_gated_delta_net<KDA_VAL, true, float>(                               \
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                    \
+                        persist_typed, parent_ids_d,                                            \
+                        S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
+                }                                                                               \
+            } else if (tree_mode) {                                                             \
                 launch_gated_delta_net<KDA_VAL, true, float>(                                   \
                     q_d, k_d, v_d, g_d, b_d, s_d, dst_d,                                        \
                     embedded_history_d, parent_ids_d,                                           \

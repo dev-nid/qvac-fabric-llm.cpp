@@ -363,13 +363,6 @@ void llm_graph_input_dflash_inline_encode::set_input(const llama_ubatch * ubatch
     if (dflash == nullptr) return;
     if (n_outputs <= 0) return;
 
-    // pos_new[i] = inline_pos_start + i (RoPE positions for K_new).
-    // pos_idx[i] = inline_write_offset + i (write slots in the side store).
-    // Both are 1D tensors sized n_outputs. We always write the full extent;
-    // ctx_filled is bumped by accepted_count (not n_outputs) by the
-    // speculative driver, so unaccepted suffix positions land in slots
-    // above ctx_filled and are overwritten by the next extend before the
-    // draft can read them.
     if (pos_new && pos_new->buffer) {
         std::vector<int32_t> buf((size_t) n_outputs);
         for (int64_t i = 0; i < n_outputs; ++i) {
@@ -2390,9 +2383,16 @@ void llm_graph_context::build_dflash_inline_encoder(const llama_model & model,
                 "inline encoder: target's per-head dims don't match draft "
                 "wk shape; this model pair needs explicit sizing cparams");
 
+    // Same F16-accumulator concern as h_fc above: the wk/wv weights are F16
+    // and the default matmul accumulator on fp16-capable backends is F16.
+    // The K/V written into the side store is the only path captured target
+    // features take into the spec block, so precision loss here feeds
+    // straight into draft acceptance. Force F32 accumulation on both
+    // projections, matching the side-store encoder at src/models/dflash.cpp.
     for (int il = 0; il < n_dft_layer; ++il) {
         // K_new = wk · h_proj  → [n_embd_head, n_head_kv, n_new]
         ggml_tensor * K_new = build_lora_mm(model.target_dflash_wk[il], h_proj);
+        ggml_mul_mat_set_prec(K_new, GGML_PREC_F32);
         K_new = ggml_reshape_3d(ctx0, K_new, n_embd_head_use, n_head_kv_use, n_new);
         K_new = build_norm(K_new, model.target_dflash_attn_k_norm[il],
                            nullptr, LLM_NORM_RMS, il);
@@ -2404,6 +2404,7 @@ void llm_graph_context::build_dflash_inline_encoder(const llama_model & model,
 
         // V_new = wv · h_proj  (no norm, no RoPE)
         ggml_tensor * V_new = build_lora_mm(model.target_dflash_wv[il], h_proj);
+        ggml_mul_mat_set_prec(V_new, GGML_PREC_F32);
         V_new = ggml_reshape_3d(ctx0, V_new, n_embd_head_use, n_head_kv_use, n_new);
         cb(V_new, "dflash_inline_enc_V_new", il);
 

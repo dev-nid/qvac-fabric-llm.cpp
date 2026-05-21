@@ -3660,6 +3660,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_TREE_BEST_FIRST"));
 
     add_opt(common_arg(
+        {"--dflash-mode"}, "NAME",
+        "DFlash drafter: select a named preset of co-tuned flags so benches "
+        "don't depend on each invocation getting the flag salad right. "
+        "Available presets: "
+        "'ddtree-22' = --dflash-tree --dflash-tree-budget 22 --dflash-gdn-history "
+        "(canonical tree-verify config for hybrid-attn targets); "
+        "'chain-k4'  = --spec-draft-n-max 4 --dflash-gdn-history "
+        "(canonical chain config; matches the May 15 reference bench shape). "
+        "Explicit per-flag arguments after --dflash-mode override the preset.",
+        [](common_params & params, const std::string & value) {
+            if (value == "ddtree-22") {
+                params.speculative.dflash_tree         = true;
+                params.speculative.dflash_tree_budget  = 22;
+                params.speculative.dflash_gdn_history  = true;
+                if (params.speculative.dflash_topk < 2) {
+                    params.speculative.dflash_topk = 2;
+                }
+            } else if (value == "chain-k4") {
+                params.speculative.draft.n_max         = 4;
+                params.speculative.dflash_gdn_history  = true;
+            } else {
+                throw std::invalid_argument(
+                    string_format("unknown --dflash-mode '%s' "
+                                  "(expected: ddtree-22, chain-k4)",
+                                  value.c_str()));
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DFLASH_MODE"));
+
+    add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
         [](common_params & params, const std::string & value) {

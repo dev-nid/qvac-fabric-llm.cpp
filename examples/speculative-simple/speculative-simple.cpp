@@ -6,6 +6,11 @@
 #include "log.h"
 #include "llama.h"
 
+// Opt-in profilers (DFLASH_GPU_LOG=1 / DFLASH_PROF=1). Zero overhead unless
+// enabled — see common/dflash-gpu-log.h, common/dflash-profile.h.
+#include "dflash-gpu-log.h"
+#include "dflash-profile.h"
+
 #include <clocale>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +44,14 @@ int main(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SPECULATIVE)) {
         return 1;
     }
+
+    // Activate the host-observed wall-time logger (DFLASH_GPU_LOG=1) and the
+    // per-ggml-op CPU profiler (DFLASH_PROF=1). Both are no-ops unless their
+    // env var is set; design + scope live in common/dflash-{gpu-log,profile}.h.
+    const auto dflash_gpu_log_cfg = dflash_gpu_log::read_env_config();
+    dflash_gpu_log::logger::instance().set_enabled(dflash_gpu_log_cfg.enabled);
+    const auto dflash_prof_cfg = dflash_prof::read_env_config();
+    dflash_prof::profiler::instance().set_enabled(dflash_prof_cfg.enabled);
 
     if (params.n_predict < -1) {
         LOG_ERR("%s: --n-predict must be >= -1\n", __func__);
@@ -221,6 +234,14 @@ int main(int argc, char ** argv) {
     int n_drafted = 0;
     int n_accept  = 0;
 
+    // counts every main-loop iteration that issued a verify decode against
+    // the target (chain spec round, tree verify, or the empty-tree single-
+    // token fallback). Used to report avg commit/step (AL) — committed
+    // tokens per verify step — which is invariant under env / config
+    // changes that don't affect draft quality, mirroring lucebox's
+    // `avg commit/step=` metric.
+    int64_t n_verify_iters = 0;
+
     // used to determine end of generation
     bool has_eos = false;
 
@@ -263,10 +284,13 @@ int main(int argc, char ** argv) {
                     /*write_offset=*/ 0,
                     /*pos_start=*/    0);
             }
-            if (llama_decode(ctx_tgt, prefill_batch) != 0) {
-                LOG_ERR("%s: target prompt prefill (with capture) failed\n", __func__);
-                llama_batch_free(prefill_batch);
-                return 1;
+            {
+                DFLASH_GPU_TIMER("prefill-tgt-dflash", ctx_tgt);
+                if (llama_decode(ctx_tgt, prefill_batch) != 0) {
+                    LOG_ERR("%s: target prompt prefill (with capture) failed\n", __func__);
+                    llama_batch_free(prefill_batch);
+                    return 1;
+                }
             }
             llama_batch_free(prefill_batch);
 
@@ -385,8 +409,11 @@ int main(int argc, char ** argv) {
             common_params_speculative params_spec_iter = params_spec;
             params_spec_iter.dflash_tree_budget = effective_budget;
 
-            common_speculative_tree tree =
-                common_speculative_draft_tree(spec, params_spec_iter, prompt_tgt, id_last);
+            common_speculative_tree tree;
+            {
+                DFLASH_GPU_TIMER("draft-tree-gdn", ctx_tgt);
+                tree = common_speculative_draft_tree(spec, params_spec_iter, prompt_tgt, id_last);
+            }
 
             const int n_past_before = n_past;
             auto * mem = llama_get_memory(ctx_tgt);
@@ -416,7 +443,11 @@ int main(int argc, char ** argv) {
                 llama_dflash_set_gdn_history_parent_ids(
                     ctx_tgt, nullptr, 0, 0);
                 common_batch_add(batch_tgt, id_last, n_past_before, { 0 }, /*logits=*/true);
-                llama_decode(ctx_tgt, batch_tgt);
+                {
+                    DFLASH_GPU_TIMER("verify-tree-gdn-fallback", ctx_tgt);
+                    llama_decode(ctx_tgt, batch_tgt);
+                }
+                ++n_verify_iters;
                 const llama_token bonus =
                     common_sampler_sample(smpl.get(), ctx_tgt, 0);
                 common_sampler_accept(smpl.get(), bonus, true);
@@ -475,7 +506,11 @@ int main(int argc, char ** argv) {
                 // the value is still the default (-1) so the op is a
                 // no-op and the prefill state is used unchanged.
 
-                llama_decode(ctx_tgt, batch_tgt);
+                {
+                    DFLASH_GPU_TIMER("verify-tree-gdn", ctx_tgt);
+                    llama_decode(ctx_tgt, batch_tgt);
+                }
+                ++n_verify_iters;
 
                 // (4) Tree-walk accept: root → ... → commit_n. Track
                 // each accepted child's DFS slot so step (5) can hand
@@ -535,6 +570,7 @@ int main(int argc, char ** argv) {
                 // cells are renamed to a contiguous monotonic block
                 // [n_past_before .. n_past_before + L].
                 {
+                    DFLASH_GPU_TIMER("kv-compaction-tree-gdn", ctx_tgt);
                     std::vector<int32_t> dfs_keep;
                     dfs_keep.reserve(1 + accepted_dfs.size());
                     dfs_keep.push_back(0);
@@ -651,7 +687,11 @@ int main(int argc, char ** argv) {
                 // Drafter returned no tree (non-DFlash, or topk read failed).
                 // Decode just id_last and emit the bonus token.
                 common_batch_add(batch_tgt, id_last, n_past_before, { 0 }, /*logits=*/true);
-                llama_decode(ctx_tgt, batch_tgt);
+                {
+                    DFLASH_GPU_TIMER("verify-tree-legacy-fallback", ctx_tgt);
+                    llama_decode(ctx_tgt, batch_tgt);
+                }
+                ++n_verify_iters;
 
                 const llama_token bonus = common_sampler_sample(smpl.get(), ctx_tgt, 0);
                 common_sampler_accept(smpl.get(), bonus, true);
@@ -696,7 +736,11 @@ int main(int argc, char ** argv) {
                                      n_past_before + d, seqs, /*logits=*/true);
                 }
 
-                llama_decode(ctx_tgt, batch_tgt);
+                {
+                    DFLASH_GPU_TIMER("verify-tree-legacy", ctx_tgt);
+                    llama_decode(ctx_tgt, batch_tgt);
+                }
+                ++n_verify_iters;
 
                 // Tree-walk accept: root → ... → commit_n following target argmax.
                 int current  = 0;
@@ -793,6 +837,7 @@ int main(int argc, char ** argv) {
         //
         if (draft.empty()) {
             // generate a new draft
+            DFLASH_GPU_TIMER("draft-chain", ctx_tgt);
             draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last);
 
             // save the original draft size
@@ -841,7 +886,11 @@ int main(int argc, char ** argv) {
 
             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
-            llama_decode(ctx_tgt, batch_tgt);
+            {
+                DFLASH_GPU_TIMER("verify-chain", ctx_tgt);
+                llama_decode(ctx_tgt, batch_tgt);
+            }
+            ++n_verify_iters;
         }
 
         // only save the sampler sampler state if we use checkpoints
@@ -1004,6 +1053,14 @@ int main(int argc, char ** argv) {
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", n_drafted > 0 ? 100.0f * n_accept / n_drafted : 0.0f);
+    // Avg committed tokens per verify step (== lucebox's `avg commit/step`).
+    // Function of draft quality + verify shape; invariant under env / build
+    // changes that don't affect either. Diverging tps with identical AL
+    // points at bench methodology (ctx size, flags, KV layout); diverging
+    // AL points at a real draft / verify regression.
+    LOG_INF("n_verify_iters = %lld\n", (long long) n_verify_iters);
+    LOG_INF("commit/step    = %.3f\n",
+            n_verify_iters > 0 ? (double) n_predict / (double) n_verify_iters : 0.0);
     if (use_tree) {
         LOG_INF("tree iters    = %lld\n", (long long) n_tree_iters);
         LOG_INF("tree alt taken = %lld\n", (long long) n_tree_alt_taken);
@@ -1027,6 +1084,19 @@ int main(int argc, char ** argv) {
     LOG_INF("\n");
     LOG_INF("target:\n\n");
     common_perf_print(ctx_tgt, smpl.get());
+
+    // Dump per-phase wall-time table for the GPU profiler (DFLASH_GPU_LOG=1).
+    // Each bucket entry shows count, total_ms, min/max ms — used to locate
+    // which phase dominates per-iter wall on tree-mode regressions.
+    if (dflash_gpu_log::logger::instance().enabled()) {
+        FILE * out = stderr;
+        if (!dflash_gpu_log_cfg.out_file.empty()) {
+            FILE * f = std::fopen(dflash_gpu_log_cfg.out_file.c_str(), "w");
+            if (f) { out = f; }
+        }
+        dflash_gpu_log::dump_summary(out);
+        if (out != stderr) { std::fclose(out); }
+    }
 
     llama_batch_free(batch_tgt);
 

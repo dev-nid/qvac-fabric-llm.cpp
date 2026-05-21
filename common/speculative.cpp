@@ -15,6 +15,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <queue>
 #include <cinttypes>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
@@ -1593,43 +1594,96 @@ private:
         }
 
         if (topk_K >= 2 && tree.n_nodes < budget) {
-            // Build the candidate pool (one entry per (depth, rank) with rank>=1)
-            // and sort by per-position log-prob descending. This is O(N log N)
-            // in `N = (K-1) * chain_target`, dwarfed by everything else.
-            struct AltCand {
-                float   logp;
-                int     depth;
-                uint32_t rank;
+            // Cumulative-path-probability best-first expansion (ported from
+            // lucebox's build_ddtree / Ringel & Romano arXiv:2604.12989).
+            //
+            // During chain pre-seed above, accumulate per-depth cumulative
+            // log-prob of the main chain (top-1 at each depth). Then seed
+            // a max-heap with the rank-1 sibling at each chain depth, scored
+            // by the cumulative log-prob of the *path from root* that leads
+            // to that sibling (= chain cumul up to parent + sibling's local
+            // log-prob). Expansion pops the highest-path-prob candidate,
+            // places it in the tree, and pushes its children (next-depth
+            // siblings along the same branch) back onto the heap.
+            //
+            // This concentrates sibling nodes at positions where the draft's
+            // uncertainty is highest relative to the path probability, which
+            // produces ~1.3 higher AL than the flat per-position sort used
+            // previously. Reference: lucebox RESULTS.md "Chain pre-seed in
+            // build_ddtree" row (+5 AL).
+
+            // Compute cumulative chain log-prob at each depth (for scoring).
+            std::vector<float> chain_cum_logp(chain_target + 1, 0.0f);
+            for (int d = 1; d <= chain_target; ++d) {
+                chain_cum_logp[d] = chain_cum_logp[d - 1]
+                    + topk_logprobs[(size_t) d * topk_K + 0];
+            }
+
+            struct HeapEntry {
+                float   neg_path_logp; // negated for min-heap → max-path-prob
+                int     parent_idx;    // index in the flat tree (0 = root)
+                int     depth;         // 1-based depth in the tree
                 int32_t tok;
             };
-            std::vector<AltCand> cands;
-            cands.reserve((size_t) (topk_K - 1) * (size_t) chain_target);
-            for (uint32_t rank = 1; rank < topk_K; ++rank) {
-                for (int d = 1; d <= chain_target; ++d) {
-                    const size_t idx = (size_t) d * (size_t) topk_K + rank;
-                    const int32_t tok = topk_tokens[idx];
+            auto heap_cmp = [](const HeapEntry & a, const HeapEntry & b) {
+                return a.neg_path_logp > b.neg_path_logp;
+            };
+            std::priority_queue<HeapEntry, std::vector<HeapEntry>,
+                                decltype(heap_cmp)> heap(heap_cmp);
+
+            // Seed heap: for each chain depth d, push the rank-1 sibling
+            // with path score = chain_cum_logp[d-1] + sibling_local_logp.
+            for (int d = 1; d <= chain_target; ++d) {
+                for (uint32_t rank = 1; rank < topk_K; ++rank) {
+                    const size_t pos_idx = (size_t) d * topk_K + rank;
+                    const int32_t tok = topk_tokens[pos_idx];
                     if (tok < 0) continue;
-                    cands.push_back({ topk_logprobs[idx], d, rank, tok });
+                    const float path_logp = chain_cum_logp[d - 1]
+                        + topk_logprobs[pos_idx];
+                    heap.push({ -path_logp, /*parent_idx=*/ d - 1,
+                                /*depth=*/ d, tok });
                 }
             }
-            std::sort(cands.begin(), cands.end(),
-                      [](const AltCand & a, const AltCand & b) { return a.logp > b.logp; });
 
             int next_branch = 1;
-            for (const auto & c : cands) {
-                if (tree.n_nodes >= budget) break;
-                const int alt_parent_idx = c.depth - 1;
-                if (tree.child_maps[alt_parent_idx].count(c.tok)) continue;
+            while (!heap.empty() && tree.n_nodes < budget) {
+                const HeapEntry entry = heap.top();
+                heap.pop();
+
+                // Skip if this parent already has this token as a child
+                // (can happen if multiple heap paths converge on the same
+                // (parent, tok) pair via different scoring routes).
+                if (tree.child_maps[entry.parent_idx].count(entry.tok)) {
+                    continue;
+                }
 
                 const int idx = tree.n_nodes + 1;
-                tree.tokens.push_back((llama_token) c.tok);
-                tree.parents.push_back(alt_parent_idx);
-                tree.depths.push_back(c.depth);
+                tree.tokens.push_back((llama_token) entry.tok);
+                tree.parents.push_back(entry.parent_idx);
+                tree.depths.push_back(entry.depth);
                 tree.branch_ids.push_back(next_branch);
                 tree.child_maps.emplace_back();
-                tree.child_maps[alt_parent_idx][(llama_token) c.tok] = idx;
+                tree.child_maps[entry.parent_idx][(llama_token) entry.tok] = idx;
                 tree.n_nodes++;
                 next_branch++;
+
+                // Push this node's children (next-depth candidates along the
+                // same branch) back onto the heap if they exist in the
+                // topk_logprobs array. The child at next depth inherits this
+                // node's path_logp as its parent-path score.
+                const int child_depth = entry.depth + 1;
+                if (child_depth <= chain_target) {
+                    const float parent_path_logp = -entry.neg_path_logp;
+                    for (uint32_t rank = 0; rank < topk_K; ++rank) {
+                        const size_t pos_idx = (size_t) child_depth * topk_K + rank;
+                        const int32_t child_tok = topk_tokens[pos_idx];
+                        if (child_tok < 0) continue;
+                        const float child_path_logp = parent_path_logp
+                            + topk_logprobs[pos_idx];
+                        heap.push({ -child_path_logp, /*parent_idx=*/ idx,
+                                    /*depth=*/ child_depth, child_tok });
+                    }
+                }
             }
             tree.n_branches = next_branch;
         }

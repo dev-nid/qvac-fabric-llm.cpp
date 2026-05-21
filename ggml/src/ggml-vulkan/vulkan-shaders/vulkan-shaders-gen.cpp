@@ -999,6 +999,20 @@ void process_shaders() {
     string_to_spv("gated_delta_net_history_tree_f32_nocluster",  "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"WRITE_STATE_HISTORY", "1"}, {"TREE_MODE", "1"}}));
     string_to_spv("gated_delta_net_history_tree_f32_shmem",      "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"WRITE_STATE_HISTORY", "1"}, {"TREE_MODE", "1"}}));
 
+    // DFlash _PERSIST tree-mode variants: shader spills per-token state
+    // directly into persist_inter (binding 8) and the graph builder skips
+    // the follow-up ggml_cpy. Compiled for F32 and F16 persist storage;
+    // the F16 variant is meant for NVIDIA / Intel Vulkan only — a prior
+    // F16 implementation hit a cross-iter R-A-W hazard on RADV/amdgpu (see
+    // gated_delta_net.comp TREE_MODE / WRITE_PERSIST_INTER comment), so
+    // we plumb F16 via the same shader but document the constraint.
+    string_to_spv("gated_delta_net_history_tree_persist_f32",            "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}, {"WRITE_STATE_HISTORY", "1"}, {"TREE_MODE", "1"}, {"WRITE_PERSIST_INTER", "1"}}));
+    string_to_spv("gated_delta_net_history_tree_persist_f32_nocluster",  "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"WRITE_STATE_HISTORY", "1"}, {"TREE_MODE", "1"}, {"WRITE_PERSIST_INTER", "1"}}));
+    string_to_spv("gated_delta_net_history_tree_persist_f32_shmem",      "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"WRITE_STATE_HISTORY", "1"}, {"TREE_MODE", "1"}, {"WRITE_PERSIST_INTER", "1"}}));
+    string_to_spv("gated_delta_net_history_tree_persist_f16",            "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}, {"WRITE_STATE_HISTORY", "1"}, {"TREE_MODE", "1"}, {"WRITE_PERSIST_INTER", "1"}, {"PERSIST_TYPE_F16", "1"}}));
+    string_to_spv("gated_delta_net_history_tree_persist_f16_nocluster",  "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"WRITE_STATE_HISTORY", "1"}, {"TREE_MODE", "1"}, {"WRITE_PERSIST_INTER", "1"}, {"PERSIST_TYPE_F16", "1"}}));
+    string_to_spv("gated_delta_net_history_tree_persist_f16_shmem",      "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"WRITE_STATE_HISTORY", "1"}, {"TREE_MODE", "1"}, {"WRITE_PERSIST_INTER", "1"}, {"PERSIST_TYPE_F16", "1"}}));
+
     // DFlash chain-mode state-history fixup + conv-history fixup. Both are
     // small data-shuffling kernels; F32 state history with a single scalar
     // k_index. F16 InterT and per-seq k_index live in the tree-mode variants.

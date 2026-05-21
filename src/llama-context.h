@@ -166,6 +166,16 @@ struct llama_context {
     // from outside the class without needing friend access.
     llama_dflash & get_dflash_mut() { return dflash; }
 
+    // Drop the cached decode-graph result so the next decode rebuilds it
+    // from scratch. Called from llama_dflash_inline_advance_ctx_filled
+    // when n_ctx_dft grows so the draft graph picks up the new side-store
+    // size (matches the equivalent reset in dflash_extend()).
+    void dflash_invalidate_graph_cache() {
+        if (gf_res_prev) {
+            gf_res_prev->reset();
+        }
+    }
+
     // Internal: drop the oldest `n_drop` columns of the side store.
     bool dflash_slide_left(int64_t n_drop);
 

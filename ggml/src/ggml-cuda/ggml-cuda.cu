@@ -2940,6 +2940,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
             ggml_cuda_op_gated_delta_net_with_history(ctx, dst);
             break;
+        case GGML_OP_GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST:
+            ggml_cuda_op_gated_delta_net_with_history(ctx, dst);
+            break;
         case GGML_OP_GATED_DELTA_NET_STATE_SELECT:
             ggml_cuda_op_gated_delta_net_state_select(ctx, dst);
             break;
@@ -5218,6 +5221,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
+        case GGML_OP_GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST:
             //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327
 #ifdef GGML_USE_MUSA
             return false;

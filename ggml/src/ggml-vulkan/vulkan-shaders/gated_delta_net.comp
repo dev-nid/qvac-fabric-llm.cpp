@@ -52,28 +52,42 @@ layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 // for each token t in [1, n_tokens), parent_ids[t] is either:
 //   - t - 1   : sequential continuation (no extra cost; keep s_shard).
 //   - >= 0    : another token in this same verify; reload state from
-//               the dst-embedded state_history region at that slot.
+//               the dst-embedded state_history region at that slot
+//               (WRITE_PERSIST_INTER=0) or persist_inter (=1).
 //   - -1      : "before the block" — reset state to data_state (curr_state)
 //               from src[5]. The kernel TREE_MODE convention treats < 0 the
 //               same as -1 (root sentinel).
 //
-// IMPORTANT: tree-mode writes per-token state to the dst tensor's
-// embedded state_history region (the same region the chain shader uses
-// when WRITE_STATE_HISTORY=1). The graph builder appends a
-// ggml_cpy(state_history_view, persist_inter) right after the op so the
-// external buffer (dflash->gdn_history[il]) ends up populated
-// for the next iter's state_select. We used to write persist_inter
-// directly from this shader, but cross-iter same-thread read-after-write
-// on a separate F16 storage buffer was producing wrong values on
-// RADV/amdgpu even with `coherent` + `memoryBarrierBuffer()` — routing
-// through dst (always F32, same buffer as data_dst) gives the kernel
-// guaranteed read-after-write visibility and is the same pattern the
-// chain shader uses successfully.
+// Two storage modes, picked at pipeline-compile time:
 //
-// src[7] (persist_inter) is still passed in via the op so CUDA's backend
-// can take a different path (direct spill, no cpy); Vulkan ignores
-// binding 8 and relies on the post-kernel cpy node instead.
+//   WRITE_PERSIST_INTER=0 (regular WITH_HISTORY tree pipeline):
+//     - shader writes per-token state to dst's embedded state_history
+//       region (same buffer as data_dst).
+//     - parent-walk reload reads from data_dst.
+//     - graph builder appends a ggml_cpy(state_history_view ->
+//       persist_inter) after this dispatch.
+//
+//   WRITE_PERSIST_INTER=1 (CUDA-parity persist pipeline; F32 only):
+//     - shader writes per-token state directly into persist_inter
+//       (binding 8) and the embedded state_history region of dst is
+//       left undefined.
+//     - parent-walk reload reads from persist_inter.
+//     - graph builder MUST NOT emit the follow-up ggml_cpy. Matches
+//       lucebox's `ggml_gated_delta_net_tree_persist`.
+//     - F16 persist storage is intentionally NOT compiled here: a prior
+//       attempt to write F16 persist_inter triggered a cross-iter
+//       same-thread read-after-write hazard on RADV/amdgpu even with
+//       `coherent` + `memoryBarrierBuffer()`. F32 storage doesn't hit
+//       that hazard on the drivers we've tested (NVIDIA + RADV).
 layout(binding = 7) readonly  buffer ParentIds { int parent_ids[]; };
+#if WRITE_PERSIST_INTER
+#if PERSIST_TYPE_F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(binding = 8)           buffer PersistBuf { float16_t data_persist[]; };
+#else
+layout(binding = 8)           buffer PersistBuf { float     data_persist[]; };
+#endif
+#endif
 #endif
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
@@ -152,17 +166,15 @@ void main() {
 
     for (uint t = 0; t < n_tokens; t++) {
 #if TREE_MODE
-        // Tree branch-point reload: if parent_t < 0 reset to curr_state
-        // (root of branch); if parent_t != t-1 pull state from the dst-embedded
-        // state_history region at slot parent_t; parent_t == t - 1 is
-        // sequential — keep s_shard. Mirrors the CUDA TREE_MODE branch.
-        //
-        // Reload reads from data_dst (same buffer as the per-iter write
-        // below) so the in-kernel reload is a same-thread read-after-write
-        // on the same storage buffer — Vulkan guarantees ordering for that
-        // pattern. CUDA reads from `inter_states` directly; we route
-        // through dst because cross-iter reads from a separate F16 buffer
-        // were producing wrong values on RADV.
+        // Tree branch-point reload: always reads from dst's embedded
+        // state_history region (F32). This is the same buffer the per-iter
+        // store below writes into (when in the non-persist tree path) AND
+        // the buffer we mirror to when WRITE_PERSIST_INTER is set — so the
+        // in-dispatch R-A-W is always same-thread, same-SSBO, same-element
+        // type (F32), guaranteed safe by the Vulkan memory model. The
+        // persist mirror exists only to be consumed by the next iter's
+        // ggml_gated_delta_net_state_select; it is never read inside this
+        // dispatch, so F16 storage there is safe.
         if (t > 0) {
             const int parent_t = parent_ids[parent_seq_base + t];
             if (parent_t < 0) {
@@ -230,22 +242,31 @@ void main() {
         }
 
 #if WRITE_STATE_HISTORY
-        // Per-token state spill into dst's state_history region. Used by:
-        //   - chain mode (TREE_MODE=0): a post-kernel ggml_cpy narrows
-        //     this region into dflash->gdn_history[il] for the next iter
-        //     to read.
-        //   - tree mode (TREE_MODE=1): the in-kernel parent-walk reload
-        //     above reads from this same region (same-buffer R-A-W,
-        //     ordered) AND a post-kernel ggml_cpy narrows it into
-        //     dflash->gdn_history[il]. See delta-net-base.cpp
-        //     build_delta_net_with_history_tree.
-        // CUDA reference: ggml-cuda/gated_delta_net.cu:225-232.
+        // Per-token state spill. Always write to dst's embedded F32 region;
+        // when WRITE_PERSIST_INTER is also set, MIRROR the same shard into
+        // persist_inter so the post-kernel ggml_cpy can be skipped by the
+        // graph builder. The reload above reads from the f32 dst region
+        // (safe same-SSBO R-A-W); persist_inter is written for the next
+        // iter's state_select consumer only — it is not read in this
+        // dispatch, so F16 storage on persist_inter is hazard-free.
         const uint sh_base = sh_off
             + ((seq_id * n_tokens + t) * H + head_id) * state_size
             + col * S_V;
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
             data_dst[sh_base + r * LANES_PER_COLUMN + lane] = s_shard[r];
         }
+#if TREE_MODE && WRITE_PERSIST_INTER
+        const uint p_base =
+            ((seq_id * n_tokens + t) * H + head_id) * state_size
+            + col * S_V;
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+#if PERSIST_TYPE_F16
+            data_persist[p_base + r * LANES_PER_COLUMN + lane] = float16_t(s_shard[r]);
+#else
+            data_persist[p_base + r * LANES_PER_COLUMN + lane] = s_shard[r];
+#endif
+        }
+#endif
 #endif
 
         attn_off += S_V * H;

@@ -5300,6 +5300,14 @@ void llama_dflash_inline_advance_ctx_filled(llama_context * ctx_dft,
     llama_dflash & ddflash = ctx_dft->get_dflash_mut();
     ddflash.ctx_filled += n_keep;
     ddflash.n_ctx       = ddflash.ctx_filled;
+    // The draft graph bakes n_ctx_dft into its view of the side-store K/V
+    // and into the kq_mask shape at build time. Growing n_ctx without
+    // invalidating the cached draft graph leaves the next draft decode
+    // reading a stale (truncated) view of the side store. The side-store
+    // extend path does the same reset (see llama_context::dflash_extend);
+    // the inline path was missing it, causing draft acceptance to collapse
+    // because the draft never saw newly-committed slots.
+    ctx_dft->dflash_invalidate_graph_cache();
 }
 
 void llama_dflash_set_gdn_history_k_index(llama_context * ctx_tgt,

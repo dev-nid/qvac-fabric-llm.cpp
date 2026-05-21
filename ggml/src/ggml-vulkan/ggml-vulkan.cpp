@@ -852,6 +852,12 @@ struct vk_device_struct {
     // [sv_idx][kda][persist_f16]: SV in {32, 64, 128}, KDA in {0, 1},
     // persist_inter dtype in {F32, F16}.
     vk_pipeline pipeline_gated_delta_net_history_tree[3][2];
+    // _persist variant: 9th binding for the external persist_inter buffer;
+    // skips the post-kernel cpy. Two storage variants:
+    //   [0] = F32 persist storage (safe on all Vulkan drivers we've tested)
+    //   [1] = F16 persist storage (NVIDIA / Intel; RADV hit a cross-iter
+    //         R-A-W hazard — see shader WRITE_PERSIST_INTER comment)
+    vk_pipeline pipeline_gated_delta_net_history_tree_persist[3][2][2];
     vk_pipeline pipeline_gated_delta_net_state_select_f32;
     vk_pipeline pipeline_gated_delta_net_state_select_tree_f32;
     vk_pipeline pipeline_gated_delta_net_state_select_tree_f16;
@@ -4933,6 +4939,61 @@ static void ggml_vk_load_shaders(vk_device& device) {
                     wg_denoms,
                     {S_V, kda, device->subgroup_size, lanes_per_column}, 1,
                     true, use_subgroup_reduce, device->subgroup_size);
+            }
+
+            // DFlash _PERSIST tree-mode pipelines. Same shader, 9 bindings:
+            // chain's 7 + parent_ids + persist_inter. Skips the post-kernel
+            // ggml_cpy. F32 and F16 persist-storage variants compiled
+            // separately; pipeline_gated_delta_net_history_tree_persist[si][kda][pt]
+            // pt=0 selects F32, pt=1 selects F16.
+            for (uint32_t kda = 0; kda < 2; kda++) {
+                for (uint32_t pt = 0; pt < 2; pt++) {
+                    size_t persist_len = 0;
+                    const void * persist_data = nullptr;
+                    const bool is_f16 = (pt == 1);
+                    if (is_f16) {
+                        if (use_subgroup_reduce && need_clustered_shader) {
+                            persist_len  = gated_delta_net_history_tree_persist_f16_len;
+                            persist_data = (const void *)gated_delta_net_history_tree_persist_f16_data;
+                        } else if (use_subgroup_reduce) {
+                            persist_len  = gated_delta_net_history_tree_persist_f16_nocluster_len;
+                            persist_data = (const void *)gated_delta_net_history_tree_persist_f16_nocluster_data;
+                        } else {
+                            persist_len  = gated_delta_net_history_tree_persist_f16_shmem_len;
+                            persist_data = (const void *)gated_delta_net_history_tree_persist_f16_shmem_data;
+                        }
+                    } else {
+                        if (use_subgroup_reduce && need_clustered_shader) {
+                            persist_len  = gated_delta_net_history_tree_persist_f32_len;
+                            persist_data = (const void *)gated_delta_net_history_tree_persist_f32_data;
+                        } else if (use_subgroup_reduce) {
+                            persist_len  = gated_delta_net_history_tree_persist_f32_nocluster_len;
+                            persist_data = (const void *)gated_delta_net_history_tree_persist_f32_nocluster_data;
+                        } else {
+                            persist_len  = gated_delta_net_history_tree_persist_f32_shmem_len;
+                            persist_data = (const void *)gated_delta_net_history_tree_persist_f32_shmem_data;
+                        }
+                    }
+
+                    // Skip F16 variant on devices without fp16 storage.
+                    if (is_f16 && !device->fp16) {
+                        continue;
+                    }
+
+                    char persist_name[128];
+                    snprintf(persist_name, sizeof(persist_name),
+                             "gated_delta_net_history_tree_persist_%s_d%u%s",
+                             is_f16 ? "f16" : "f32",
+                             S_V, (kda ? "_kda" : ""));
+
+                    ggml_vk_create_pipeline(device,
+                        device->pipeline_gated_delta_net_history_tree_persist[si][kda][pt],
+                        persist_name, persist_len, persist_data, "main",
+                        9, sizeof(vk_op_gated_delta_net_history_tree_push_constants),
+                        wg_denoms,
+                        {S_V, kda, device->subgroup_size, lanes_per_column}, 1,
+                        true, use_subgroup_reduce, device->subgroup_size);
+                }
             }
         }
 
@@ -10003,6 +10064,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_GATED_DELTA_NET:
     case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
+    case GGML_OP_GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t S_v = dst->src[2]->ne[0];
             const uint32_t kda = (dst->src[3]->ne[0] == (int64_t)S_v) ? 1 : 0;
@@ -10013,11 +10075,15 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 128: si = 2; break;
                 default: return nullptr;
             }
-            // tree-mode dispatch: src[6] = parent_ids. src[7] = persist_inter
-            // exists on the op for the CUDA backend's direct spill, but Vulkan
-            // ignores it here and relies on a
-            // separate ggml_cpy node to populate persist_inter — see the
-            // TREE_MODE comment in gated_delta_net.comp.
+            // tree-mode dispatches:
+            //   GATED_DELTA_NET_WITH_HISTORY (tree) → embedded write + cpy
+            //   GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST → direct persist
+            //     write, no cpy. F32 persist storage only.
+            if (op == GGML_OP_GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST) {
+                const uint32_t pt =
+                    (dst->src[7] != nullptr && dst->src[7]->type == GGML_TYPE_F16) ? 1 : 0;
+                return ctx->device->pipeline_gated_delta_net_history_tree_persist[si][kda][pt];
+            }
             if (op == GGML_OP_GATED_DELTA_NET_WITH_HISTORY &&
                 dst->src[6] != nullptr && dst->src[7] != nullptr) {
                 return ctx->device->pipeline_gated_delta_net_history_tree[si][kda];
@@ -10943,15 +11009,19 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
 
     const float scale = 1.0f / sqrtf((float)S_v);
 
-    if (dst->op == GGML_OP_GATED_DELTA_NET_WITH_HISTORY) {
-        const bool tree_mode = (dst->src[6] != nullptr && dst->src[7] != nullptr);
+    if (dst->op == GGML_OP_GATED_DELTA_NET_WITH_HISTORY ||
+        dst->op == GGML_OP_GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST) {
+        const bool persist_op =
+            (dst->op == GGML_OP_GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST);
+        const bool tree_mode = persist_op ||
+            (dst->src[6] != nullptr && dst->src[7] != nullptr);
         if (tree_mode) {
-            // tree mode: src[6] = parent_ids (I32). The shader writes
-            // per-token state into dst's embedded state_history region
-            // (sh_off + ...) and reads from the same
-            // region for the parent-walk reload — see TREE_MODE comment
-            // in gated_delta_net.comp. src[7] (persist_inter) is consumed
-            // by a separate ggml_cpy node, not by this dispatch.
+            // tree mode: src[6] = parent_ids (I32). For the regular
+            // WITH_HISTORY op the shader writes per-token state into dst's
+            // embedded state_history region and a separate ggml_cpy node
+            // populates persist_inter. For the _PERSIST op the shader
+            // writes directly into persist_inter (src[7], bound at slot
+            // 8) and no cpy is needed.
             vk_subbuffer pa_buf = ggml_vk_tensor_subbuffer(ctx, dst->src[6]);
 
             const vk_op_gated_delta_net_history_tree_push_constants pc = {
@@ -10963,9 +11033,20 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
                 scale,
                 sh_off
             };
-            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, pa_buf},
-                pc, { H, n_seqs, S_v });
+            if (persist_op) {
+                GGML_ASSERT(dst->src[7] != nullptr);
+                GGML_ASSERT((dst->src[7]->type == GGML_TYPE_F32 ||
+                             dst->src[7]->type == GGML_TYPE_F16) &&
+                            "Vulkan persist pipeline requires F32 or F16 persist_inter");
+                vk_subbuffer persist_buf = ggml_vk_tensor_subbuffer(ctx, dst->src[7]);
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                    {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, pa_buf, persist_buf},
+                    pc, { H, n_seqs, S_v });
+            } else {
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                    {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, pa_buf},
+                    pc, { H, n_seqs, S_v });
+            }
         } else {
             const vk_op_gated_delta_net_history_push_constants pc = {
                 H, n_tokens, n_seqs, s_off,
@@ -16499,6 +16580,29 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 }
+                return true;
+            }
+        case GGML_OP_GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST:
+            {
+                // Tree-mode persist variant. parent_ids + persist_inter both
+                // mandatory. F16 persist storage gated on device fp16 support;
+                // see WRITE_PERSIST_INTER comment for the RADV historical
+                // hazard story.
+                const uint32_t S_v = op->src[2]->ne[0];
+                if (S_v != 32 && S_v != 64 && S_v != 128) {
+                    return false;
+                }
+                for (int i = 0; i < 6; i++) {
+                    if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
+                        return false;
+                    }
+                }
+                if (op->type != GGML_TYPE_F32) return false;
+                if (op->src[6] == nullptr || op->src[6]->type != GGML_TYPE_I32) return false;
+                if (op->src[7] == nullptr) return false;
+                if (op->src[7]->type != GGML_TYPE_F32 &&
+                    op->src[7]->type != GGML_TYPE_F16) return false;
+                if (op->src[7]->type == GGML_TYPE_F16 && !device->fp16) return false;
                 return true;
             }
         case GGML_OP_GATED_DELTA_NET_STATE_SELECT:

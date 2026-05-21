@@ -569,6 +569,15 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_GATED_DELTA_NET_WITH_HISTORY,
+        // CUDA-only variant of WITH_HISTORY's tree mode. The kernel writes the
+        // per-token state_history directly into src[7] (persist_inter) and the
+        // embedded state-history region of dst is left undefined, so the graph
+        // builder MUST NOT emit a follow-up ggml_cpy from dst -> persist_inter.
+        // This skips a ~9 ms/iter redundant copy on hybrid SSM targets at
+        // tree-budget-22; lucebox's `ggml_gated_delta_net_tree_persist`.
+        // Vulkan / CPU do not implement this opcode (they keep the unified
+        // WITH_HISTORY path that writes the embedded region + cpy outside).
+        GGML_OP_GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST,
         GGML_OP_GATED_DELTA_NET_STATE_SELECT,
         GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT,
         GGML_OP_DFLASH_CONV_STATE_HISTORY_SELECT_TREE,
@@ -2614,6 +2623,25 @@ extern "C" {
     // CUDA only. CPU backend aborts with the same error as the chain-mode
     // entry point.
     GGML_API struct ggml_tensor * ggml_gated_delta_net_with_history_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * parent_ids,
+            struct ggml_tensor  * persist_inter);
+
+    // Same as ggml_gated_delta_net_with_history_tree but with a stronger
+    // contract: the CUDA kernel writes per-token states DIRECTLY into
+    // persist_inter and the embedded state-history region of the result
+    // tensor is left undefined. The graph builder MUST NOT emit a
+    // follow-up ggml_cpy(state_history_view -> persist_inter) — there is
+    // no data to copy from the embedded region. Use this entry point on
+    // CUDA-resident layers only; Vulkan / CPU still need the regular
+    // _with_history_tree + cpy.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_with_history_tree_persist(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
             struct ggml_tensor  * k,
