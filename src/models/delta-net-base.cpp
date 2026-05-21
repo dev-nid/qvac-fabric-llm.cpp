@@ -571,32 +571,19 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
     // Fast path: when the backend has a direct-spill kernel for this op,
     // call the _persist factory so the graph builder skips the follow-up
-    // ggml_cpy(state_history_view -> persist_inter). Supported by:
-    //   - CUDA (any persist_inter dtype)
-    //   - Vulkan (only with F32 persist_inter; the F16 path is intentionally
-    //     compiled out — see gated_delta_net.comp TREE_MODE / WRITE_PERSIST_INTER
-    //     comment for the RADV cross-iter R-A-W hazard).
-    // All other backends fall back to the unified embedded-region-write
-    // + post-kernel cpy path.
+    // ggml_cpy(state_history_view -> persist_inter). Supported by CUDA and
+    // Vulkan; other backends fall back to the embedded-region-write +
+    // post-kernel cpy path.
     const char * persist_buft_name = "";
     if (persist_inter->buffer != nullptr) {
         persist_buft_name =
             ggml_backend_buft_name(ggml_backend_buffer_get_type(persist_inter->buffer));
     }
     const bool persist_on_cuda =
-        persist_buft_name != nullptr && std::strstr(persist_buft_name, "CUDA") != nullptr;
-    // Vulkan persist path is currently disabled. A first attempt at writing
-    // persist_inter from the shader (both direct write and mirror write)
-    // produced a ~99% accept-rate collapse on Qwen3.5-27B tree-22, even on
-    // NVIDIA where the original RADV-only F16 hazard shouldn't apply. The
-    // root cause is unclear (suspected index/stride mismatch between the
-    // shader's runtime n_tokens and persist_inter's compile-time max_tokens
-    // stride, but not yet confirmed). Reverted to the proven cpy-emitting
-    // path until a follow-up session can isolate it with a correctness
-    // gate. The pipelines + opcode plumbing remain in place so the
-    // optimization can be re-enabled by a single-line gate change.
-    (void) persist_buft_name;
-    const bool use_persist_op = persist_on_cuda;
+        persist_buft_name != nullptr && std::strstr(persist_buft_name, "CUDA")   != nullptr;
+    const bool persist_on_vulkan =
+        persist_buft_name != nullptr && std::strstr(persist_buft_name, "Vulkan") != nullptr;
+    const bool use_persist_op = persist_on_cuda || persist_on_vulkan;
 
     ggml_tensor * result = use_persist_op
         ? ggml_gated_delta_net_with_history_tree_persist(

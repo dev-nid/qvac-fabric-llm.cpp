@@ -14019,6 +14019,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     case GGML_OP_GATED_DELTA_NET:
     case GGML_OP_GATED_DELTA_NET_WITH_HISTORY:
+    case GGML_OP_GATED_DELTA_NET_WITH_HISTORY_TREE_PERSIST:
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
 
         break;
