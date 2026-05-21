@@ -6,11 +6,6 @@
 #include "log.h"
 #include "llama.h"
 
-// Opt-in profilers (DFLASH_GPU_LOG=1 / DFLASH_PROF=1). Zero overhead unless
-// enabled — see common/dflash-gpu-log.h, common/dflash-profile.h.
-#include "dflash-gpu-log.h"
-#include "dflash-profile.h"
-
 #include <clocale>
 #include <cstdio>
 #include <cstdlib>
@@ -44,14 +39,6 @@ int main(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SPECULATIVE)) {
         return 1;
     }
-
-    // Activate the host-observed wall-time logger (DFLASH_GPU_LOG=1) and the
-    // per-ggml-op CPU profiler (DFLASH_PROF=1). Both are no-ops unless their
-    // env var is set; design + scope live in common/dflash-{gpu-log,profile}.h.
-    const auto dflash_gpu_log_cfg = dflash_gpu_log::read_env_config();
-    dflash_gpu_log::logger::instance().set_enabled(dflash_gpu_log_cfg.enabled);
-    const auto dflash_prof_cfg = dflash_prof::read_env_config();
-    dflash_prof::profiler::instance().set_enabled(dflash_prof_cfg.enabled);
 
     if (params.n_predict < -1) {
         LOG_ERR("%s: --n-predict must be >= -1\n", __func__);
@@ -285,7 +272,6 @@ int main(int argc, char ** argv) {
                     /*pos_start=*/    0);
             }
             {
-                DFLASH_GPU_TIMER("prefill-tgt-dflash", ctx_tgt);
                 if (llama_decode(ctx_tgt, prefill_batch) != 0) {
                     LOG_ERR("%s: target prompt prefill (with capture) failed\n", __func__);
                     llama_batch_free(prefill_batch);
@@ -365,9 +351,7 @@ int main(int argc, char ** argv) {
                 alt_decide_fallback);
     }
 
-    // warmup-decide path between chain and tree mode is currently disabled
-    // (off by default; see logs/core_architecture/17_dflash_env_vars_archive.md
-    // to re-enable for testing).
+    // warmup-decide path between chain and tree mode is currently disabled.
     constexpr int   wd_warmup_iters       = 3;
     constexpr float wd_yield_threshold    = 0.50f;
     const bool      wd_active             = false;
@@ -411,7 +395,6 @@ int main(int argc, char ** argv) {
 
             common_speculative_tree tree;
             {
-                DFLASH_GPU_TIMER("draft-tree-gdn", ctx_tgt);
                 tree = common_speculative_draft_tree(spec, params_spec_iter, prompt_tgt, id_last);
             }
 
@@ -444,7 +427,6 @@ int main(int argc, char ** argv) {
                     ctx_tgt, nullptr, 0, 0);
                 common_batch_add(batch_tgt, id_last, n_past_before, { 0 }, /*logits=*/true);
                 {
-                    DFLASH_GPU_TIMER("verify-tree-gdn-fallback", ctx_tgt);
                     llama_decode(ctx_tgt, batch_tgt);
                 }
                 ++n_verify_iters;
@@ -507,7 +489,6 @@ int main(int argc, char ** argv) {
                 // no-op and the prefill state is used unchanged.
 
                 {
-                    DFLASH_GPU_TIMER("verify-tree-gdn", ctx_tgt);
                     llama_decode(ctx_tgt, batch_tgt);
                 }
                 ++n_verify_iters;
@@ -570,7 +551,6 @@ int main(int argc, char ** argv) {
                 // cells are renamed to a contiguous monotonic block
                 // [n_past_before .. n_past_before + L].
                 {
-                    DFLASH_GPU_TIMER("kv-compaction-tree-gdn", ctx_tgt);
                     std::vector<int32_t> dfs_keep;
                     dfs_keep.reserve(1 + accepted_dfs.size());
                     dfs_keep.push_back(0);
@@ -688,7 +668,6 @@ int main(int argc, char ** argv) {
                 // Decode just id_last and emit the bonus token.
                 common_batch_add(batch_tgt, id_last, n_past_before, { 0 }, /*logits=*/true);
                 {
-                    DFLASH_GPU_TIMER("verify-tree-legacy-fallback", ctx_tgt);
                     llama_decode(ctx_tgt, batch_tgt);
                 }
                 ++n_verify_iters;
@@ -737,7 +716,6 @@ int main(int argc, char ** argv) {
                 }
 
                 {
-                    DFLASH_GPU_TIMER("verify-tree-legacy", ctx_tgt);
                     llama_decode(ctx_tgt, batch_tgt);
                 }
                 ++n_verify_iters;
@@ -837,7 +815,6 @@ int main(int argc, char ** argv) {
         //
         if (draft.empty()) {
             // generate a new draft
-            DFLASH_GPU_TIMER("draft-chain", ctx_tgt);
             draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last);
 
             // save the original draft size
@@ -887,7 +864,6 @@ int main(int argc, char ** argv) {
             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
             {
-                DFLASH_GPU_TIMER("verify-chain", ctx_tgt);
                 llama_decode(ctx_tgt, batch_tgt);
             }
             ++n_verify_iters;
@@ -1084,19 +1060,6 @@ int main(int argc, char ** argv) {
     LOG_INF("\n");
     LOG_INF("target:\n\n");
     common_perf_print(ctx_tgt, smpl.get());
-
-    // Dump per-phase wall-time table for the GPU profiler (DFLASH_GPU_LOG=1).
-    // Each bucket entry shows count, total_ms, min/max ms — used to locate
-    // which phase dominates per-iter wall on tree-mode regressions.
-    if (dflash_gpu_log::logger::instance().enabled()) {
-        FILE * out = stderr;
-        if (!dflash_gpu_log_cfg.out_file.empty()) {
-            FILE * f = std::fopen(dflash_gpu_log_cfg.out_file.c_str(), "w");
-            if (f) { out = f; }
-        }
-        dflash_gpu_log::dump_summary(out);
-        if (out != stderr) { std::fclose(out); }
-    }
 
     llama_batch_free(batch_tgt);
 

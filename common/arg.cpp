@@ -3661,13 +3661,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--dflash-mode"}, "NAME",
-        "DFlash drafter: select a named preset of co-tuned flags so benches "
-        "don't depend on each invocation getting the flag salad right. "
+        "DFlash drafter: select a named preset of co-tuned flags. "
         "Available presets: "
         "'ddtree-22' = --dflash-tree --dflash-tree-budget 22 --dflash-gdn-history "
-        "(canonical tree-verify config for hybrid-attn targets); "
+        "(tree-verify config for hybrid-attn targets); "
         "'chain-k4'  = --spec-draft-n-max 4 --dflash-gdn-history "
-        "(canonical chain config; matches the May 15 reference bench shape). "
+        "(chain config). "
         "Explicit per-flag arguments after --dflash-mode override the preset.",
         [](common_params & params, const std::string & value) {
             if (value == "ddtree-22") {

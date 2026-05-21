@@ -41,13 +41,11 @@ class Config:
 
 
 def build_configs(use_gdn_history: bool) -> list[Config]:
-    # --dflash-gdn-history is REQUIRED for qwen35-family targets to hit
-    # paper / lucebox-reference accept rates, but the target context init
-    # ERRORS on qwen3-base targets ("model lacks GDN dims") — so it has to
-    # be opt-in. Caller passes use_gdn_history based on target path or the
-    # --gdn-history CLI flag.
-    # --dflash-no-chat-template matches the doc 20 reference command at
-    # logs/core_architecture/20_benchmark_regression_investigation.md.
+    # --dflash-gdn-history is required for qwen35-family targets to hit
+    # their full acceptance rate but the target context errors out on
+    # qwen3-base targets ("model lacks GDN dims"), so it has to be opt-in.
+    # Caller passes use_gdn_history based on target path (auto_gdn_history)
+    # or the explicit --gdn-history CLI flag.
     DFLASH_COMMON = ["--draft-type", "dflash",
                      "--dflash-no-chat-template"]
     if use_gdn_history:

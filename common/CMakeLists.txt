@@ -102,10 +102,6 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative.h
-    dflash-gpu-log.cpp
-    dflash-gpu-log.h
-    dflash-profile.cpp
-    dflash-profile.h
     unicode.cpp
     unicode.h
     jinja/lexer.cpp
