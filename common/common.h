@@ -541,6 +541,7 @@ struct common_params {
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
+    bool training          = false; // enable training mode (affects LoRA K/V gradient flow)
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
@@ -554,6 +555,7 @@ struct common_params {
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;     // use GPU for multimodal model
+    std::string mmproj_backend = "";    // GPU backend for multimodal model (e.g. "CUDA", "Metal", "Vulkan")
     bool no_mmproj = false;         // explicitly disable multimodal model
     std::vector<std::string> image; // path to image file(s)
     int image_min_tokens = -1;
@@ -846,11 +848,16 @@ struct common_init_result {
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    friend std::unique_ptr<common_init_result> common_init_from_model_and_params(llama_model * model, common_params & params);
 };
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params);
+common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_init_result_ptr res,
+                                                         common_params & params);
+common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params);
 
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
@@ -998,3 +1005,8 @@ ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std
 
 // "adamw" or "sgd" (case insensitive)
 enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
+ggml_opt_dataset_t common_opt_sft_dataset_init(
+        struct llama_context * ctx,
+        const std::string    & json_content,
+        int64_t                stride,
+        const std::string    & chat_template_path = "");

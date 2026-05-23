@@ -13,6 +13,10 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     add_definitions(/MP)
 endif()
 
+# Add options to disable cooperative matrix support
+option(GGML_VULKAN_DISABLE_COOPMAT "Disable VK_KHR_cooperative_matrix support" OFF)
+option(GGML_VULKAN_DISABLE_COOPMAT2 "Disable VK_NV_cooperative_matrix2 support" OFF)
+
 function(detect_host_compiler)
     if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
         find_program(HOST_C_COMPILER NAMES cl gcc clang NO_CMAKE_FIND_ROOT_PATH)
@@ -62,17 +66,25 @@ if (Vulkan_FOUND)
     set(VULKAN_SHADER_GEN_CMAKE_ARGS "")
 
     # Test all shader extensions
-    test_shader_extension_support(
-        "GL_KHR_cooperative_matrix"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat.comp"
-        "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
-    )
+    if (NOT GGML_VULKAN_DISABLE_COOPMAT)
+        test_shader_extension_support(
+            "GL_KHR_cooperative_matrix"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat.comp"
+            "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
+        )
+    else()
+        message(STATUS "VK_KHR_cooperative_matrix support disabled by GGML_VULKAN_DISABLE_COOPMAT")
+    endif()
 
-    test_shader_extension_support(
-        "GL_NV_cooperative_matrix2"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
-        "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
-    )
+    if (NOT GGML_VULKAN_DISABLE_COOPMAT2)
+        test_shader_extension_support(
+            "GL_NV_cooperative_matrix2"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
+            "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
+        )
+    else()
+        message(STATUS "VK_NV_cooperative_matrix2 support disabled by GGML_VULKAN_DISABLE_COOPMAT2")
+    endif()
 
     test_shader_extension_support(
         "GL_EXT_integer_dot_product"
@@ -87,8 +99,19 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
-    target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(ggml-vulkan
+        PRIVATE
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ../../../vendor
 
+    )
+    if (ANDROID)
+        target_include_directories(ggml-vulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include")
+    endif()
+
+    if (FORCE_GGML_VK_PERF_LOGGER)
+      add_compile_definitions(FORCE_GGML_VK_PERF_LOGGER)
+    endif()
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
     # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
     if (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -101,6 +124,11 @@ if (Vulkan_FOUND)
 
     if (GGML_VULKAN_DEBUG)
         add_compile_definitions(GGML_VULKAN_DEBUG)
+    endif()
+
+    if (GGML_VULKAN_BUILD_ADRENO_SHADERS)
+        add_compile_definitions(GGML_VULKAN_BUILD_ADRENO_SHADERS)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_BUILD_ADRENO_SHADERS=ON)
     endif()
 
     if (GGML_VULKAN_MEMORY_DEBUG)
@@ -183,16 +211,19 @@ if (Vulkan_FOUND)
               CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.cpp"
                                 "${_ggml_vk_input_dir}/*.h")
 
+    set (_ggml_vk_common_cpp "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders-common.cpp")
+
     add_custom_command(
-        OUTPUT ${_ggml_vk_header}
+        OUTPUT ${_ggml_vk_header} ${_ggml_vk_common_cpp}
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
+            --target-common-cpp ${_ggml_vk_common_cpp}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
                 vulkan-shaders-gen
-        COMMENT "Generate vulkan shaders header"
+        COMMENT "Generate vulkan shaders header and common cpp"
     )
-    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_header})
+    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_header} ${_ggml_vk_common_cpp})
 
     foreach (file_full ${_ggml_vk_shader_files})
         get_filename_component(file ${file_full} NAME)

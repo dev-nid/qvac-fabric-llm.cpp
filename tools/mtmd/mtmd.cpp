@@ -117,6 +117,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* image_max_tokens  */ -1,
         /* cb_eval           */ nullptr,
         /* cb_eval_user_data */ nullptr,
+        /* backend_device    */ nullptr,
     };
     return params;
 }
@@ -183,8 +184,10 @@ struct mtmd_context {
             /* image_min_tokens  */ ctx_params.image_min_tokens,
             /* image_max_tokens  */ ctx_params.image_max_tokens,
             /* warmup            */ ctx_params.warmup,
+            /* has_bf16_weights  */ false, // set by clip_init after scanning the GGUF
             /* cb_eval           */ ctx_params.cb_eval,
             /* cb_eval_user_data */ ctx_params.cb_eval_user_data,
+            /* backend_device    */ ctx_params.backend_device,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
@@ -563,6 +566,10 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 void mtmd_free(mtmd_context * ctx) {
     delete ctx;
+}
+
+void mtmd_log_set_llama_callback(ggml_log_callback llama_cb, void * llama_user_data) {
+    clip_log_set_callback(llama_cb, llama_user_data);
 }
 
 struct mtmd_tokenizer {
