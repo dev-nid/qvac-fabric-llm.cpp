@@ -134,6 +134,7 @@ set(GGML_OPENCL_KERNELS
     norm
     relu
     l2_norm
+    gated_delta_net
     rms_norm
     rope
     scale

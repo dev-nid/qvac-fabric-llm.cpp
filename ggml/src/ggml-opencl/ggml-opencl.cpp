@@ -513,6 +513,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_group_norm, kernel_group_norm_mul_add;
     cl_kernel kernel_diag_mask_inf, kernel_diag_mask_inf_8;
     cl_kernel kernel_diag_f32;
+    cl_kernel kernel_gated_delta_net_f32_s128;
     cl_kernel kernel_soft_max, kernel_soft_max_4;
     cl_kernel kernel_soft_max_f16, kernel_soft_max_4_f16;
     std::map<std::pair<int, int>, cl_kernel> kernels_flash_attn_f16;
@@ -1146,6 +1147,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_diag_f32 = clCreateKernel(prog, "kernel_diag_f32", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // gated_delta_net (Qwen3.5 autoregressive decode; S=128 specialised)
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gated_delta_net.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gated_delta_net.cl");
+#endif
+        cl_program prog =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_gated_delta_net_f32_s128 = clCreateKernel(prog, "kernel_gated_delta_net_f32_s128", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -4285,6 +4303,38 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return true;
         case GGML_OP_DIAG:
             return true;
+        case GGML_OP_GATED_DELTA_NET: {
+            const ggml_tensor * q     = op->src[0];
+            const ggml_tensor * k     = op->src[1];
+            const ggml_tensor * v     = op->src[2];
+            const ggml_tensor * g     = op->src[3];
+            const ggml_tensor * beta  = op->src[4];
+            const ggml_tensor * state = op->src[5];
+
+            if (!q || !k || !v || !g || !beta || !state) {
+                return false;
+            }
+            if (op->type != GGML_TYPE_F32 ||
+                    q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 ||
+                    v->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 ||
+                    beta->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32) {
+                return false;
+            }
+
+            const int64_t S = v->ne[0];
+            const int64_t H = v->ne[1];
+            const int64_t T = v->ne[2];
+            const int64_t N = v->ne[3];
+
+            return S == 128 && T == 1 &&
+                    q->ne[0] == S && q->ne[1] == H && q->ne[2] == T && q->ne[3] == N &&
+                    k->ne[0] == S && k->ne[1] == H && k->ne[2] == T && k->ne[3] == N &&
+                    (g->ne[0] == 1 || g->ne[0] == S) && g->ne[1] == H && g->ne[2] == T && g->ne[3] == N &&
+                    beta->ne[0] == 1 && beta->ne[1] == H && beta->ne[2] == T && beta->ne[3] == N &&
+                    ggml_nelements(state) == S * S * H * N &&
+                    ggml_is_contiguous(q) && ggml_is_contiguous(k) && ggml_is_contiguous_rows(v) &&
+                    ggml_is_contiguous(g) && ggml_is_contiguous(beta) && ggml_is_contiguous(state);
+        }
         case GGML_OP_DIAG_MASK_INF:
             return op->ne[3] == 1;
         case GGML_OP_ROPE: {
@@ -12756,6 +12806,84 @@ static void ggml_cl_dup(ggml_backend_t backend, const ggml_tensor * src0, const 
     UNUSED(src1);
 }
 
+static void ggml_cl_gated_delta_net(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(dst);
+    GGML_ASSERT(dst->extra);
+    UNUSED(src0);
+    UNUSED(src1);
+
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * g     = dst->src[3];
+    const ggml_tensor * beta  = dst->src[4];
+    const ggml_tensor * state = dst->src[5];
+
+    GGML_ASSERT(q && k && v && g && beta && state);
+    GGML_ASSERT(q->extra && k->extra && v->extra && g->extra && beta->extra && state->extra);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const int S     = (int) v->ne[0];
+    const int H     = (int) v->ne[1];
+    const int T     = (int) v->ne[2];
+    const int N     = (int) v->ne[3];
+    const int g_ne0 = (int) g->ne[0];
+
+    GGML_ASSERT(S == 128 && "ggml_cl_gated_delta_net: kernel specialised for S=128");
+    GGML_ASSERT(T == 1 && "ggml_cl_gated_delta_net: OpenCL path is decode-only");
+    GGML_ASSERT(g_ne0 == 1 || g_ne0 == S);
+
+    ggml_tensor_extra_cl * extra_q = (ggml_tensor_extra_cl *) q->extra;
+    ggml_tensor_extra_cl * extra_k = (ggml_tensor_extra_cl *) k->extra;
+    ggml_tensor_extra_cl * extra_v = (ggml_tensor_extra_cl *) v->extra;
+    ggml_tensor_extra_cl * extra_g = (ggml_tensor_extra_cl *) g->extra;
+    ggml_tensor_extra_cl * extra_b = (ggml_tensor_extra_cl *) beta->extra;
+    ggml_tensor_extra_cl * extra_s = (ggml_tensor_extra_cl *) state->extra;
+    ggml_tensor_extra_cl * extra_d = (ggml_tensor_extra_cl *) dst->extra;
+
+    const cl_ulong off_q  = extra_q->offset + q->view_offs;
+    const cl_ulong off_k  = extra_k->offset + k->view_offs;
+    const cl_ulong off_v  = extra_v->offset + v->view_offs;
+    const cl_ulong off_g  = extra_g->offset + g->view_offs;
+    const cl_ulong off_b  = extra_b->offset + beta->view_offs;
+    const cl_ulong off_s  = extra_s->offset + state->view_offs;
+    const cl_ulong off_o  = extra_d->offset + dst->view_offs;
+    const cl_ulong off_so = off_o + (cl_ulong)(S * H * T * N) * (cl_ulong)sizeof(float);
+
+    cl_kernel kernel = backend_ctx->kernel_gated_delta_net_f32_s128;
+
+    int arg = 0;
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_q->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_q));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_k->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_k));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_v->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_v));
+    const cl_ulong nbv1 = v->nb[1];
+    const cl_ulong nbv2 = v->nb[2];
+    const cl_ulong nbv3 = v->nb[3];
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nbv1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nbv2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nbv3));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_g->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_g));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_b->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_b));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_s->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_s));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_d->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_o));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_d->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_so));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &H));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &g_ne0));
+
+    size_t global_work_size[] = {(size_t)S, (size_t)H, (size_t)N};
+    size_t local_work_size[]  = {(size_t)S, 1, 1};
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_set(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -14021,6 +14149,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_diag;
+            break;
+        case GGML_OP_GATED_DELTA_NET:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_gated_delta_net;
             break;
         case GGML_OP_DIAG_MASK_INF:
             if (!any_on_device) {
