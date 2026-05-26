@@ -3214,23 +3214,15 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
 
     const uint32_t qjl_quant_k = ggml_vk_flash_attn_qjl_quant_k(kv_type);
     if (!small_rows && qjl_quant_k > 0 && hsk > qjl_quant_k) {
-        auto try_full_proj = [&](uint32_t block_rows, uint32_t block_cols) {
-            vk_fa_tuning_params fast = result;
-            fast.block_rows = block_rows;
-            fast.block_cols = block_cols;
-            fast.qjl_full_proj = true;
+        vk_fa_tuning_params multi_block = result;
+        multi_block.block_rows = 32;
+        multi_block.block_cols = 32;
 
-            if (ggml_vk_flash_attn_coopmat_shmem_support(device, fast, hsk, hsv, f32acc, qjl_quant_k, true)) {
-                result = fast;
-                return true;
-            }
-            return false;
-        };
-
-        // Prefer fewer KV tiles when possible, but keep a smaller fallback for
-        // devices with 48 KiB workgroup shared-memory limits.
-        if (!try_full_proj(32, 32) && !try_full_proj(16, 64)) {
-            try_full_proj(16, 32);
+        // On the NV coopmat2 path, QJL_FULL_PROJ corrupts TBQ correction for
+        // multi-block heads such as Qwen3.5's head_dim=256. Keep the smaller
+        // coopmat2 tile, but recompute the per-128 QJL projection per block.
+        if (ggml_vk_flash_attn_coopmat_shmem_support(device, multi_block, hsk, hsv, f32acc, qjl_quant_k, false)) {
+            result = multi_block;
         }
     }
 
