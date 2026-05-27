@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 #include <map>
 #include <algorithm>
@@ -27,6 +28,11 @@
 
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)
+
+#define print_build_info() do {                                                                     \
+    fprintf(stderr, "%s: build = %d (%s)\n",      __func__, LLAMA_BUILD_NUMBER, LLAMA_COMMIT);      \
+    fprintf(stderr, "%s: built with %s for %s\n", __func__, LLAMA_COMPILER, LLAMA_BUILD_TARGET);    \
+} while(0)
 
 struct common_time_meas {
     common_time_meas(int64_t & t_acc, bool disable = false);
@@ -48,6 +54,14 @@ struct common_adapter_lora_info {
 };
 
 using llama_tokens = std::vector<llama_token>;
+
+// build info
+extern int LLAMA_BUILD_NUMBER;
+extern const char * LLAMA_COMMIT;
+extern const char * LLAMA_COMPILER;
+extern const char * LLAMA_BUILD_TARGET;
+
+const static std::string build_info("b" + std::to_string(LLAMA_BUILD_NUMBER) + "-" + LLAMA_COMMIT);
 
 struct common_control_vector_load_info;
 
@@ -298,7 +312,6 @@ struct common_params_model {
     std::string name        = ""; // in format <user>/<model>[:<tag>] (tag is optional)     // NOLINT
 };
 
-// draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
@@ -373,9 +386,9 @@ struct common_params_speculative {
 struct common_params_vocoder {
     struct common_params_model model;
 
-    std::string speaker_file; // speaker file path
+    std::string speaker_file = ""; // speaker file path                                      // NOLINT
 
-    bool use_guide_tokens = false; // enable guide tokens to improve TTS accuracy
+    bool use_guide_tokens = false; // enable guide tokens to improve TTS accuracy            // NOLINT
 };
 
 struct common_params_diffusion {
