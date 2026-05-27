@@ -293,6 +293,79 @@ struct gguf_bytes_file_reader : public gguf_bytes_reader {
     FILE * file;
 };
 
+// qvac: raw-pointer in-memory reader (upstream b9341 API addition).
+struct gguf_bytes_mem_reader : public gguf_bytes_reader {
+    gguf_bytes_mem_reader(const void * data, size_t size)
+        : data(static_cast<const uint8_t *>(data)), size(size), offset(0) {}
+
+    ~gguf_bytes_mem_reader() {}
+
+    size_t read(void * buffer, size_t size_elem, size_t count) override {
+        const size_t want = size_elem * count;
+        if (offset > size) return 0;
+        const size_t avail = size - offset;
+        const size_t got   = want < avail ? want : avail;
+        if (got > 0) memcpy(buffer, data + offset, got);
+        offset += got;
+        return got;
+    }
+
+    size_t align(size_t alignment) override {
+        offset = GGML_PAD(offset, alignment);
+        return offset;
+    }
+
+  private:
+    const uint8_t * data;
+    size_t          size;
+    size_t          offset;
+};
+
+// qvac: callback-based reader for streaming gguf parses (upstream b9341 API addition).
+// Maintains a small staging buffer of `chunk_size` bytes filled lazily from `cb`.
+struct gguf_bytes_callback_reader : public gguf_bytes_reader {
+    gguf_bytes_callback_reader(gguf_read_callback_t cb,
+                               void *               userdata,
+                               size_t               chunk_size,
+                               uint64_t             max_size)
+        : cb(cb), userdata(userdata), chunk_size(chunk_size == 0 ? 4096 : chunk_size),
+          max_size(max_size), offset(0) {}
+
+    ~gguf_bytes_callback_reader() {}
+
+    size_t read(void * buffer, size_t size_elem, size_t count) override {
+        const size_t want = size_elem * count;
+        if (want == 0) return 0;
+        if (offset >= max_size) return 0;
+
+        const uint64_t avail64 = max_size - offset;
+        const size_t   cap     = want < avail64 ? want : static_cast<size_t>(avail64);
+
+        uint8_t * out = static_cast<uint8_t *>(buffer);
+        size_t    got = 0;
+        while (got < cap) {
+            const size_t step = (cap - got) < chunk_size ? (cap - got) : chunk_size;
+            const size_t n    = cb(userdata, out + got, offset, step);
+            if (n == 0) break;
+            got    += n;
+            offset += n;
+        }
+        return got;
+    }
+
+    size_t align(size_t alignment) override {
+        offset = GGML_PAD(offset, alignment);
+        return offset;
+    }
+
+  private:
+    gguf_read_callback_t cb;
+    void *               userdata;
+    size_t               chunk_size;
+    uint64_t             max_size;
+    uint64_t             offset;
+};
+
 
 struct gguf_reader {
     gguf_bytes_reader& bytes_reader;
@@ -931,6 +1004,22 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
 struct gguf_context * gguf_init_from_buffer(std::basic_streambuf<char> & streambuf, struct gguf_init_params params) {
     gguf_bytes_buffer_reader bytes_reader(streambuf);
     gguf_reader              reader(bytes_reader);
+    return gguf_init_from_reader_impl(reader, params);
+}
+
+struct gguf_context * gguf_init_from_buffer(const void * data, size_t size, struct gguf_init_params params) {
+    gguf_bytes_mem_reader bytes_reader(data, size);
+    gguf_reader           reader(bytes_reader);
+    return gguf_init_from_reader_impl(reader, params);
+}
+
+struct gguf_context * gguf_init_from_callback(gguf_read_callback_t cb,
+                                              void *               userdata,
+                                              size_t               chunk_size,
+                                              uint64_t             max_size,
+                                              struct gguf_init_params params) {
+    gguf_bytes_callback_reader bytes_reader(cb, userdata, chunk_size, max_size);
+    gguf_reader                reader(bytes_reader);
     return gguf_init_from_reader_impl(reader, params);
 }
 

@@ -91,11 +91,20 @@ if (Vulkan_FOUND)
         message(STATUS "VK_NV_cooperative_matrix2 support disabled by GGML_VULKAN_DISABLE_COOPMAT2")
     endif()
 
-    test_shader_extension_support(
-        "GL_EXT_integer_dot_product"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot.comp"
-        "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
-    )
+    # qvac: gate integer-dot MMQ shaders behind an opt-out flag. The MMQ glsl
+    # files (flash_attn_mmq_funcs.glsl / flash_attn_dequant.glsl) reference
+    # FaTypeK/FA_TYPE_* spec constants that were never ported from upstream
+    # b9341 into the qvac fork's macro-based dispatch. Until that port is done,
+    # `-DGGML_VULKAN_DISABLE_INTEGER_DOT=ON` skips the broken shader variants.
+    if (NOT GGML_VULKAN_DISABLE_INTEGER_DOT)
+        test_shader_extension_support(
+            "GL_EXT_integer_dot_product"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot.comp"
+            "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
+        )
+    else()
+        message(STATUS "Integer-dot MMQ shaders disabled by GGML_VULKAN_DISABLE_INTEGER_DOT")
+    endif()
 
     test_shader_extension_support(
         "GL_EXT_bfloat16"

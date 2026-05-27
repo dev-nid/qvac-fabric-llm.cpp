@@ -822,6 +822,134 @@ std::string common_chat_template_direct_apply(
     return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
 }
 
+// qvac: server-side helpers ported from upstream b9341 (their bodies were
+// dropped in the rebase). The previous stubs returned safe defaults; these are
+// the real implementations.
+
+// upstream b9341: common/chat.cpp
+common_chat_continuation common_chat_continuation_parse(const nlohmann::ordered_json & value) {
+    if (value.is_boolean() && value.get<bool>()) {
+        return COMMON_CHAT_CONTINUATION_AUTO;
+    }
+    if (value.is_string()) {
+        auto value_str = value.get<std::string>();
+        if (value_str == "reasoning_content") {
+            return COMMON_CHAT_CONTINUATION_REASONING;
+        }
+        if (value_str == "content") {
+            return COMMON_CHAT_CONTINUATION_CONTENT;
+        }
+    }
+    return COMMON_CHAT_CONTINUATION_NONE;
+}
+
+// upstream b9341: detects LFM2-family chat templates by their tool-list
+// delimiters. Used by the ASR preset selection just below.
+static bool is_lfm2_template(const std::string & src) {
+    return src.find("<|tool_list_start|>") != std::string::npos &&
+           src.find("<|tool_list_end|>")   != std::string::npos;
+}
+
+// upstream b9341: returns the system/user pair used to prime a model for
+// automatic speech recognition. Defaults to a generic "Transcribe audio to
+// text" prompt; LFM2-family templates use a custom system prompt instead.
+common_chat_prompt_preset common_chat_get_asr_prompt(const common_chat_templates * chat_templates) {
+    common_chat_prompt_preset asr_preset;
+    asr_preset.system = "";
+    asr_preset.user   = "Transcribe audio to text";
+
+    if (chat_templates && chat_templates->template_default && is_lfm2_template(chat_templates->template_default->source())) {
+        asr_preset.system = "Perform ASR.";
+        asr_preset.user   = "";
+    }
+    return asr_preset;
+}
+
+// upstream b9341: extracts just the "generation prefix" produced by applying a
+// chat template — i.e. the trailing assistant-prompt marker(s) the model is
+// supposed to see (for Qwen3 that's `<|im_start|>assistant\n<think>\n`, etc.).
+// We render the template twice (with and without add_generation_prompt) and
+// return the suffix that the second pass adds on top of the first.
+std::string common_chat_template_generation_prompt(
+    const common_chat_template & tmpl,
+    const autoparser::generation_params & inputs) {
+    autoparser::generation_params params = inputs;
+
+    params.add_generation_prompt  = false;
+    params.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+    std::string no_gen_prompt = common_chat_template_direct_apply(tmpl, params);
+
+    params.add_generation_prompt = true;
+    std::string gen_prompt = common_chat_template_direct_apply(tmpl, params);
+
+    size_t prefix_len = 0;
+    const size_t min_size = std::min(no_gen_prompt.size(), gen_prompt.size());
+    while (prefix_len < min_size && no_gen_prompt[prefix_len] == gen_prompt[prefix_len]) {
+        ++prefix_len;
+    }
+    return gen_prompt.substr(prefix_len);
+}
+
+std::string common_chat_msg::render_content(const std::string & delimiter) const {
+    if (!content.empty()) {
+        return content;
+    }
+    std::string out;
+    for (const auto & part : content_parts) {
+        if (!out.empty()) out += delimiter;
+        out += part.text;
+    }
+    return out;
+}
+
+// qvac: split a rendered prompt into role-tagged spans by scanning for the
+// provided per-role delimiter strings. The first delimiter that matches at a
+// given position opens a new span (closing the previous one). Used by
+// chat-diff-analyzer / test-chat to recover message boundaries from a fully
+// rendered template output.
+std::vector<common_chat_msg_span> common_chat_split_by_role(
+        const std::string & prompt,
+        const std::vector<common_chat_msg_delimiter> & delims) {
+    std::vector<common_chat_msg_span> spans;
+    if (delims.empty() || prompt.empty()) {
+        return spans;
+    }
+
+    std::size_t i = 0;
+    common_chat_msg_span cur;
+    cur.pos = 0;
+    bool open = false;
+
+    while (i < prompt.size()) {
+        const common_chat_msg_delimiter * hit = nullptr;
+        for (const auto & d : delims) {
+            if (d.delimiter.empty()) continue;
+            if (prompt.compare(i, d.delimiter.size(), d.delimiter) == 0) {
+                hit = &d;
+                break;
+            }
+        }
+        if (hit != nullptr) {
+            if (open) {
+                cur.len = i - cur.pos;
+                spans.push_back(cur);
+            }
+            cur.role = hit->role;
+            cur.pos  = i + hit->delimiter.size();
+            cur.len  = 0;
+            open     = true;
+            i        = cur.pos;
+            continue;
+        }
+        ++i;
+    }
+    if (open) {
+        cur.len = prompt.size() - cur.pos;
+        spans.push_back(cur);
+    }
+    return spans;
+}
+
 static common_chat_params common_chat_params_init_ministral_3(const common_chat_template &    tmpl,
                                                               const autoparser::generation_params & inputs) {
     common_chat_params data;

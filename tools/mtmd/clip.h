@@ -5,6 +5,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#ifdef __cplusplus
+#include <map>
+#endif
 
 // !!! Internal header, to be used by mtmd only !!!
 
@@ -118,3 +121,10 @@ void clip_image_f32_batch_add_mel(struct clip_image_f32_batch * batch, int n_mel
 bool clip_has_vision_encoder(const struct clip_ctx * ctx);
 bool clip_has_audio_encoder(const struct clip_ctx * ctx);
 bool clip_has_whisper_encoder(const struct clip_ctx * ctx);
+
+#ifdef __cplusplus
+// qvac: per-device memory usage of an initialised clip_ctx — weight buffers
+// summed with the scheduler's compute reservations. Used by mtmd_get_memory_usage
+// (and ultimately by common/fit.cpp's heuristic). Restored from upstream b9341.
+std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx);
+#endif

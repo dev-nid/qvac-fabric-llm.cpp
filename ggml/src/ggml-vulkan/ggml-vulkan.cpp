@@ -1400,6 +1400,13 @@ struct vk_op_rope_push_constants {
     uint32_t nb11;
     uint32_t nb12;
     uint32_t nb13;
+    // qvac fix: the ROPE shader (rope_head.glsl) declares a 116-byte push-constant
+    // block ending in a_offset/d_offset (read at bytes [108,116)); the qvac rebase
+    // dropped these two fields, truncating the pipeline push-constant range to 108
+    // bytes so the shader read undefined push-constant memory → deterministic
+    // garbage ("of of of...") on multi-token prefill. Restore them.
+    uint32_t a_offset;
+    uint32_t d_offset;
 };
 static_assert(sizeof(vk_op_rope_push_constants) <= 128, "sizeof(vk_op_rope_push_constants) must be <= 128");
 
@@ -1553,6 +1560,11 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
     float scale;
+    // qvac fix: the MTP-support commit added a trailing `uint K` (the recurrent
+    // snapshot/rollback slot count = state->ne[1]) to the gated_delta_net shader
+    // but not to this struct, so the shader read K from undefined push-constant
+    // memory → NaN/garbage (test-backend-ops 0/13). Restore it.
+    uint32_t K;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -5418,7 +5430,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size, 16}, 1, true, true);
     }
 
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 3, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
+    // qvac fix: the ssm_conv_f32 shader was updated upstream to fuse BIAS+SILU
+    // and now declares 4 bindings (src0, src1, bias, dst). The rebase kept this
+    // shader but left the pipeline at 3 params, so the dst (binding 3) was
+    // unbound and the conv result was never written → garbage (all SSM_CONV
+    // test-backend-ops cases failed, ERR~2). Use 4 params; the dispatch binds a
+    // dummy bias buffer (APPLY_BIAS/APPLY_SILU stay false, so it is never read).
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -11740,6 +11758,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     } else if (op == GGML_OP_OPT_STEP_SGD) {
         // OPT_STEP_SGD works on src0, it does not need dst
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf }, pc, elements);
+    } else if (op == GGML_OP_SSM_CONV) {
+        // qvac fix: the ssm_conv_f32 shader declares 4 bindings (src0, src1,
+        // bias, dst) since the upstream BIAS+SILU fusion. We don't fuse bias
+        // here (APPLY_BIAS=false), but the binding still has to exist, so bind a
+        // dummy (src0_buf) at the bias slot; dst must be the 4th buffer.
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src0_buf, dst_buf }, pc, elements);
     } else if (use_src3) {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf, src3_buf, dst_buf }, pc, elements);
     } else if (use_src2) {
@@ -12084,13 +12108,16 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
+    // K = recurrent snapshot/rollback slot count = state (src[5]) ne[1].
+    const uint32_t K = (uint32_t)dst->src[5]->ne[1];
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         sq1, sq2, sq3,
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         neq1, rq3,
-        scale
+        scale,
+        K
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -12525,6 +12552,7 @@ static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *
         (uint32_t)src0->ne[2],
         nb01, nb02, nb03,
         nb11, nb12, nb13,
+        0, 0, // a_offset, d_offset (rope asserts zero misalignment; see struct note)
     };
 
     return rope;

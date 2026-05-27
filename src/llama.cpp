@@ -52,11 +52,8 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
     GGML_ABORT("fatal error");
 }
 
-struct llama_device_memory_data {
-    int64_t total;
-    int64_t free;
-    llama_memory_breakdown_data mb;
-};
+// qvac: definition lives in llama-ext.h (transitively included via llama-context.h);
+// the duplicate here was carried over from before that header existed.
 
 static std::vector<llama_device_memory_data> llama_get_device_memory_data(
         const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
@@ -940,7 +937,16 @@ static struct llama_model * llama_model_load_from_file_impl(
         };
     }
 
-    llama_model * model = new llama_model(params);
+    // qvac: dispatch via llama_model_create so we get the proper
+    // llama_model_<arch> subclass (with its load_arch_hparams / load_arch_tensors
+    // / build_arch_graph overrides). The legacy `new llama_model(params)` here
+    // produced a base instance whose virtual hooks were no-ops, leaving
+    // build_arch_graph to return nullptr for every architecture.
+    llama_model * model = llama_model_create(ml, params);
+    if (model == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to create model for arch '%s'\n", __func__, ml.get_arch_name().c_str());
+        return nullptr;
+    }
 
     // create list of devices to use with this model
     if (params.devices) {

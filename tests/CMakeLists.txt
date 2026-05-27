@@ -154,7 +154,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-parser.cpp)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
-    llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    llama_build_and_test(test-chat.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-chat.cpp
+        ${PROJECT_SOURCE_DIR}/tools/server/server-common.cpp
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    # qvac: test-chat transitively includes server-common.h which #include "mtmd.h",
+    # and references server_chat_convert_responses_to_chatcmpl from server-chat.cpp
+    # plus get_media_marker from server-common.cpp.
+    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    target_link_libraries(test-chat PRIVATE mtmd)
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
         llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})

@@ -572,6 +572,74 @@ void mtmd_log_set_llama_callback(ggml_log_callback llama_cb, void * llama_user_d
     clip_log_set_callback(llama_cb, llama_user_data);
 }
 
+// qvac: light-weight mmproj capability probe used by the server. The previous
+// implementation relied on a `clip_get_cap` helper that hasn't been ported yet
+// from upstream b9341. Fall back to a full clip_init load so the server can
+// still detect vision/audio capability — slightly heavier than the upstream
+// metadata-only path, but functionally correct.
+struct mtmd_caps mtmd_get_cap_from_file(const char * fname) {
+    mtmd_caps cap{ false, false };
+    try {
+        clip_context_params cp{};
+        cp.use_gpu          = false;
+        cp.flash_attn_type  = CLIP_FLASH_ATTN_TYPE_DISABLED;
+        cp.image_min_tokens = -1;
+        cp.image_max_tokens = -1;
+        cp.warmup           = false;
+        cp.has_bf16_weights = false;
+        cp.cb_eval          = nullptr;
+        cp.cb_eval_user_data= nullptr;
+        cp.backend_device   = nullptr;
+        clip_init_result init = clip_init(fname, cp);
+        if (init.ctx_v != nullptr) {
+            cap.inp_vision = clip_has_vision_encoder(init.ctx_v);
+            clip_free(init.ctx_v);
+        }
+        if (init.ctx_a != nullptr) {
+            cap.inp_audio = clip_has_audio_encoder(init.ctx_a);
+            clip_free(init.ctx_a);
+        }
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: failed to get capabilities from file '%s': %s\n", __func__, fname, e.what());
+    }
+    return cap;
+}
+
+// qvac: per-device memory footprint of an mmproj. Ports upstream b9341 — opens
+// a temporary mtmd_context from the mmproj file (no text model, so we don't
+// need n_embd_text), then sums weight+compute memory from the vision and audio
+// clip contexts via clip_get_mem_usage.
+std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(
+        const char * mmproj_fname,
+        struct mtmd_context_params ctx_params) {
+    std::map<ggml_backend_dev_t, size_t> total_mem;
+    try {
+        clip_context_params cp{};
+        cp.use_gpu          = ctx_params.use_gpu;
+        cp.flash_attn_type  = CLIP_FLASH_ATTN_TYPE_DISABLED;
+        cp.image_min_tokens = ctx_params.image_min_tokens;
+        cp.image_max_tokens = ctx_params.image_max_tokens;
+        cp.warmup           = false;
+        cp.has_bf16_weights = false;
+        cp.cb_eval          = nullptr;
+        cp.cb_eval_user_data= nullptr;
+        cp.backend_device   = nullptr;
+        clip_init_result init = clip_init(mmproj_fname, cp);
+        auto merge = [&](struct clip_ctx * c) {
+            if (c == nullptr) return;
+            for (const auto & [dev, size] : clip_get_mem_usage(c)) {
+                total_mem[dev] += size;
+            }
+            clip_free(c);
+        };
+        merge(init.ctx_v);
+        merge(init.ctx_a);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: error querying mmproj '%s': %s\n", __func__, mmproj_fname, e.what());
+    }
+    return total_mem;
+}
+
 struct mtmd_tokenizer {
     mtmd_context * ctx;
     std::vector<const mtmd_bitmap *> bitmaps;
@@ -1021,7 +1089,10 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
     return ctx->image_embd_v.data();
 }
 
-bool mtmd_decode_use_non_causal(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
+// qvac: const-qualifiers updated to match the declarations in mtmd.h. The
+// previous non-const signatures caused link failures because the public API
+// shape (declared via extern "C" in the header) didn't match what we emitted.
+bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk) {
     auto proj_type = ctx->proj_type_v();
     if (chunk && chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         proj_type = ctx->proj_type_a();
@@ -1035,7 +1106,7 @@ bool mtmd_decode_use_non_causal(mtmd_context * ctx, const mtmd_input_chunk * chu
     }
 }
 
-bool mtmd_decode_use_mrope(mtmd_context * ctx) {
+bool mtmd_decode_use_mrope(const mtmd_context * ctx) {
     if (ctx->ctx_v == nullptr && ctx->proj_type_a() == PROJECTOR_TYPE_QWEN3A) {
         // qwen3-asr
         return true;
@@ -1052,15 +1123,15 @@ bool mtmd_decode_use_mrope(mtmd_context * ctx) {
     }
 }
 
-bool mtmd_support_vision(mtmd_context * ctx) {
+bool mtmd_support_vision(const mtmd_context * ctx) {
     return ctx->ctx_v != nullptr;
 }
 
-bool mtmd_support_audio(mtmd_context * ctx) {
+bool mtmd_support_audio(const mtmd_context * ctx) {
     return ctx->ctx_a != nullptr;
 }
 
-int mtmd_get_audio_sample_rate(mtmd_context * ctx) {
+int mtmd_get_audio_sample_rate(const mtmd_context * ctx) {
     if (!ctx->ctx_a) {
         return -1;
     }
@@ -1253,11 +1324,21 @@ size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens) {
     return image_tokens->ny;
 }
 
-mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, size_t i) {
+mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, llama_pos pos_0, size_t i) {
+    // M-RoPE: the whole image shares one temporal position (pos_0) and occupies
+    // a 2D grid in the spatial (y,x) dimensions, each offset by pos_0. This must
+    // stay consistent with mtmd_image_tokens_get_n_pos() == max(nx, ny): the
+    // largest position written here is pos_0 + max(nx,ny) - 1, so the following
+    // text chunk (which starts at pos_0 + n_pos) satisfies the M-RoPE memory
+    // invariant X < Y. The previous code set t = pos_0 + i (sequential), which
+    // overshot to pos_0 + n_tokens - 1 for multi-row images (ny > 1, e.g.
+    // PaddleOCR-VL) and made llama_decode reject the next text chunk. z was also
+    // left uninitialized.
     mtmd_decoder_pos pos;
-    pos.t = 0;
-    pos.x = i % image_tokens->nx;
-    pos.y = i / image_tokens->nx;
+    pos.t = static_cast<uint32_t>(pos_0);
+    pos.y = static_cast<uint32_t>(pos_0) + static_cast<uint32_t>(i / image_tokens->nx);
+    pos.x = static_cast<uint32_t>(pos_0) + static_cast<uint32_t>(i % image_tokens->nx);
+    pos.z = 0;
     return pos;
 }
 

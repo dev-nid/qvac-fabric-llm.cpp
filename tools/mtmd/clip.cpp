@@ -328,8 +328,10 @@ ggml_tensor * clip_graph::build_vit(
             norm_type norm_t,
             ffn_op_type ffn_t,
             ggml_tensor * learned_pos_embd,
-            std::function<ggml_tensor *(ggml_tensor *, const clip_layer &)> add_pos
+            std::function<ggml_tensor *(ggml_tensor *, const clip_layer &)> add_pos,
+            const build_vit_opts & opts
         ) {
+    GGML_UNUSED(opts);  // qvac: opts plumbing not yet wired through this implementation
     if (learned_pos_embd) {
         inp = ggml_add(ctx0, inp, learned_pos_embd);
         cb(inp, "pos_embed", -1);
@@ -670,7 +672,9 @@ ggml_tensor * clip_graph::build_attn(
         ggml_tensor * v_cur,
         ggml_tensor * kq_mask,
         float kq_scale,
-        int il) const {
+        int il,
+        ggml_tensor * sinks) const {
+    GGML_UNUSED(sinks);  // qvac: not used by the legacy attention path yet
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
@@ -941,7 +945,9 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             } break;
         case PROJECTOR_TYPE_HUNYUANOCR:
             {
-                builder = std::make_unique<clip_graph_hunyuanocr>(ctx, img);
+                // qvac: upstream b9341 commit 6a257d446 merged HunyuanOCR into HunyuanVL,
+                // so the OCR path now reuses the VL graph builder.
+                builder = std::make_unique<clip_graph_hunyuanvl>(ctx, img);
             } break;
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_MLP_NORM:
@@ -1238,12 +1244,12 @@ struct clip_model_loader {
                         hparams.has_llava_projector = model.proj_type != PROJECTOR_TYPE_COGVLM;
                         hparams.image_pad_color     = {122, 116, 104};
                         if (!hparams.image_res_candidates.empty()) {
-                            hparams.image_resize_pad  = true;
+                            hparams.image_resize_pad  = PAD_CEIL;
                             hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         } else {
                             // llava-1.6 default params
-                            hparams.image_pad_ov         = false;
-                            hparams.image_pad_rf         = true;
+                            hparams.image_pad_ov         = PAD_NONE;
+                            hparams.image_pad_rf         = PAD_CEIL;
                             hparams.image_pad_color_rf   = {122, 116, 104};
                             hparams.image_resize_algo_rf = RESIZE_ALGO_BICUBIC;
                             hparams.image_resize_algo_ov = RESIZE_ALGO_BILINEAR;
@@ -1251,7 +1257,7 @@ struct clip_model_loader {
                     } break;
                 case PROJECTOR_TYPE_GLM_EDGE:
                     {
-                        hparams.image_resize_pad  = true;
+                        hparams.image_resize_pad  = PAD_CEIL;
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                     } break;
                 case PROJECTOR_TYPE_MINICPMV:
@@ -1425,7 +1431,7 @@ struct clip_model_loader {
                     {
                         hparams.n_merge = 2;
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
-                        hparams.image_resize_pad  = false;
+                        hparams.image_resize_pad  = PAD_NONE;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_ATTN_WINDOW_SIZE, hparams.attn_window_size, true);
                         std::vector<int> wa_layer_indexes_vec;
@@ -3813,6 +3819,42 @@ bool clip_has_vision_encoder(const struct clip_ctx * ctx) {
 
 bool clip_has_audio_encoder(const struct clip_ctx * ctx) {
     return ctx->model.modality == CLIP_MODALITY_AUDIO;
+}
+
+// qvac: per-device memory accounting for an initialised clip context. Combines
+// the weight buffer (ctx->buf) with the scheduler's compute reservation for
+// each backend in ctx->backend_ptrs. Mirrors the upstream b9341
+// `clip_get_mem_usage` whose body relied on cached mem_usage/mem_compute maps
+// that don't exist in the qvac fork — here we read the same data live from
+// the backend buffer and sched APIs.
+std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx) {
+    std::map<ggml_backend_dev_t, size_t> result;
+    if (ctx == nullptr) {
+        return result;
+    }
+
+    // weight buffer
+    if (ctx->buf) {
+        ggml_backend_buffer_t buf = ctx->buf.get();
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev != nullptr) {
+            result[dev] += ggml_backend_buffer_get_size(buf);
+        }
+    }
+
+    // compute reservations (per backend tracked by the scheduler)
+    if (ctx->sched) {
+        for (ggml_backend_t backend : ctx->backend_ptrs) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            if (dev == nullptr) continue;
+            const size_t sz = ggml_backend_sched_get_buffer_size(ctx->sched.get(), backend);
+            if (sz > 0) {
+                result[dev] += sz;
+            }
+        }
+    }
+    return result;
 }
 
 bool clip_has_whisper_encoder(const struct clip_ctx * ctx) {

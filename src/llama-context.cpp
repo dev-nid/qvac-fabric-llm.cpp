@@ -42,6 +42,13 @@ llama_context::llama_context(
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
 
+    // qvac: the b9341 (MTP) rebase added n_rs_seq to llama_context_params,
+    // llama_cparams, default-params and the getter, but missed this assignment,
+    // leaving cparams.n_rs_seq uninitialized. Garbage here makes recurrent
+    // models (Qwen3.5/qwen3next/kimi-linear Gated-DeltaNet) take the rollback
+    // branch in build_conv_state with a huge K → out-of-bounds view → abort.
+    cparams.n_rs_seq         = params.n_rs_seq;
+
     cparams.n_threads        = params.n_threads;
     cparams.n_threads_batch  = params.n_threads_batch;
     cparams.yarn_ext_factor  = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -283,6 +290,7 @@ llama_context::llama_context(
             /*.type_k   =*/ params.type_k,
             /*.type_v   =*/ params.type_v,
             /*.swa_full =*/ params.swa_full,
+            /*.ctx_type =*/ params.ctx_type,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -1042,6 +1050,43 @@ void llama_context::set_embeddings(bool value) {
 
     // TODO: not sure yet if we want to reserve here
     //sched_need_reserve = true;
+}
+
+// qvac: pre-norm embedding extraction. Declared in llama-context.h and llama-ext.h
+// but the rebase silently dropped the implementations. The cparams + buffer field
+// (embd_pre_norm) already exist; these methods just plumb access to them.
+
+void llama_context::set_embeddings_pre_norm(bool value, bool masked) {
+    LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
+
+    cparams.embeddings_pre_norm        = value;
+    cparams.embeddings_pre_norm_masked = masked;
+}
+
+float * llama_context::get_embeddings_pre_norm() {
+    output_reorder();
+    return embd_pre_norm.data;
+}
+
+float * llama_context::get_embeddings_pre_norm_ith(int32_t i) {
+    output_reorder();
+
+    try {
+        if (embd_pre_norm.data == nullptr) {
+            throw std::runtime_error("no pre-norm embeddings");
+        }
+
+        const int64_t  j         = output_resolve_row(i);
+        const uint32_t n_embd_out = model.hparams.n_embd_out();
+        return embd_pre_norm.data + j * n_embd_out;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid pre-norm embeddings id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return nullptr;
+#endif
+    }
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -3063,8 +3108,10 @@ llama_context_params llama_context_default_params() {
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
+        /*.n_rs_seq                    =*/ 0, // qvac: upstream b9341 added for MTP recurrent state rollback
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT, // qvac: upstream b9341 added context-type tagging (e.g. MTP)
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
         /*.attention_type              =*/ LLAMA_ATTENTION_TYPE_UNSPECIFIED,
@@ -3236,6 +3283,12 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
 }
 
+// qvac: upstream b9341 (MTP) introduced this — exposes the n_rs_seq cparam
+// used to decide whether partial-rollback speculative decoding is allowed.
+uint32_t llama_n_rs_seq(const llama_context * ctx) {
+    return ctx->get_cparams().n_rs_seq;
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
@@ -3323,6 +3376,28 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+// qvac: ext-API memory breakdown — exposes the per-buffer-type map that
+// llama_context tracks internally. Declared in llama-ext.h; the cpp body was
+// lost during the rebase.
+llama_memory_breakdown llama_get_memory_breakdown(const llama_context * ctx) {
+    return ctx->memory_breakdown();
+}
+
+// qvac: pre-norm embeddings — C API wrappers
+void llama_set_embeddings_pre_norm(llama_context * ctx, bool value, bool masked) {
+    ctx->set_embeddings_pre_norm(value, masked);
+}
+
+float * llama_get_embeddings_pre_norm(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_embeddings_pre_norm();
+}
+
+float * llama_get_embeddings_pre_norm_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_embeddings_pre_norm_ith(i);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
