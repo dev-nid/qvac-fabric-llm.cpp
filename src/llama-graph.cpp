@@ -379,6 +379,17 @@ void llm_graph_input_dflash_inline_encode::set_input(const llama_ubatch * ubatch
         ggml_backend_tensor_set(pos_idx, buf.data(), 0,
                                 (size_t) n_outputs * sizeof(int64_t));
     }
+
+    // Advance the host-side committed-rows high-water mark. The encoder
+    // graph will scatter rows [write_offset .. write_offset + n_outputs - 1]
+    // when it runs on the backend; we record that fact here so begin()
+    // (which runs after llama_decode returns) can detect that the caller's
+    // prefill — possibly chunked across multiple llama_decode calls — has
+    // populated the side store and skip its fallback re-decode.
+    const int64_t end_row = dflash->inline_write_offset + n_outputs;
+    if (end_row > dflash->inline_n_committed) {
+        dflash->inline_n_committed = end_row;
+    }
 }
 
 bool llm_graph_input_dflash_gdn_fixup::can_reuse(const llm_graph_params & params) {
@@ -1060,6 +1071,7 @@ void llm_graph_result::reset() {
     t_logits             = nullptr;
     t_embd               = nullptr;
     t_embd_pooled        = nullptr;
+    t_logits_argmax      = nullptr;
     t_dflash_topk        = nullptr;
     t_dflash_topk_argmax = nullptr;
     t_dflash_captures.clear();
@@ -1097,6 +1109,9 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
 void llm_graph_result::set_outputs() {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
+    }
+    if (t_logits_argmax != nullptr) {
+        ggml_set_output(t_logits_argmax);
     }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);
@@ -2373,15 +2388,30 @@ void llm_graph_context::build_dflash_inline_encoder(const llama_model & model,
                                       nullptr, LLM_NORM_RMS, -1);
     cb(h_proj, "dflash_inline_enc_h_proj", -1);
 
-    // per-head dims and RoPE params: use TARGET's hparams. Correct only when
-    // target and draft share them (Qwen3 family); other families need an
-    // explicit-sizing path.
-    const int64_t n_embd_head_use = n_embd_head_v;
-    const int64_t n_head_kv_use   = n_head_kv;
-    GGML_ASSERT(n_embd_head_use * n_head_kv_use ==
-                model.target_dflash_wk[0]->ne[1] &&
-                "inline encoder: target's per-head dims don't match draft "
-                "wk shape; this model pair needs explicit sizing cparams");
+    // Per-head dims: derived from the bound draft weight shapes (the K-norm
+    // tensor is per-head, the wk tensor's output dim is the full draft
+    // n_embd_kv). This works for any target/draft pair regardless of whether
+    // they share per-head dims — the side-store the encoder writes into is
+    // sized by the draft, not the target, so the rotation and reshape must
+    // use the draft's layout.
+    //
+    // RoPE: the DFlash draft (LLM_ARCH_DFLASH) is trained with NEOX-style RoPE
+    // on the full draft head_dim. Force those values here instead of inheriting
+    // the target's n_rot/rope_type (which can be MRoPE on partial dims, e.g.
+    // Qwen 3.5/3.6 targets, or full-rotation on a larger head, e.g. Gemma 4).
+    // freq_base / ext_factor / attn_factor / beta_fast / beta_slow are taken
+    // from the target's hparams — verified to match the draft for all current
+    // model pairs (Qwen3 / Qwen 3.5/3.6 / Gemma 4).
+    const int64_t n_embd_head_use = (int64_t) model.target_dflash_attn_k_norm[0]->ne[0];
+    const int64_t n_embd_kv_dft   = (int64_t) model.target_dflash_wk[0]->ne[1];
+    GGML_ASSERT(n_embd_head_use > 0);
+    GGML_ASSERT(n_embd_kv_dft > 0 && n_embd_kv_dft % n_embd_head_use == 0 &&
+                "inline encoder: draft wk[0]->ne[1] not divisible by draft "
+                "head_dim (target_dflash_attn_k_norm[0]->ne[0])");
+    const int64_t n_head_kv_use = n_embd_kv_dft / n_embd_head_use;
+
+    const int                  n_rot_dft     = (int) n_embd_head_use;
+    const enum llama_rope_type rope_type_dft = LLAMA_ROPE_TYPE_NEOX;
 
     // Same F16-accumulator concern as h_fc above: the wk/wv weights are F16
     // and the default matmul accumulator on fp16-capable backends is F16.
@@ -2389,6 +2419,13 @@ void llm_graph_context::build_dflash_inline_encoder(const llama_model & model,
     // features take into the spec block, so precision loss here feeds
     // straight into draft acceptance. Force F32 accumulation on both
     // projections, matching the side-store encoder at src/models/dflash.cpp.
+    //
+    // (Profiling 2026-05-28 showed removing these hints did NOT close the
+    // ~12% HE gap to bee. The gap is structural: bee defers K/V projection
+    // into the draft graph and only memcpy's raw hidden states inside the
+    // target graph, while we compute K/V here in the target graph. Same
+    // total compute, different scheduling. F32 prec on CUDA was a no-op
+    // since tensor cores already accumulate in F32 by default.)
     for (int il = 0; il < n_dft_layer; ++il) {
         // K_new = wk · h_proj  → [n_embd_head, n_head_kv, n_new]
         ggml_tensor * K_new = build_lora_mm(model.target_dflash_wk[il], h_proj);
@@ -2398,7 +2435,7 @@ void llm_graph_context::build_dflash_inline_encoder(const llama_model & model,
                            nullptr, LLM_NORM_RMS, il);
         K_new = ggml_rope_ext(
                 ctx0, K_new, pos_new, nullptr,
-                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                n_rot_dft, rope_type_dft, n_ctx_orig, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow);
         cb(K_new, "dflash_inline_enc_K_new", il);
 
@@ -3394,6 +3431,26 @@ void llm_graph_context::build_pooling(
     res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+void llm_graph_context::build_logits_argmax() const {
+    if (res->t_logits == nullptr) {
+        return;
+    }
+    static const bool _disabled = []() {
+        const char * e = getenv("LLAMA_NO_LOGITS_ARGMAX");
+        return e && atoi(e) != 0;
+    }();
+    if (_disabled) {
+        return;
+    }
+    // ggml_argmax requires a matrix view. t_logits is [n_vocab, n_outputs];
+    // ggml_is_matrix(a) allows ne[2]==1 && ne[3]==1 so this is fine for
+    // both single-output (n_outputs=1) and multi-output (spec verify) decodes.
+    ggml_tensor * argmax = ggml_argmax(ctx0, res->t_logits);
+    ggml_format_name(argmax, "logits_argmax");
+    res->t_logits_argmax = argmax;
+    ggml_build_forward_expand(res->get_gf(), argmax);
 }
 
 void llm_graph_context::build_sampling() const {

@@ -177,6 +177,21 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // DFlash inline encoder. The captures stored by build_dflash_capture in
+    // the per-layer loop above carry the full ubatch's n_tokens rows (they
+    // are taken before the il == n_layer-1 get_rows reduction). The encoder
+    // consumes packed_captures with one row per output token, so we apply
+    // the get_rows(inp_out_ids) reduction here before passing it in. When
+    // n_outputs == n_tokens (e.g. a verify decode where every position has
+    // logits requested), the get_rows is an identity gather and a no-op.
+    if (inp_out_ids != nullptr && res->t_dflash_captures_packed != nullptr) {
+        res->t_dflash_captures_packed = ggml_get_rows(
+            ctx0, res->t_dflash_captures_packed, inp_out_ids);
+        cb(res->t_dflash_captures_packed, "dflash_captures_packed_reduced", -1);
+        ggml_build_forward_expand(gf, res->t_dflash_captures_packed);
+    }
+    build_dflash_inline_encoder(model, res->t_dflash_captures_packed);
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(

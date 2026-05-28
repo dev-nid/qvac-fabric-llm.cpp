@@ -170,3 +170,19 @@ if (LLAMA_LLGUIDANCE)
 endif()
 
 target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
+
+# Optional NVTX (Nvidia Tools Extension) markers around DFlash spec-loop
+# phases. Disabled by default (markers compile out to no-ops). Enable with
+# -DLLAMA_NVTX=ON when capturing nsys --trace=cuda,nvtx for fork-vs-fork
+# attribution of target_decode / draft_decode / encoder kernels.
+option(LLAMA_NVTX "Compile in NVTX range markers for DFlash phases" OFF)
+if (LLAMA_NVTX)
+    find_library(NVTX_LIBRARY nvToolsExt)
+    if (NVTX_LIBRARY)
+        target_compile_definitions(${TARGET} PUBLIC LLAMA_NVTX_ENABLED)
+        target_link_libraries     (${TARGET} PUBLIC ${NVTX_LIBRARY})
+        message(STATUS "LLAMA_NVTX: enabled, linking ${NVTX_LIBRARY}")
+    else()
+        message(WARNING "LLAMA_NVTX requested but libnvToolsExt not found; markers will be no-ops")
+    endif()
+endif()

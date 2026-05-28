@@ -738,6 +738,16 @@ extern "C" {
             struct llama_context * ctx_dft,
             int64_t                n_keep);
 
+    // High-water mark of side-store rows the inline encoder has scattered
+    // since the last per-request reset. Updated host-side by the encoder's
+    // input-class set_input() — survives across chunked llama_decode calls,
+    // unlike captured_n_outputs which is per-call. Used by the speculative
+    // begin() to detect that the caller's prefill has populated the side
+    // store and skip a redundant fallback re-decode.
+    // Returns 0 when ctx is null or the inline encoder hasn't run.
+    LLAMA_API int64_t llama_dflash_inline_get_n_committed(
+            struct llama_context * ctx_tgt);
+
     // DFlash + GDN partial-tail seq_rm: same as llama_memory_seq_rm but
     // allows partial-tail removal on hybrid memory backends (e.g. GDN+attn
     // combos) by rewinding the recurrent tail cell's pos to p0 - 1 instead
@@ -998,6 +1008,14 @@ extern "C" {
 
     // Reset the K/V side store (e.g. on a new prompt).
     LLAMA_API void llama_dflash_reset_ctx_kv(struct llama_context * ctx);
+
+    // Full per-request DFlash reset: zeroes the K/V side store buffers AND
+    // the per-layer GDN history buffers AND counters (ctx_filled,
+    // captured_n_outputs, inline_pos_start, inline_write_offset). Use
+    // between requests on the same slot to prevent state leaks. Not safe
+    // under multi-slot serving (touches buffers shared across all slots).
+    // No-op on non-DFlash contexts.
+    LLAMA_API void llama_dflash_reset_for_new_request(struct llama_context * ctx);
 
     // tree-shaped attention mask
     LLAMA_API void llama_set_tree_mask(
@@ -1423,6 +1441,23 @@ extern "C" {
     // Get the backend sampled token for the ith token.
     // Returns LLAMA_TOKEN_NULL if no token was sampled.
     LLAMA_API llama_token llama_get_sampled_token_ith(struct llama_context * ctx, int32_t i);
+
+    // Get the per-output greedy argmax of the final logits. Populated by an
+    // always-on ggml_argmax over t_logits, so available regardless of
+    // whether --backend-sampling is enabled. Lets greedy-equivalent
+    // consumers (DFlash spec verify accept) avoid the bs * n_vocab * 4
+    // byte logits readback.
+    //
+    // llama_get_logits_argmax_ith: idx semantics match llama_get_logits_ith;
+    //                              i = -1 = last output.
+    //                              returns LLAMA_TOKEN_NULL if unavailable.
+    //
+    // llama_get_logits_argmax: returns a pointer to the n_outputs-length
+    //                          int32 buffer (post-reorder), or NULL.
+    //                          The buffer is owned by ctx and invalidated
+    //                          on the next llama_decode.
+    LLAMA_API llama_token     llama_get_logits_argmax_ith(struct llama_context * ctx, int32_t i);
+    LLAMA_API const int32_t * llama_get_logits_argmax    (struct llama_context * ctx);
 
     // Get the backend sampled probabilities for the ith token
     // The index matches llama_get_sampled_token_ith().

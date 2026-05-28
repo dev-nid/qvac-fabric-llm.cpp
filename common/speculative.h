@@ -81,6 +81,13 @@ llama_tokens common_speculative_draft(
                      const llama_tokens & prompt,
                             llama_token   id_last);
 
+// DFlash spec-round profile (env DFLASH_PROFILE=1). No-op when unset.
+// Accumulates encoder / draft_decode / draft_other ns per round inside
+// the DFlash draft() path. Pair with caller-side timers around
+// llama_decode(ctx_tgt, ...) to get the full target / draft / driver
+// breakdown.
+void common_dflash_prof_print();
+
 // tree-shaped variant of common_speculative_draft. Runs the draft once
 // (same compute as draft) and returns a tree of candidate continuations
 // built from the draft's per-position top-K. The

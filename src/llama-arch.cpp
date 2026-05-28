@@ -776,8 +776,26 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_FFN_LATENT_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     // DFlash speculative-decoding draft globals
-    {LLM_TENSOR_DFLASH_FC,                  {LLM_TENSOR_LAYER_INPUT, GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_DFLASH_HIDDEN_NORM,         {LLM_TENSOR_LAYER_INPUT, GGML_OP_MUL}},
+    // dflash_fc and dflash_hidden_norm are encoder weights used by both:
+    //   - the draft-side encoder (executed on the DRAFT sched)
+    //   - the TARGET-side inline encoder (cparams.dflash_inline_encoder)
+    //
+    // They were tagged LAYER_INPUT (CPU placement) which forced the target
+    // sched to materialise dflash_fc.weight (70 MB) in a CPU buffer. With
+    // --dflash-inline-encoder enabled, every verify decode crossed the
+    // CUDA→CPU→CUDA boundary at the inline-encoder matmul, splitting the
+    // graph into 4 subgraphs instead of 2 (verified via GGML_SCHED_DEBUG=2,
+    // dflash_fc.weight shows [CPU 1.dst]) and disabling CUDA graph capture
+    // for the encoder fragment. That regressed throughput by 13% on
+    // Qwen 3.6-27B Q5_K_S HumanEval despite the encoder NVTX wall dropping
+    // from 2.5 ms/round to 3 µs/round as intended.
+    //
+    // Tagging LAYER_OUTPUT puts them in the output buffer (GPU when
+    // -ngl == n_layer + 1, which is the prevailing config). The non-inline
+    // draft-side encoder path benefits identically — captures are on GPU
+    // via skip_host_readback so the dflash_fc matmul stays GPU-local.
+    {LLM_TENSOR_DFLASH_FC,                  {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DFLASH_HIDDEN_NORM,         {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}

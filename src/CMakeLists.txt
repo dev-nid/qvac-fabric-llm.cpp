@@ -53,6 +53,18 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+# Optional NVTX markers around llama_decode internals (graph_compute / dflash
+# syncs). Same option as common/CMakeLists.txt (LLAMA_NVTX). Markers are
+# strict no-ops when LLAMA_NVTX=OFF. Mirrored here because llama target
+# does not depend on llama-common.
+if (LLAMA_NVTX)
+    find_library(NVTX_LIBRARY_LLAMA nvToolsExt)
+    if (NVTX_LIBRARY_LLAMA)
+        target_compile_definitions(llama PRIVATE LLAMA_NVTX_ENABLED)
+        target_link_libraries     (llama PRIVATE ${NVTX_LIBRARY_LLAMA})
+    endif()
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

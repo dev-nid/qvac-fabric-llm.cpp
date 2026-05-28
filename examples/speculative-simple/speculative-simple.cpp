@@ -6,6 +6,7 @@
 #include "log.h"
 #include "llama.h"
 
+#include <chrono>
 #include <clocale>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,24 @@
 #include <string>
 #include <vector>
 #include <utility>
+
+// Caller-side accumulators paired with the speculative.cpp DFlash profile.
+// Opt-in via DFLASH_PROFILE=1 env var; printed at end of main() together with
+// common_dflash_prof_print().
+struct caller_prof {
+    int64_t target_decode_ns = 0; // llama_decode(ctx_tgt, batch_tgt) — verify pass
+    int64_t draft_call_ns    = 0; // common_speculative_draft() — wraps spec.cpp's draft()
+    int64_t loop_iter_ns     = 0; // whole spec-loop iter (target + draft + sampling + bookkeeping)
+    int     n_iters          = 0;
+};
+static caller_prof g_caller_prof;
+static inline bool dflash_prof_enabled_caller() {
+    static const bool enabled = []() {
+        const char * s = std::getenv("DFLASH_PROFILE");
+        return s != nullptr && std::atoi(s) != 0;
+    }();
+    return enabled;
+}
 
 struct spec_checkpoint {
     int64_t n_tokens = 0;
@@ -813,9 +832,17 @@ int main(int argc, char ** argv) {
         // offloaded to a remote device. it doesn't even have to be based on an LLM. instead, it can provide tokens
         // from a cache or lookup tables.
         //
+        using clk = std::chrono::steady_clock;
+        const bool prof = dflash_prof_enabled_caller();
+
         if (draft.empty()) {
             // generate a new draft
+            const auto t_draft_start = prof ? clk::now() : clk::time_point{};
             draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last);
+            if (prof) {
+                g_caller_prof.draft_call_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    clk::now() - t_draft_start).count();
+            }
 
             // save the original draft size
             n_draft = draft.size();
@@ -864,7 +891,13 @@ int main(int argc, char ** argv) {
             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
             {
+                const auto t_tgt_start = prof ? clk::now() : clk::time_point{};
                 llama_decode(ctx_tgt, batch_tgt);
+                if (prof) {
+                    g_caller_prof.target_decode_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        clk::now() - t_tgt_start).count();
+                    g_caller_prof.n_iters++;
+                }
             }
             ++n_verify_iters;
         }
@@ -1060,6 +1093,19 @@ int main(int argc, char ** argv) {
     LOG_INF("\n");
     LOG_INF("target:\n\n");
     common_perf_print(ctx_tgt, smpl.get());
+
+    if (dflash_prof_enabled_caller() && g_caller_prof.n_iters > 0) {
+        const double n = (double) g_caller_prof.n_iters;
+        fprintf(stderr,
+                "\n=== Caller-side spec-loop profile (n_iters=%d) ===\n"
+                "  target_decode (avg/iter): %8.3f ms  (total %.1f ms)\n"
+                "  draft_call    (avg/iter): %8.3f ms  (total %.1f ms)\n"
+                "    (draft_call = encoder + draft_decode + draft_other, see DFlash profile below)\n",
+                g_caller_prof.n_iters,
+                g_caller_prof.target_decode_ns / 1e6 / n, g_caller_prof.target_decode_ns / 1e6,
+                g_caller_prof.draft_call_ns    / 1e6 / n, g_caller_prof.draft_call_ns    / 1e6);
+        common_dflash_prof_print();
+    }
 
     llama_batch_free(batch_tgt);
 

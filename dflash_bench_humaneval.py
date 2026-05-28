@@ -50,6 +50,8 @@ def build_configs(use_gdn_history: bool) -> list[Config]:
                      "--dflash-no-chat-template"]
     if use_gdn_history:
         DFLASH_COMMON.append("--dflash-gdn-history")
+    if os.environ.get("DFLASH_INLINE_ENCODER") == "1":
+        DFLASH_COMMON += ["--dflash-inline-encoder", "--dflash-max-ctx", "4096"]
     return [
         Config("greedy", "llama-completion"),
         Config("chain", "llama-speculative-simple",

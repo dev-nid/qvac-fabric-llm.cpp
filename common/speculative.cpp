@@ -7,9 +7,11 @@
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
+#include "nvtx_helper.h"
 #include "sampling.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +22,45 @@
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+
+// DFlash spec-round profiling. Opt-in via DFLASH_PROFILE=1 env var.
+// Accumulates per-round timings across one process lifetime; printed by
+// common_dflash_prof_print() at end of main(). Wall-time only — no GPU
+// sync, so the numbers reflect host-side observed durations (which is
+// what matters for driver-overhead analysis on a workload that's GPU-bound
+// anyway: the host blocks on llama_decode until the kernels return).
+struct common_dflash_prof {
+    int64_t encoder_ns       = 0; // extend_side_store() — encoder graph exec (or inline-fast-path advance)
+    int64_t draft_decode_ns  = 0; // llama_decode(ctx_dft, ...) — draft block forward
+    int64_t draft_other_ns   = 0; // draft()-internal bookkeeping (batch fill, top-k read, KV reset)
+    int     n_rounds         = 0;
+};
+static common_dflash_prof g_dflash_prof;
+
+static inline bool common_dflash_prof_enabled() {
+    static const bool enabled = []() {
+        const char * s = std::getenv("DFLASH_PROFILE");
+        return s != nullptr && std::atoi(s) != 0;
+    }();
+    return enabled;
+}
+
+void common_dflash_prof_print() {
+    if (!common_dflash_prof_enabled() || g_dflash_prof.n_rounds == 0) {
+        return;
+    }
+    const double n = (double) g_dflash_prof.n_rounds;
+    fprintf(stderr,
+            "\n=== DFlash profile (n_rounds=%d) ===\n"
+            "  encoder       (avg/round) : %8.3f ms  (total %.1f ms)\n"
+            "  draft_decode  (avg/round) : %8.3f ms  (total %.1f ms)\n"
+            "  draft_other   (avg/round) : %8.3f ms  (total %.1f ms)\n"
+            "  spec_loop_in_speculative.cpp / round = encoder + draft_decode + draft_other\n",
+            g_dflash_prof.n_rounds,
+            g_dflash_prof.encoder_ns      / 1e6 / n, g_dflash_prof.encoder_ns      / 1e6,
+            g_dflash_prof.draft_decode_ns / 1e6 / n, g_dflash_prof.draft_decode_ns / 1e6,
+            g_dflash_prof.draft_other_ns  / 1e6 / n, g_dflash_prof.draft_other_ns  / 1e6);
+}
 
 const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NONE,
@@ -1081,14 +1122,28 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         // Fast path: caller's prefill already produced captures covering
-        // the prompt. We check by asking ctx_tgt for the captured-feature
-        // count: in skip_host_readback mode the host pointer is null but
-        // n_captures is still updated (captures live on device). The
-        // device path in extend_side_store handles both cases uniformly.
+        // the prompt. Two signals:
+        //   (1) inline-encoder path: ask ctx_tgt for the cumulative
+        //       committed-rows high-water mark. Survives chunked prompt-
+        //       eval, where captured_n_outputs would only reflect the
+        //       LAST chunk's count.
+        //   (2) legacy (non-inline) path: captured-feature count, set
+        //       per-llama_decode-call. Sufficient when the caller's
+        //       prefill is a single llama_decode (CLI prefill, or server
+        //       prefill that fits in one ubatch with logits=true on
+        //       every position).
+        // The device path in extend_side_store handles both cases
+        // uniformly when n_committed >= n_to_decode.
         {
-            int64_t n_captures = 0;
+            int64_t n_captures   = 0;
             (void) llama_dflash_get_captured_features(ctx_tgt, &n_captures);
-            if (n_captures >= (int64_t) n_to_decode) {
+            const int64_t n_committed_inline =
+                dflash_inline_encoder
+                    ? llama_dflash_inline_get_n_committed(ctx_tgt)
+                    : 0;
+            const int64_t n_committed = std::max(n_captures, n_committed_inline);
+
+            if (n_committed >= (int64_t) n_to_decode) {
                 if (extend_side_store(n_to_decode, /*pos_start=*/0)) {
                     n_committed_total = n_to_decode;
                     return;
@@ -1140,6 +1195,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
             ? std::min<int>(block_size - 1, params.draft.n_max)
             : block_size - 1;
 
+        using clk = std::chrono::steady_clock;
+        const bool prof = common_dflash_prof_enabled();
+        const auto t0_round = prof ? clk::now() : clk::time_point{};
+
         // Step 1: bring the K/V side store up to date with whatever the
         // verify loop accepted since the previous call.
         const int64_t n_committed_after = (int64_t) prompt_tgt.size();
@@ -1149,12 +1208,17 @@ struct common_speculative_state_dflash : public common_speculative_state {
                     __func__, (long long) n_committed_after, (long long) n_committed_total);
             return;
         }
+        const auto t1_enc_start = prof ? clk::now() : clk::time_point{};
         if (n_to_extend > 0) {
+            NVTX_PUSH("dflash_encoder");
             if (!extend_side_store(n_to_extend, /*pos_start=*/n_committed_total)) {
+                NVTX_POP();
                 return;
             }
+            NVTX_POP();
             n_committed_total = n_committed_after;
         }
+        const auto t2_enc_end = prof ? clk::now() : clk::time_point{};
 
         // Step 2: run the draft on a block [id_last, MASK, ..., MASK].
         // Reset draft KV cache (side store carries the persistent state).
@@ -1166,10 +1230,15 @@ struct common_speculative_state_dflash : public common_speculative_state {
             const llama_token tok = (i == 0) ? id_last : mask_token_id;
             common_batch_add(batch_dft, tok, pos_block_start + i, { 0 }, /*logits=*/true);
         }
+        const auto t3_dec_start = prof ? clk::now() : clk::time_point{};
+        NVTX_PUSH("draft_decode");
         if (llama_decode(ctx_dft, batch_dft) != 0) {
+            NVTX_POP();
             LOG_ERR("%s: draft llama_decode failed\n", __func__);
             return;
         }
+        NVTX_POP();
+        const auto t4_dec_end = prof ? clk::now() : clk::time_point{};
 
         // Step 3: read top-K candidates per draft position (bidirectional
         // intra-block attention: position i predicts the token AT position
@@ -1191,6 +1260,17 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         // Reset draft cache so the next iteration starts from a clean slate.
         llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, -1);
+
+        if (prof) {
+            const auto t5_round_end = clk::now();
+            const int64_t enc_ns   = std::chrono::duration_cast<std::chrono::nanoseconds>(t2_enc_end - t1_enc_start).count();
+            const int64_t dec_ns   = std::chrono::duration_cast<std::chrono::nanoseconds>(t4_dec_end - t3_dec_start).count();
+            const int64_t total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t5_round_end - t0_round).count();
+            g_dflash_prof.encoder_ns      += enc_ns;
+            g_dflash_prof.draft_decode_ns += dec_ns;
+            g_dflash_prof.draft_other_ns  += (total_ns - enc_ns - dec_ns);
+            g_dflash_prof.n_rounds        += 1;
+        }
     }
 
     void accept(uint16_t /*n_accepted*/) override {

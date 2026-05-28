@@ -111,10 +111,19 @@ struct llama_context {
     // host-pointer variant; only the t_target_hidden_new input is populated
     // via ggml_backend_tensor_copy_async from src_captures instead of
     // ggml_backend_tensor_set from a host buffer. Returns 0 on success.
-    int32_t dflash_extend_from_tensor(ggml_tensor * src_captures,
-                                      int64_t       src_row_offset,
-                                      int64_t       n_keep,
-                                      int64_t       pos_start);
+    // src_ctx (optional): if provided, the cross-context D2D from
+    // src_captures is issued asynchronously via
+    // ggml_backend_tensor_copy_async, which serialises the copy on the
+    // source context's compute stream and chains a cudaEvent into the
+    // encoder's stream. This lets the caller skip the host-side
+    // ggml_backend_sched_synchronize() after the producing target decode
+    // (saves ~20 ms/round in the chain-mode spec loop). Pass nullptr
+    // (default) for the legacy host-blocking copy path.
+    int32_t dflash_extend_from_tensor(ggml_tensor *   src_captures,
+                                      int64_t         src_row_offset,
+                                      int64_t         n_keep,
+                                      int64_t         pos_start,
+                                      llama_context * src_ctx = nullptr);
 
     // inline encoder (target-side execution): same encoder graph contents
     // as dflash_extend_from_tensor but executed on TARGET's scheduler instead
@@ -140,6 +149,10 @@ struct llama_context {
 
     // Reset the K/V side store to empty.
     void dflash_reset_ctx_kv();
+
+    // Full per-request reset: ctx_filled + side store buffers + GDN
+    // history buffers + counters. Use between requests on the same slot.
+    void dflash_reset_for_new_request();
 
     // skip the per-decode D2H of captured_features. Consumers must use
     // dflash_extend_from_tensor (or llama_dflash_extend_from_ctx) after
@@ -185,6 +198,13 @@ struct llama_context {
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
+
+    // Per-output greedy argmax. Returns LLAMA_TOKEN_NULL if logits_argmax
+    // is not populated (e.g. embed-only contexts or LLAMA_NO_LOGITS_ARGMAX
+    // env var set). idx follows the same semantics as
+    // llama_get_logits_ith(idx) — batch position; -1 = last output.
+    llama_token        get_logits_argmax_ith(int32_t idx) const;
+    const int32_t *    get_logits_argmax_data() const;
 
     float * get_sampled_logits_ith(int32_t idx);
     size_t  get_sampled_logits_count(int32_t idx);
@@ -419,6 +439,14 @@ private:
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+
+    // Per-output greedy argmax over t_logits, populated by an async D2H from
+    // res->t_logits_argmax during process_ubatch. Indexed by post-reorder
+    // output row (same indexing as logits.data / sampling.sampled.data).
+    // Sized to n_outputs_max in output_reserve, filled to LLAMA_TOKEN_NULL
+    // until the readback completes. Always present (independent of
+    // --backend-sampling).
+    std::vector<int32_t> logits_argmax;
 
     struct swap_info {
         uint32_t i0;

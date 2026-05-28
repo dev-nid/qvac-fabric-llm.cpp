@@ -390,6 +390,23 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // DFlash inline encoder. Captures stored in the per-layer loop above
+    // carry the full ubatch n_tokens; reduce to n_outputs rows via
+    // get_rows(inp_out_ids) so the encoder's [n_embd_head, n_head_kv, n_new]
+    // reshape matches K_new = wk * h_proj on prompt-eval ubatches where
+    // n_outputs < n_tokens. No-op when n_outputs == n_tokens.
+    if (inp_out_ids != nullptr && res->t_dflash_captures_packed != nullptr) {
+        res->t_dflash_captures_packed = ggml_get_rows(
+            ctx0, res->t_dflash_captures_packed, inp_out_ids);
+        cb(res->t_dflash_captures_packed, "dflash_captures_packed_reduced", -1);
+        ggml_build_forward_expand(gf, res->t_dflash_captures_packed);
+    }
+    // No-op when not enabled (cparams.dflash_inline_encoder false) or when
+    // the draft hasn't bound its encoder weights / side-store pointers.
+    // Uses draft-derived per-head dims and NEOX RoPE so it works correctly
+    // for Gemma 4 (target head_dim 512, draft head_dim 128).
+    build_dflash_inline_encoder(model, res->t_dflash_captures_packed);
 }
 
 // equivalent to get_per_layer_inputs() in python code

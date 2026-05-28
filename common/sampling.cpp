@@ -3,6 +3,7 @@
 #include "common.h"
 #include "fit.h"
 #include "log.h"
+#include "nvtx_helper.h"
 #include "reasoning-budget.h"
 
 #include "ggml.h"
@@ -120,6 +121,15 @@ struct common_sampler {
     std::vector<llama_token_data> cur;
 
     llama_token_data_array cur_p;
+
+    // True when the configured sampler chain is observationally equivalent
+    // to greedy/argmax (temp == 0 OR top_k == 1, no grammar, no reasoning
+    // budget, no logit_bias, no penalties / DRY / mirostat). When set, the
+    // DFlash spec verify accept path uses llama_get_logits_argmax_ith()
+    // directly, bypassing the per-position synchronize + chain-apply that
+    // dominates request wall time (~580 ms of a 1.25 s 200-token run on
+    // Qwen 3.6-27B Q5_K_S per nsys). Computed once at init from params.
+    bool greedy_equivalent = false;
 
     void reset() {
         prev.clear();
@@ -398,14 +408,54 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         params.backend_sampling = false;
     }
 
+    // Determine whether the resulting chain is greedy-equivalent. Conditions
+    // (any-of for greedy outcome, all-of for "no side effects we'd skip"):
+    //   - temp == 0 OR top_k == 1                       (forces argmax)
+    //   - no grammar / reasoning budget                 (would gate tokens)
+    //   - no logit_bias                                 (would shift logits)
+    //   - no penalties / DRY                            (would reshape probs)
+    //   - mirostat == 0                                 (mirostat picks differently)
+    //   - no XTC / typical / top_n_sigma / adaptive_p   (stochastic / reshape)
+    const bool can_short_circuit = (params.temp == 0.0f || params.top_k == 1);
+    bool no_side_effects = grmr == nullptr && rbudget == nullptr
+        && !params.has_logit_bias()
+        && params.mirostat == 0
+        && params.penalty_last_n == 0
+        && params.penalty_repeat == 1.0f
+        && params.penalty_freq   == 0.0f
+        && params.penalty_present == 0.0f
+        && params.dry_multiplier  == 0.0f
+        && params.xtc_probability == 0.0f
+        && params.top_n_sigma     <= 0.0f;
+    // Sampler list must not include any of the reshape-or-stochastic types
+    // that operate before the greedy/top_k=1 reduction step. (TOP_K with
+    // top_k != 1 is fine — it'd be a no-op when followed by top_k=1, but
+    // greedy_equivalent only triggers when top_k == 1 or temp == 0.)
+    for (const auto & s : params.samplers) {
+        switch (s) {
+            case COMMON_SAMPLER_TYPE_DRY:
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+            case COMMON_SAMPLER_TYPE_XTC:
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+            case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+            case COMMON_SAMPLER_TYPE_INFILL:
+                no_side_effects = false;
+                break;
+            default:
+                break;
+        }
+    }
+
     auto * result = new common_sampler {
-        /* .params  = */ params,
-        /* .grmr    = */ grmr,
-        /* .rbudget = */ rbudget,
-        /* .chain   = */ chain,
-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .cur     = */ {},
-        /* .cur_p   = */ {},
+        /* .params             = */ params,
+        /* .grmr               = */ grmr,
+        /* .rbudget            = */ rbudget,
+        /* .chain              = */ chain,
+        /* .prev               = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+        /* .cur                = */ {},
+        /* .cur_p              = */ {},
+        /* .greedy_equivalent  = */ can_short_circuit && no_side_effects,
     };
 
     return result;
@@ -535,7 +585,9 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    NVTX_PUSH("css_sync");
     llama_synchronize(ctx);
+    NVTX_POP();
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
@@ -546,6 +598,26 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    // Greedy-equivalent fast path: when the chain is observationally
+    // equivalent to argmax (set at init in common_sampler_init), skip the
+    // backend-sampler check + set_logits + chain_apply entirely. The
+    // graph-side ggml_argmax over t_logits already produced the answer
+    // and the synchronize above has settled it. Same answer the CPU
+    // chain would compute, ~50× cheaper (no 10 MB logits readback on the
+    // host buffer when needs_raw_logits is short-circuited, no per-token
+    // softmax over the full vocab). Falls through to the regular path if
+    // the argmax buffer isn't populated for any reason.
+    if (gsmpl->greedy_equivalent) {
+        const llama_token argmax_id = llama_get_logits_argmax_ith(ctx, idx);
+        if (argmax_id != LLAMA_TOKEN_NULL) {
+            id = argmax_id;
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = { id, 0.0f, 1.0f };
+            cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), 0, true };
+            return id;
+        }
+    }
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -567,7 +639,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
+    NVTX_PUSH("css_set_logits");
     gsmpl->set_logits(ctx, idx);
+    NVTX_POP();
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
@@ -576,7 +650,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_sampler_apply(grmr, &cur_p);
     }
 
+    NVTX_PUSH("css_chain_apply");
     llama_sampler_apply(chain, &cur_p);
+    NVTX_POP();
 
     id = cur_p.data[cur_p.selected].id;
 

@@ -10,6 +10,7 @@
 #include "common.h"
 #include "llama.h"
 #include "log.h"
+#include "nvtx_helper.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
@@ -83,6 +84,23 @@ struct server_slot {
     llama_context * ctx = nullptr;
 
     common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+    // DFlash --dflash-gdn-history short-circuit. When true, the slot replaces
+    // the spec_ckpt + restore round-trip on partial acceptance with the
+    // in-graph GDN-state fixup (state_select op driven by
+    // llama_dflash_set_gdn_history_k_index) + partial-tail seq_rm. Mirrors
+    // the use_gdn_history branch in examples/speculative-simple. Plumbed
+    // from params_base.speculative.dflash_gdn_history at slot init.
+    bool dflash_gdn_history = false;
+
+    // DFlash --dflash-inline-encoder. When true, the inline encoder runs
+    // in the target's main decode graph and writes K/V captures into the
+    // draft's side store directly. The slot must call
+    // llama_dflash_set_inline_encode_state(write_offset, pos_start) before
+    // each decode so the encoder knows where to write. Mirrors lines ~878
+    // of examples/speculative-simple.
+    bool dflash_inline_encoder = false;
+
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -210,6 +228,37 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            // Reset DFlash gdn-history k_index hint so a leftover from the
+            // previous request's partial-acceptance doesn't drive the next
+            // request's first verify into a stale state_history slot.
+            if (dflash_gdn_history) {
+                llama_dflash_set_gdn_history_k_index(ctx, -1);
+                // Full per-request DFlash reset: zeroes the K/V side store,
+                // GDN history buffers, ctx_filled, captured_n_outputs, and
+                // inline encoder offsets. memory_clear handles the model's
+                // s_l[il] recurrent state buffers. Together these eliminate
+                // cross-request state leaks that caused same-prompt repeats
+                // to emit immediate EOS on temp=0. Not safe for multi-slot
+                // serving (touches buffers shared across all slots) — fine
+                // for --parallel 1.
+                //
+                // memory_clear wipes the actual KV+recurrent state for this
+                // seq, so the next request's LCP-prefix search must NOT
+                // think tokens are still cached. prompt.tokens carries the
+                // previous request's tokens up until its own clear in
+                // launch_slot_with_task; clear it here too so
+                // get_common_prefix(input_tokens) doesn't return n_past>0
+                // when pos_min is now -1, which would trip the assert at
+                // server-context.cpp:2525 ("pos_min == -1, but n_past > 0").
+                // The cost is no LCP-cache reuse across requests on the
+                // same slot — acceptable trade-off (matches BENCH_NO_PROMPT
+                // _CACHE behaviour) since DFlash gdn-history's per-request
+                // recurrent-state wipe makes prefix reuse incorrect anyway.
+                llama_memory_clear(llama_get_memory(ctx), /*data=*/true);
+                llama_dflash_reset_for_new_request(ctx);
+                prompt.tokens.clear();
+                prompt.checkpoints.clear();
+            }
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -345,9 +394,16 @@ struct server_slot {
 
             const auto & params_spec = task->params.speculative;
 
+            // DFlash --dflash-gdn-history disables the ckpt path entirely:
+            // partial acceptance is handled by an in-graph state_select fixup
+            // (driven by llama_dflash_set_gdn_history_k_index after sample)
+            // + partial-tail seq_rm. Mirrors examples/speculative-simple's
+            // use_ckpt = false override in the use_gdn_history branch.
+            const bool needs_ckpt = (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) && !dflash_gdn_history;
+
             if (!spec_draft.empty()) {
                 // we have a previous (partial) draft to reuse
-                if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                if (needs_ckpt) {
                     GGML_ASSERT(!spec_ckpt.empty());
                 }
             } else {
@@ -362,7 +418,7 @@ struct server_slot {
                     spec_draft.resize(n_draft_max);
                 }
 
-                if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                if (!spec_draft.empty() && needs_ckpt) {
                     const auto n_tokens = prompt.tokens.size();
 
                     //const int64_t t_start = ggml_time_us();
@@ -401,6 +457,26 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
+            // --dflash-inline-encoder: mirror CLI speculative-simple.cpp:878.
+            // The verify batch about to be appended is
+            // [sampled, draft0, ..., draftN-1] at positions [pos0..pos0+N].
+            // The inline encoder, fired inside the target's decode graph,
+            // will scatter one K/V row per output token into the draft's
+            // side store. Tell it to start scattering at slot
+            // prompt.tokens.size() (= n_committed_total — sampled hasn't
+            // been push_back'd yet, that happens on line ~481) with RoPE
+            // positions starting at pos0. Without this call the offsets
+            // stay at their defaults (0, 0) and every verify decode
+            // overwrites the committed prefill captures at slots 0..N,
+            // collapsing draft acceptance to ~0. --parallel 1 only; a
+            // multi-slot rework needs a per-slot accumulator and a single
+            // call right before the master llama_decode at line ~2892.
+            if (dflash_inline_encoder) {
+                llama_dflash_set_inline_encode_state(ctx,
+                    /*write_offset=*/ (int64_t) prompt.tokens.size(),
+                    /*pos_start=*/    (int64_t) pos0);
+            }
+
             common_batch_add(batch, sampled, pos0++, { this->id }, true);
             for (auto token : spec_draft) {
                 common_batch_add(batch, token, pos0++, { this->id }, true);
@@ -419,6 +495,11 @@ struct server_slot {
 
             t_last_used        =  ggml_time_us();
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
+
+            // DFlash spec-round profile (env DFLASH_PROFILE=1). Prints the
+            // collected encoder/draft_decode/draft_other breakdown for the
+            // request that just finished. No-op when env var is unset.
+            common_dflash_prof_print();
 
             state = SLOT_STATE_IDLE;
 
@@ -811,6 +892,11 @@ private:
             // Forward DFlash-specific cparams to the draft context.
             params_base.speculative.draft.cparams.dflash_max_ctx = params_base.speculative.dflash_max_ctx;
             params_base.speculative.draft.cparams.dflash_topk    = params_base.speculative.dflash_topk;
+            // dflash_inline_encoder and dflash_gdn_history are target-only;
+            // the draft context's cparams validation rejects them. Clear
+            // explicitly to mirror examples/speculative-simple's setup.
+            params_base.speculative.draft.cparams.dflash_inline_encoder = false;
+            params_base.speculative.draft.cparams.dflash_gdn_history    = false;
         }
 
         std::string & mmproj_path = params_base.mmproj.path;
@@ -890,8 +976,16 @@ private:
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
+        const bool dflash_gdn_history    = params_base.speculative.dflash_gdn_history;
+        const bool dflash_inline_encoder = params_base.speculative.dflash_inline_encoder;
         if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-            SRV_WRN("%s", "speculative decoding will use checkpoints\n");
+            if (dflash_gdn_history) {
+                SRV_WRN("%s", "--dflash-gdn-history: replacing checkpoint+re-verify path "
+                              "with in-graph GDN-state fixup + partial-tail seq_rm on "
+                              "partial acceptance\n");
+            } else {
+                SRV_WRN("%s", "speculative decoding will use checkpoints\n");
+            }
         }
 
         // initialize slots
@@ -907,6 +1001,8 @@ private:
             slot.n_ctx = n_ctx_slot;
 
             slot.ctx_seq_rm_type = ctx_seq_rm_type;
+            slot.dflash_gdn_history    = dflash_gdn_history;
+            slot.dflash_inline_encoder = dflash_inline_encoder;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -2141,6 +2237,7 @@ private:
     }
 
     void update_slots() {
+        NVTX_RANGE("update_slots");
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -2252,7 +2349,7 @@ private:
                 continue;
             }
 
-            slot.update_batch(batch);
+            { NVTX_RANGE("update_batch_with_draft"); slot.update_batch(batch); }
         }
 
         // process in chunks of params.n_batch
@@ -2657,12 +2754,36 @@ private:
                             break;
                         }
 
-                        // embedding requires all tokens in the batch to be output
+                        // embedding requires all tokens in the batch to be output.
+                        //
+                        // DFlash spec (either --dflash-gdn-history or
+                        // --dflash-inline-encoder): also force logits=true
+                        // on every prompt-eval position.
+                        //   * Inline encoder: scatters captures only for
+                        //     positions with logits requested (filtered via
+                        //     inp_out_ids in the target graph). All-positions
+                        //     logits lets the encoder fire for the whole
+                        //     prompt during prompt-eval; begin() then takes
+                        //     the fast path via inline_n_committed and skips
+                        //     a redundant fallback re-decode.
+                        //   * Legacy encoder (gdn-history alone): captures
+                        //     accumulate into captured_features. With all-
+                        //     positions logits AND a single prompt-eval
+                        //     ubatch, captured_n_outputs == prompt size →
+                        //     begin() fast path. For chunked prompt-eval the
+                        //     last chunk overwrites captured_features so
+                        //     begin() still falls back; the sampler call
+                        //     site below uses idx=-1 to stay correct in
+                        //     that case.
+                        const bool need_logits =
+                            slot.task->need_embd()
+                            || slot.dflash_inline_encoder
+                            || slot.dflash_gdn_history;
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
-                            slot.task->need_embd());
+                            need_logits);
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -2803,7 +2924,35 @@ private:
                 batch.logits   + i,
             };
 
+            // --dflash-inline-encoder: prompt-eval can be chunked into
+            // multiple master llama_decode calls (the server reserves
+            // 4 tokens at the end of the prompt for a context checkpoint,
+            // so a 325-token prompt fires as 321 + 4). Each chunk's
+            // encoder must scatter into side-store rows
+            // [batch_view.pos[0] .. batch_view.pos[0] + n_outputs - 1],
+            // otherwise chunk-2's captures would overwrite chunk-1's at
+            // slot 0. Verify decodes are handled in update_batch above;
+            // here we cover the prompt-eval chunks (slot still in
+            // PROCESSING_PROMPT or DONE_PROMPT). --parallel 1 only.
+            if (slot_batched && slot_batched->dflash_inline_encoder &&
+                (slot_batched->state == SLOT_STATE_PROCESSING_PROMPT ||
+                 slot_batched->state == SLOT_STATE_DONE_PROMPT) &&
+                n_tokens > 0) {
+                const int64_t pos0 = (int64_t) batch.pos[i];
+                llama_dflash_set_inline_encode_state(ctx,
+                    /*write_offset=*/ pos0,
+                    /*pos_start=*/    pos0);
+            }
+
+            // NVTX-instrument the target decode so nsys --trace=nvtx can
+            // separate "verify N drafted tokens" cost from "encoder + draft"
+            // cost. The name encodes batch size so we can group decodes of
+            // identical width when comparing fork-vs-fork traces.
+            char _nvtx_name[64];
+            snprintf(_nvtx_name, sizeof(_nvtx_name), "target_decode_n%d", n_tokens);
+            NVTX_PUSH(_nvtx_name);
             const int ret = llama_decode(ctx, batch_view);
+            NVTX_POP();
 
             metrics.on_decoded(slots);
 
@@ -2929,9 +3078,27 @@ private:
                     continue; // sample using speculative decoding
                 }
 
-                const int tok_idx = slot.i_batch - i;
+                // For DFlash spec slots, common_speculative_begin() may have
+                // run a fallback full-prompt re-decode just above (line ~3031),
+                // which overwrites ctx's output_ids mapping. slot.i_batch was
+                // set relative to the chunked prompt-eval batch, so after the
+                // fallback decode it indexes the WRONG output row (a mid-prompt
+                // logit instead of the last prompt position). idx=-1 robustly
+                // resolves to the LAST logits=true output row of whatever
+                // decode ctx is currently in — which equals slot.i_batch's
+                // intended position when no fallback ran (chunk-last had only
+                // one logits=true at slot.i_batch by construction at line
+                // ~2794), and equals the fallback's last position (= last
+                // prompt token) when fallback ran. --parallel 1 only; multi-
+                // slot would need per-slot output index tracking through
+                // begin().
+                const bool dflash_slot =
+                    slot.dflash_gdn_history || slot.dflash_inline_encoder;
+                const int tok_idx = dflash_slot ? -1 : (slot.i_batch - i);
 
+                NVTX_PUSH("sampler_sample");
                 llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
+                NVTX_POP();
 
                 slot.i_batch = -1;
 
@@ -2983,7 +3150,13 @@ private:
 
                 // verify and try to accept the draft
                 {
-                    const bool use_ckpt = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                    // DFlash --dflash-gdn-history disables the ckpt path: the
+                    // in-graph state_select op (driven by
+                    // llama_dflash_set_gdn_history_k_index below) restores the
+                    // recurrent state on the next decode without a checkpoint
+                    // restore. See examples/speculative-simple chain-mode
+                    // gdn-history branch for the reference flow.
+                    const bool use_ckpt = (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) && !slot.dflash_gdn_history;
 
                     // only save the sampler sampler state if we use checkpoints
                     common_sampler_ptr smpl_save;
@@ -2992,10 +3165,28 @@ private:
                     }
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                    NVTX_PUSH("sample_and_accept_n");
                     auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    NVTX_POP();
                     slot.spec_i_batch.clear();
 
                     GGML_ASSERT(accepted.size() >= 1);
+
+                    // GDN history fixup hint for the NEXT verify graph's state_select
+                    // op. state_history slot t holds the recurrent state after
+                    // position P+t in this verify batch. k_index = accepted_count
+                    // restores the GDN state to "right after the last accepted token"
+                    // on the next decode. -1 = no fixup (full acceptance, latest
+                    // state is already correct). Mirrors lines 952-960 of
+                    // examples/speculative-simple/speculative-simple.cpp.
+                    if (slot.dflash_gdn_history) {
+                        const int32_t accepted_count = (int32_t)(accepted.size() - 1);
+                        if (accepted_count < (int32_t) slot.spec_draft.size()) {
+                            llama_dflash_set_gdn_history_k_index(slot.ctx, accepted_count);
+                        } else {
+                            llama_dflash_set_gdn_history_k_index(slot.ctx, -1);
+                        }
+                    }
 
                     // check for partial draft acceptance
                     if (accepted.size() < slot.spec_draft.size() + 1) {
@@ -3053,7 +3244,16 @@ private:
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-                llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
+                // DFlash partial-tail variant: on hybrid memory (recurrent +
+                // attention) with gdn-history, the recurrent tail cell needs to
+                // be rewound rather than rejected. Falls back to plain seq_rm
+                // on non-recurrent backends, so it's safe to call unconditionally.
+                if (slot.dflash_gdn_history) {
+                    llama_dflash_memory_seq_rm_partial_tail_state_managed_externally(
+                        llama_get_memory(slot.ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
+                } else {
+                    llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
+                }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;

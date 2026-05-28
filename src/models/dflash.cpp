@@ -384,13 +384,26 @@ llama_model_dflash::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * topk;
     ggml_tensor * topk_argmax = nullptr;
     if (K == 1) {
-        topk = ggml_top_k(ctx0, logits, 1);
+        // Chain mode: K=1 is just argmax. ggml_top_k(x, 1) routes through the
+        // CUDA argsort path which on CCCL < 3.2 falls back to
+        // DeviceSegmentedSortFallbackKernel — a full sort of [vocab × n_tokens]
+        // costing ~1.3 ms/round per nsys profiling on Qwen 3.6-27B Q5_K_S
+        // (HumanEval/66, May 2026). Using ggml_argmax instead dispatches to a
+        // dedicated single-pass reduction kernel (~10× faster). Output layout
+        // is byte-compatible with top_k(.,1): n_outputs × i32, contiguous, so
+        // the host readback at llama-context.cpp::~3071 is unchanged.
+        topk = ggml_argmax(ctx0, logits);
         cb(topk, "result_output_argmax", -1);
     } else {
         topk = ggml_top_k(ctx0, logits, (int) K);
         cb(topk, "result_output_topk", -1);
 
-        topk_argmax = ggml_top_k(ctx0, logits, 1);
+        // Same reasoning as the K == 1 branch above: an argmax tensor
+        // computed via ggml_argmax avoids the cub::DeviceSegmentedSort
+        // fallback that ggml_top_k(.,1) routes through on CCCL < 3.2.
+        // Used by the tree-mode best-first expansion path to find the
+        // per-position argmax cheaply alongside the K-best candidates.
+        topk_argmax = ggml_argmax(ctx0, logits);
         cb(topk_argmax, "result_output_topk_argmax", -1);
     }
     // Default: skip the bs * n_vocab * 4 byte logits readback (chain mode and

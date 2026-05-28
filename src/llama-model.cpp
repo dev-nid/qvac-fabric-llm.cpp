@@ -2067,6 +2067,11 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // add backend sampling layers (if any)
     llm->build_sampling();
 
+    // attach per-output argmax over t_logits for greedy-equivalent consumers
+    // (e.g. DFlash spec verify accept). Cheap, always-on; see
+    // llm_graph_context::build_logits_argmax for the cost rationale.
+    llm->build_logits_argmax();
+
     // if the gguf model was converted with --sentence-transformers-dense-modules
     // there will be two additional dense projection layers
     // dense linear projections are applied after pooling

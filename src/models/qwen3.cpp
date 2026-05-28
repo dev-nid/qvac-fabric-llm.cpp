@@ -158,8 +158,18 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
     ggml_build_forward_expand(gf, cur);
 
-    // DFlash inline encoder. No-op when not enabled or weights/side-store
-    // aren't bound. Emitted after lm_head so the encoder ops can overlap
-    // with the lm_head matmul on the GPU.
+    // DFlash inline encoder. Captures stored in the per-layer loop above
+    // carry the full ubatch n_tokens; reduce to n_outputs rows via
+    // get_rows(inp_out_ids) so the encoder's [n_embd_head, n_head_kv, n_new]
+    // reshape matches K_new = wk * h_proj on prompt-eval ubatches where
+    // n_outputs < n_tokens. No-op when n_outputs == n_tokens.
+    if (inp_out_ids != nullptr && res->t_dflash_captures_packed != nullptr) {
+        res->t_dflash_captures_packed = ggml_get_rows(
+            ctx0, res->t_dflash_captures_packed, inp_out_ids);
+        cb(res->t_dflash_captures_packed, "dflash_captures_packed_reduced", -1);
+        ggml_build_forward_expand(gf, res->t_dflash_captures_packed);
+    }
+    // Emitted after lm_head so the encoder ops can overlap with the lm_head
+    // matmul on the GPU.
     build_dflash_inline_encoder(model, res->t_dflash_captures_packed);
 }

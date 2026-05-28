@@ -2,6 +2,12 @@
 #include <cuda_fp16.h>
 #include <type_traits>
 
+// exp2f((x) * log2(e)) == expf(x) but compiles to a single ex2.approx SFU
+// instruction instead of expf's multiply + ex2 + range reduction. Used for
+// the DeltaNet gating exponentials, which are unbounded reals. Constant is
+// log2(e) to ~10 decimals. Same trick beellama.cpp uses; cf. llama.cpp #20354.
+#define GDN_EXPF(x) exp2f((x) * 1.442695041f)
+
 // Tree-mode parent-index sentinel. A parent index < 0 means "the parent is the
 // pre-block state" (root of the DFS-flattened sub-tree); the warp reloads
 // s_shard from curr_state instead of an intermediate-state slot.
@@ -158,7 +164,7 @@ gated_delta_net_cuda(const float * q,
         }
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            const float g_val = GDN_EXPF(*g_t);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -191,7 +197,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
+                kv_shard += GDN_EXPF(g_t[i]) * s_shard[r] * k_reg[r];
             }
 
             float kv_col = warp_reduce_sum<warp_size>(kv_shard);
@@ -205,7 +211,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]  = GDN_EXPF(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[r] * q_reg[r];
             }
 

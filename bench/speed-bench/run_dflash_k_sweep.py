@@ -54,12 +54,21 @@ SPEED_BENCH = Path(os.environ.get("BENCH_SPEEDBENCH",
 # (pair_id, target_gguf_by_quant, draft_gguf, family_label, draft_type)
 # target_gguf_by_quant maps "q4_k_m" / "q6_k" / "q8_0" -> (models_dir, filename)
 # draft_type: "dflash" (default) or "draft" for vanilla speculative with a small draft model
+QWEN3_8B_Q8 = Path(os.environ.get("BENCH_QWEN3_8B_Q8",
+                                  DATA_DIR / "models" / "qwen3-8b-q8"))
+
 DEFAULT_PAIRS = [
     ("qwen36-27b", {
         "q4_k_m": (MODELS_Q4, "Qwen3.6-27B-Q4_K_M.gguf"),
         "q6_k":   (MODELS_Q6, "Qwen3.6-27B-Q6_K.gguf"),
         "q8_0":   (MODELS_Q8, "Qwen3.6-27B-Q8_0.gguf"),
      }, "Qwen3.6-27B-DFlash.gguf", "Qwen 3.6-27B dense", "dflash"),
+    # Qwen 3-8B Q8_0 sanity-reference pair matching the historical report's
+    # "Qwen 3-8B sanity reference" section. Target = Qwen3-8B-Q8_0,
+    # draft = z-lab/Qwen3-8B-DFlash-b16 converted to GGUF.
+    ("qwen3-8b", {
+        "q8_0":   (QWEN3_8B_Q8, "Qwen3-8B-Q8_0.gguf"),
+     }, "Qwen3-8B-DFlash-bf16.gguf", "Qwen 3-8B dense", "dflash"),
     ("qwen36-35bA3", {
         "q4_k_m": (MODELS_Q4, "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"),
         "q6_k":   (MODELS_Q6, "Qwen3.6-35B-A3B-UD-Q6_K.gguf"),
@@ -256,13 +265,23 @@ def bench_pair(args, pair, quant, backend, prompts_df, results: list[Row]):
             cmd = [
                 spec_bin,
                 "-m", str(target), "-md", str(draft), "--draft-type", draft_type,
-                "--spec-draft-n-max", str(k),
                 "-p", ptxt,
                 "--n-predict", str(args.n_predict),
                 "--temp", "0", "--seed", str(args.seed),
                 "-c", str(args.ctx), "-cd", str(args.ctx),
                 "-ngl", "99", "-ngld", "99", "-t", "8",
             ]
+            if args.mode == "tree":
+                cmd += ["--dflash-tree", "--dflash-tree-budget", str(k)]
+            else:
+                cmd += ["--spec-draft-n-max", str(k)]
+            # auto-enable --dflash-gdn-history for hybrid-attn targets (Qwen 3.5/3.6).
+            wants_gdn = args.gdn_history == "on" or (
+                args.gdn_history == "auto" and pair_id.startswith(("qwen35", "qwen36")))
+            if wants_gdn:
+                cmd += ["--dflash-gdn-history"]
+            if os.environ.get("DFLASH_INLINE_ENCODER") == "1":
+                cmd += ["--dflash-inline-encoder", "--dflash-max-ctx", "4096"]
             rc, log = run_cmd(cmd, env=env, timeout=args.timeout)
             stats = parse_spec_log(log)
             n_drafted = stats.get("n_drafted")
@@ -374,6 +393,10 @@ def main():
     p.add_argument("--per-category", type=int, default=1,
                    help="prompts per SPEED-Bench category (1 = 11 prompts total)")
     p.add_argument("--n-predict", type=int, default=512)
+    p.add_argument("--mode", choices=["chain", "tree"], default="chain",
+                   help="chain: k -> --spec-draft-n-max; tree: k -> --dflash-tree-budget")
+    p.add_argument("--gdn-history", choices=["auto", "on", "off"], default="auto",
+                   help="add --dflash-gdn-history. 'auto' enables it for qwen35/qwen36 pairs")
     p.add_argument("--ctx", type=int, default=4096)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--timeout", type=int, default=900)

@@ -147,6 +147,17 @@ struct llama_dflash {
     int64_t                    inline_write_offset = 0;
     int64_t                    inline_pos_start    = 0;
 
+    // High-water mark of side-store rows the inline encoder has scattered
+    // since the last dflash_reset_for_new_request. Updated inside the
+    // encoder's set_input() (which knows write_offset + n_outputs for the
+    // ubatch about to run) — host-side, no GPU sync needed. Used by
+    // common_speculative_state_dflash::begin() to detect "captures already
+    // committed during the caller's prefill (possibly across multiple
+    // chunked llama_decode calls)" and skip the fallback re-decode.
+    // captured_n_outputs is per-decode-call so it can't be used for this
+    // purpose under chunked prompt-eval.
+    int64_t                    inline_n_committed  = 0;
+
     // ---------- (e) GDN history (target-side persistent buffers) ----
     //
     // When the TARGET context has cparams.dflash_gdn_history set and the
@@ -943,6 +954,17 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
 
+    // Per-output greedy argmax over the final logits, [n_outputs] I32. Always
+    // attached (cheap: one warp-reduction kernel per output row, sub-µs each
+    // for typical vocab sizes) so consumers that only need argmax can avoid
+    // the bs * n_vocab * 4 byte logits readback + host-side softmax. Used by
+    // the DFlash spec verify path to determine accept/reject per draft
+    // position without paying the full lm_head logits D2H + CPU sampler
+    // chain (~20 ms/round on Qwen 3.6-27B Q5_K_S per nsys, ~50% of request
+    // wall). nullptr only if the model didn't produce t_logits (e.g. embed-
+    // only modes) or the graph builder explicitly disabled it.
+    ggml_tensor * t_logits_argmax = nullptr;
+
     // DFlash drafter: in-graph top-K candidate token IDs of the per-position
     // lm_head logits. When non-null, llm_build_dflash sets t_logits = nullptr
     // — the float-logits read-back is skipped to eliminate the
@@ -1439,6 +1461,19 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    //
+    // per-output greedy argmax over t_logits (sets res->t_logits_argmax)
+    //
+    // Cheap (sub-µs per row on modern CUDA via the dedicated argmax kernel
+    // at ggml/src/ggml-cuda/argmax.cu), so attached unconditionally for
+    // every model whose graph produces t_logits. Lets greedy-equivalent
+    // consumers (e.g. the DFlash spec verify accept path) skip the full
+    // bs * n_vocab logits D2H + CPU sampler chain.
+    //
+    // No-op when t_logits is null or when LLAMA_NO_LOGITS_ARGMAX is set in
+    // the environment (escape hatch in case a backend ever lacks argmax).
+    void build_logits_argmax() const;
 
     //
     // dense (out)

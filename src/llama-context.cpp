@@ -21,6 +21,29 @@
 #include <limits>
 #include <stdexcept>
 
+// Lightweight NVTX scoped range helper for nsys-trace attribution of
+// llama_decode internals (graph_compute / dflash sync). Compiles out when
+// LLAMA_NVTX_ENABLED is not defined (see common/CMakeLists.txt LLAMA_NVTX).
+// Mirror of common/nvtx_helper.h kept inline here because the llama target
+// does not include common/ on its private include path.
+#ifdef LLAMA_NVTX_ENABLED
+#include <nvToolsExt.h>
+namespace { class llama_ctx_nvtx_range {
+public:
+    explicit llama_ctx_nvtx_range(const char * name) { nvtxRangePushA(name); }
+    ~llama_ctx_nvtx_range()                          { nvtxRangePop();        }
+    llama_ctx_nvtx_range(const llama_ctx_nvtx_range &) = delete;
+    llama_ctx_nvtx_range & operator=(const llama_ctx_nvtx_range &) = delete;
+}; }
+#define NVTX_RANGE(name) llama_ctx_nvtx_range _nvtx_range_##__LINE__##__(name)
+#define NVTX_PUSH(name)  nvtxRangePushA(name)
+#define NVTX_POP()       nvtxRangePop()
+#else
+#define NVTX_RANGE(name) do { (void) (name); } while (0)
+#define NVTX_PUSH(name)  do { (void) (name); } while (0)
+#define NVTX_POP()       do {} while (0)
+#endif
+
 //
 // llama_context
 //
@@ -1310,6 +1333,26 @@ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     }
 }
 
+llama_token llama_context::get_logits_argmax_ith(int32_t idx) const {
+    if (logits_argmax.empty()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    try {
+        const int64_t row = output_resolve_row(idx);
+        if (row < 0 || (size_t) row >= logits_argmax.size()) {
+            return LLAMA_TOKEN_NULL;
+        }
+        return logits_argmax[(size_t) row];
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid logits_argmax idx %d, reason: %s\n", __func__, idx, err.what());
+        return LLAMA_TOKEN_NULL;
+    }
+}
+
+const int32_t * llama_context::get_logits_argmax_data() const {
+    return logits_argmax.empty() ? nullptr : logits_argmax.data();
+}
+
 float * llama_context::get_sampled_probs_ith(int32_t idx) {
     output_reorder();
 
@@ -1536,6 +1579,29 @@ void llama_context::dflash_reset_ctx_kv() {
     }
 }
 
+// Full per-request reset for DFlash contexts. Zeroes the side-store K/V
+// buffers (so stale captures from a previous request can't be read by the
+// next request's draft graph view), zeroes the GDN history buffers (so
+// stale recurrent state from a previous request can't be selected by
+// state_select on the next request's first verify), and resets counters
+// (ctx_filled, ctx_pos_base, captured_n_outputs). Call this between
+// requests on the same slot; not safe under multi-slot serving because
+// it touches buffers shared across all slots.
+void llama_context::dflash_reset_for_new_request() {
+    dflash_reset_ctx_kv();
+    dflash.captured_n_outputs  = 0;
+    dflash.inline_pos_start    = 0;
+    dflash.inline_write_offset = 0;
+    dflash.inline_n_committed  = 0;
+    for (auto & [_, buf] : dflash_kv_ctxs_bufs) {
+        ggml_backend_buffer_clear(buf.get(), 0);
+    }
+    for (auto & [_, buf] : dflash_gdn_history_ctxs_bufs) {
+        ggml_backend_buffer_clear(buf.get(), 0);
+    }
+    dflash_invalidate_graph_cache();
+}
+
 bool llama_context::dflash_slide_left(int64_t n_drop) {
     GGML_ASSERT(n_drop > 0);
     GGML_ASSERT(n_drop <= dflash.ctx_filled);
@@ -1742,10 +1808,11 @@ int32_t llama_context::dflash_extend(const float * target_hidden_new,
     return 0;
 }
 
-int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
-                                                 int64_t       src_row_offset,
-                                                 int64_t       n_keep,
-                                                 int64_t       pos_start) {
+int32_t llama_context::dflash_extend_from_tensor(ggml_tensor *   src_captures,
+                                                 int64_t         src_row_offset,
+                                                 int64_t         n_keep,
+                                                 int64_t         pos_start,
+                                                 llama_context * src_ctx) {
     const int64_t n_keep_real = n_keep;
     int64_t       n_keep_pad  = n_keep;
 
@@ -1936,13 +2003,49 @@ int32_t llama_context::dflash_extend_from_tensor(ggml_tensor * src_captures,
         GGML_ASSERT((size_t) ggml_nbytes(dst_view) >= bytes);
         GGML_ASSERT((size_t) ggml_nbytes(src_view) >= bytes);
 
-        // Per ggml semantics this is a true D2D within a single device
-        // backend (e.g. Vulkan/CUDA cpy_tensor); only falls back to a host
-        // bounce if buffers are on different physical devices. Cross-ctx
-        // ordering is fine here because llama_decode() synchronizes its
-        // scheduler before returning, so src_captures's contents are
-        // settled by the time we enter this function.
-        ggml_backend_tensor_copy(src_view, dst_view);
+        // Async D2D: issues the copy on the source context's compute stream
+        // and chains a cudaEvent into the encoder's stream. Producer ordering
+        // is enforced GPU-side so the caller can skip the post-decode
+        // ggml_backend_sched_synchronize in the source context (saves
+        // ~20 ms/round on the DFlash chain spec loop; see
+        // ggml/src/ggml-cuda/ggml-cuda.cu ggml_backend_cuda_cpy_tensor_async
+        // for the underlying event serialisation).
+        //
+        // src_ctx is required: the only in-tree caller
+        // (llama_dflash_extend_from_ctx) always passes it. The default
+        // nullptr in the declaration exists for API forward-compatibility
+        // — should an external embedder appear that can't pass src_ctx,
+        // the contract becomes "caller has already host-synchronized the
+        // source scheduler"; ggml_backend_tensor_copy via cudaStreamPerThread
+        // is then safe (kept here as a sync fallback for that future
+        // contingency).
+        bool copied_async = false;
+        if (src_ctx != nullptr) {
+            ggml_backend_t src_backend = ggml_backend_sched_get_tensor_backend(
+                src_ctx->get_sched(), src_captures);
+            ggml_backend_t dst_backend = ggml_backend_sched_get_tensor_backend(
+                sched_slot, dst_view);
+            if (src_backend != nullptr && dst_backend != nullptr) {
+                ggml_backend_tensor_copy_async(src_backend, dst_backend,
+                                               src_view, dst_view);
+                copied_async = true;
+            }
+        }
+        if (!copied_async) {
+            // Reached only on legacy/external callers that pass src_ctx ==
+            // nullptr OR if the sched backend lookup fails (e.g. a pre-
+            // allocated tensor not attached to any sched at copy time).
+            // The latter is a programmer error in our own codepath — log it
+            // so it doesn't silently fall into the slow path.
+            if (src_ctx != nullptr) {
+                LLAMA_LOG_WARN("%s: async D2D failed to resolve backends "
+                               "(src=%p, dst=%p); falling back to host-sync copy "
+                               "via cudaStreamPerThread. Verify src_ctx's sched "
+                               "owns src_captures and this sched owns dst_view.\n",
+                               __func__, (void *) src_captures, (void *) dst_view);
+            }
+            ggml_backend_tensor_copy(src_view, dst_view);
+        }
 
         ggml_free(view_ctx);
     }
@@ -2461,7 +2564,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const bool can_reuse_result = !graph_reuse_disable && res->can_reuse(gparams);
+    // Per-call reuse diagnostic. Opt-in via LLAMA_GRAPH_REUSE_TRACE=1 so the
+    // server log stays quiet by default. Used to verify CUDA-graph-friendly
+    // reuse in the DFlash spec loop without enabling --verbose globally.
+    static const bool _reuse_trace = []() {
+        const char * e = getenv("LLAMA_GRAPH_REUSE_TRACE");
+        return e && atoi(e) != 0;
+    }();
+    if (_reuse_trace) {
+        LLAMA_LOG_INFO("graph_reuse: ctx=%p n_tokens=%d n_outputs=%d gtype=%d -> %s\n",
+                       (void *) this,
+                       (int) ubatch.n_tokens,
+                       (int) n_outputs,
+                       (int) gtype,
+                       can_reuse_result ? "REUSE" : "REBUILD");
+    }
+    if (can_reuse_result) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2497,17 +2616,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
-    // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
-
-        // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        NVTX_RANGE("set_inputs");
         res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    NVTX_PUSH("graph_compute");
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    NVTX_POP();
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3028,6 +3144,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // extract per-output greedy argmax (cheap; n_outputs * 4 bytes vs the
+        // n_outputs * n_vocab * 4 byte full logits readback above). Always
+        // populated when the graph emitted t_logits_argmax — letting greedy
+        // consumers (DFlash spec verify accept) skip the full logits D2H.
+        if (res->t_logits_argmax && n_outputs > 0 &&
+                (size_t) (n_outputs_prev + n_outputs) <= logits_argmax.size()) {
+            ggml_backend_t backend_am = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_logits_argmax);
+            if (backend_am != nullptr) {
+                int32_t * argmax_out = logits_argmax.data() + n_outputs_prev;
+                ggml_backend_tensor_get_async(backend_am, res->t_logits_argmax, argmax_out,
+                                              0, (size_t) n_outputs * sizeof(int32_t));
+            }
+        }
+
         // DFlash: read back in-graph top-K candidate token IDs (replaces the
         // bs * n_vocab * 4 byte float-logits transfer per draft block).
         if (model.arch == LLM_ARCH_DFLASH && res->t_dflash_topk && n_outputs > 0) {
@@ -3229,20 +3359,38 @@ int llama_context::decode(const llama_batch & batch_inp) {
             && dflash.capture_staging.empty()
             && !dflash.captured_features.empty()
             && n_outputs_all > 0) {
+        NVTX_RANGE("dflash_sync_a");
         ggml_backend_sched_synchronize(sched.get());
     } else if (!dflash.capture_layer_ids.empty()
             && dflash.skip_host_readback
             && dflash.last_packed_captures != nullptr
             && n_outputs_all > 0) {
-        // skip-host-readback mode: we didn't enqueue a D2H but we still need
-        // to synchronize so the packed tensor's compute settles before a
-        // downstream consumer (llama_dflash_extend_from_ctx) reads it via
-        // a cross-context D2D copy. Without this sync, target compute can
-        // race the copy and the draft side store gets stale features.
-        ggml_backend_sched_synchronize(sched.get());
+        // skip-host-readback mode: the downstream consumer
+        // (llama_dflash_extend_from_ctx → encoder graph reads via
+        // cross-context D2D copy) is properly serialized through CUDA
+        // events by ggml_backend_cuda_cpy_tensor_async() — see
+        // ggml/src/ggml-cuda/ggml-cuda.cu: cpy_tensor_async records a
+        // cudaEvent on the src stream and the encoder's dst stream waits
+        // on it via cudaStreamWaitEvent. A host-side
+        // ggml_backend_sched_synchronize is therefore redundant for
+        // correctness and was costing ~20 ms/round of wall time per nsys
+        // (the GPU only does ~1.5 ms of kernel work per verify round, but
+        // synchronize blocked the host until the full stream drained).
+        // The opt-in env var LLAMA_DFLASH_SYNC_AFTER_DECODE=1 restores the
+        // previous behavior in case a downstream consumer is added that
+        // doesn't go through the cross-backend copy path.
+        static const bool _force_sync = []() {
+            const char * e = getenv("LLAMA_DFLASH_SYNC_AFTER_DECODE");
+            return e && atoi(e) != 0;
+        }();
+        if (_force_sync) {
+            NVTX_RANGE("dflash_sync_b_packed");
+            ggml_backend_sched_synchronize(sched.get());
+        }
     } else if (!dflash.capture_layer_ids.empty()
             && !dflash.capture_staging.empty()
             && n_outputs_all > 0) {
+        NVTX_RANGE("dflash_sync_c_staging");
         ggml_backend_sched_synchronize(sched.get());
 
         const int64_t n_embd_target = dflash.capture_n_embd;
@@ -3360,6 +3508,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     if (output_ids.empty()) {
         // init, never resized afterwards
         output_ids.resize(n_batch);
+    }
+
+    // logits_argmax mirrors logits in row count; sized to n_outputs_max so
+    // the row indices output_resolve_row() returns are always in-bounds.
+    if (logits_argmax.size() < (size_t) n_outputs_max) {
+        logits_argmax.assign((size_t) n_outputs_max, LLAMA_TOKEN_NULL);
+    } else {
+        std::fill(logits_argmax.begin(), logits_argmax.end(), LLAMA_TOKEN_NULL);
     }
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
@@ -3498,6 +3654,10 @@ void llama_context::output_reorder() {
             std::swap(sampling.logits_count[i0],     sampling.logits_count[i1]);
             std::swap(sampling.probs_count[i0],      sampling.probs_count[i1]);
             std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
+        }
+
+        if (i0 < logits_argmax.size() && i1 < logits_argmax.size()) {
+            std::swap(logits_argmax[i0], logits_argmax[i1]);
         }
     }
 
@@ -3641,7 +3801,11 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+    static const bool _log_splits = getenv("LLAMA_LOG_SPLITS") != nullptr;
+    if (_log_splits) {
+        fprintf(stderr, "splits: %d (sched=%p)\n",
+                ggml_backend_sched_get_n_splits(sched_use), (void *) sched_use);
+    }
 
     return status;
 }
@@ -4842,6 +5006,18 @@ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     return ctx->get_sampled_token_ith(i);
 }
 
+llama_token llama_get_logits_argmax_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_logits_argmax_ith(i);
+}
+
+const int32_t * llama_get_logits_argmax(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_logits_argmax_data();
+}
+
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
@@ -5221,6 +5397,11 @@ void llama_dflash_set_capture(struct llama_context * ctx,
     ctx->set_dflash_capture(layer_ids, n_layer_ids, n_embd_target);
 }
 
+void llama_dflash_reset_for_new_request(struct llama_context * ctx) {
+    if (ctx == nullptr) return;
+    ctx->dflash_reset_for_new_request();
+}
+
 const float * llama_dflash_get_captured_features(struct llama_context * ctx,
                                                  int64_t * n_outputs_out) {
     if (ctx == nullptr) {
@@ -5263,7 +5444,7 @@ int32_t llama_dflash_extend_from_ctx(llama_context * dst_ctx,
                 __func__);
         return -1;
     }
-    return dst_ctx->dflash_extend_from_tensor(src_packed, src_row_offset, n_keep, pos_start);
+    return dst_ctx->dflash_extend_from_tensor(src_packed, src_row_offset, n_keep, pos_start, src_ctx);
 }
 
 bool llama_dflash_bind_inline_side_store(llama_context * ctx_tgt,
@@ -5292,6 +5473,11 @@ void llama_dflash_set_inline_encode_state(llama_context * ctx_tgt,
     llama_dflash & tdflash = ctx_tgt->get_dflash_mut();
     tdflash.inline_write_offset = write_offset;
     tdflash.inline_pos_start    = pos_start;
+}
+
+int64_t llama_dflash_inline_get_n_committed(llama_context * ctx_tgt) {
+    if (ctx_tgt == nullptr) return 0;
+    return ctx_tgt->get_dflash_mut().inline_n_committed;
 }
 
 void llama_dflash_inline_advance_ctx_filled(llama_context * ctx_dft,
