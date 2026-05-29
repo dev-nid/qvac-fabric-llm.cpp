@@ -873,7 +873,7 @@ struct common_sampler;
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
-    common_init_result(common_params & params);
+    common_init_result(common_params & params, bool model_only = false);
     ~common_init_result();
 
     llama_model * model();
@@ -893,7 +893,7 @@ private:
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
-common_init_result_ptr common_init_from_params(common_params & params);
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_init_result_ptr res,
                                                          common_params & params);
 common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params);
