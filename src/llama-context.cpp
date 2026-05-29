@@ -56,6 +56,14 @@ llama_context::llama_context(
     cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings       = params.embeddings;
+    // qvac: pre-norm embedding extraction is opt-in via set_embeddings_pre_norm().
+    // Leaving these uninitialized was OK for production paths (server always calls
+    // the setter), but test-llama-archs constructs llama_context directly, so the
+    // garbage bool drove qwen35 graph construction down a non-`inp_out_ids` branch
+    // — leaving the input tensor unconsumed → scheduler never allocates its buffer
+    // → llm_graph_input_out_ids::set_input asserts on a null buffer. Default off.
+    cparams.embeddings_pre_norm        = false;
+    cparams.embeddings_pre_norm_masked = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
