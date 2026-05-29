@@ -2387,6 +2387,16 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         adjusted_messages.back().role == "assistant") {
         params.continue_msg = adjusted_messages.back();
         adjusted_messages.pop_back();
+
+        if (params.continue_final_message == COMMON_CHAT_CONTINUATION_AUTO) {
+            // Resolve based on message content
+            params.continue_final_message = COMMON_CHAT_CONTINUATION_CONTENT;
+            if (!params.continue_msg.reasoning_content.empty() &&
+                params.continue_msg.content.empty() &&
+                params.continue_msg.content_parts.empty()) {
+                params.continue_final_message = COMMON_CHAT_CONTINUATION_REASONING;
+            }
+        }
     }
     params.messages = render_message_to_json(adjusted_messages, tmpl.original_caps());
 
