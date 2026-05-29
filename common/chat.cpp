@@ -2501,13 +2501,17 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
             auto_params.thinking_start_tag = autoparser.reasoning.start;
             auto_params.thinking_end_tag   = autoparser.reasoning.end;
         }
-        // Preserve generate_parser's continuation-extended generation_prompt
-        // (it overrides params.generation_prompt with reasoning_content +
-        // optional close + content when continue_final_message != NONE).
-        if (params.continue_final_message == COMMON_CHAT_CONTINUATION_NONE ||
-            params.continue_msg.empty()) {
-            auto_params.generation_prompt = params.generation_prompt;
-        }
+        // Leave auto_params.generation_prompt as what generate_parser computed
+        // (character-level diff via common_chat_template_generation_prompt, plus
+        // any continuation-mode reasoning/content extensions). We previously
+        // overwrote this with params.generation_prompt (which uses the
+        // segment-based calculate_diff_split), but for templates like
+        // MiniMax-M2 whose role delimiters are bracket-shaped (`[e~[`, `]~b]`),
+        // segment-based diff includes the trailing `[e~[` of the prior message
+        // as part of the "right" diff. That makes auto_params.generation_prompt
+        // disagree with parser_generation_prompt (used to build the parser),
+        // and the PEG parser then fails on inputs that include the spurious
+        // delimiter prefix.
         auto_params.thinking_forced_open = auto_params.supports_thinking &&
             thinking_forced_open_from_gen_prompt(params.generation_prompt,
                                                  auto_params.thinking_start_tag,
