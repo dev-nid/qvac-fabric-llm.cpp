@@ -935,10 +935,13 @@ std::vector<common_chat_msg_span> common_chat_split_by_role(
                 spans.push_back(cur);
             }
             cur.role = hit->role;
-            cur.pos  = i + hit->delimiter.size();
+            // Span starts at the delimiter, not after it — so that
+            // prompt.substr(span.pos, span.len) reconstructs the original
+            // role chunk including the delimiter that introduced it.
+            cur.pos  = i;
             cur.len  = 0;
             open     = true;
-            i        = cur.pos;
+            i       += hit->delimiter.size();
             continue;
         }
         ++i;
