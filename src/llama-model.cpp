@@ -2850,6 +2850,14 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_HUNYUAN_VL:
+            {
+                // All HUNYUAN_VL hparams (norm eps, M-RoPE sections, XDRoPE
+                // scaling, n_embd → type) are loaded by
+                // llama_model_hunyuan_vl::load_arch_hparams in
+                // src/models/hunyuan-vl.cpp. An empty case here is just to
+                // keep llama_model::load_hparams' default-throw from firing.
+            } break;
         case LLM_ARCH_SMOLLM3:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
