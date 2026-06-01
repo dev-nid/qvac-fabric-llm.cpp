@@ -1088,9 +1088,17 @@ float * llama_context::get_embeddings_pre_norm_ith(int32_t i) {
             throw std::runtime_error("no pre-norm embeddings");
         }
 
-        const int64_t  j         = output_resolve_row(i);
-        const uint32_t n_embd_out = model.hparams.n_embd_out();
-        return embd_pre_norm.data + j * n_embd_out;
+        // Row layout matches the buffer layout we wrote in decode():
+        //   masked=true  → buffer rows are output-positions; map i (batch idx)
+        //                  through output_resolve_row.
+        //   masked=false → buffer rows are batch-positions; use i directly
+        //                  (MTP reads h[i_batch_beg + k] this way).
+        // Stride is hparams.n_embd to match the buffer sizing.
+        const int64_t  j      = cparams.embeddings_pre_norm_masked
+            ? output_resolve_row(i)
+            : (int64_t) i;
+        const uint32_t n_embd = model.hparams.n_embd;
+        return embd_pre_norm.data + j * n_embd;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid pre-norm embeddings id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
@@ -1879,16 +1887,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling
         // modes are ignored. Consumers (e.g. MTP draft) call
         // llama_get_embeddings_pre_norm{,_ith} to read the rows back.
+        //
+        // Two layouts come out of the graph depending on cparams.embeddings_pre_norm_masked:
+        //   - masked=false (target ctx): t_h_pre_norm holds all n_tokens rows (mask
+        //     applied AFTER storing the tensor). Buffer is sized to n_batch in
+        //     output_reserve so the full row count fits per ubatch.
+        //   - masked=true (draft ctx): t_h_pre_norm is post-mask, n_outputs rows.
         if (embd_pre_norm.data && t_h_pre_norm && n_outputs > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
             ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_pre_norm);
             GGML_ASSERT(backend_h != nullptr);
 
-            const uint32_t n_embd = hparams.n_embd;
-            float * embd_pre_norm_out = embd_pre_norm.data + n_outputs_prev*n_embd;
+            const uint32_t n_embd  = hparams.n_embd;
+            const uint32_t n_rows  = cparams.embeddings_pre_norm_masked ? n_outputs : (uint32_t) ubatch.n_tokens;
+            const uint32_t off_rows = cparams.embeddings_pre_norm_masked ? n_outputs_prev : 0;
+            float * embd_pre_norm_out = embd_pre_norm.data + off_rows*n_embd;
 
-            GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-            GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd <= (int64_t) embd_pre_norm.size);
-            ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_outputs*n_embd*sizeof(float));
+            GGML_ASSERT((off_rows + n_rows)*n_embd <= (uint64_t) embd_pre_norm.size);
+            ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_rows*n_embd*sizeof(float));
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
@@ -1994,7 +2009,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits.size         = has_logits        ? n_vocab*n_outputs_max     : 0;
     embd.size           = has_embd          ? n_embd_out*n_outputs_max  : 0;
-    embd_pre_norm.size  = has_embd_pre_norm ? n_embd*n_outputs_max      : 0;
+    // pre-norm extraction:
+    //   masked=true  → graph applies inp_out_ids before storing t_h_pre_norm,
+    //                  so the tensor (and the buffer) only need n_outputs_max rows.
+    //   masked=false → t_h_pre_norm holds the full pre-mask tensor with up to
+    //                  n_batch rows per ubatch (target-ctx layout consumed by MTP).
+    embd_pre_norm.size  = has_embd_pre_norm
+        ? n_embd * (cparams.embeddings_pre_norm_masked ? (size_t) n_outputs_max : (size_t) n_batch)
+        : 0;
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
@@ -2127,7 +2149,10 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_pre_norm.size > 0) {
+        // Only reorder when the buffer is laid out by output row (masked mode).
+        // In non-masked mode the buffer stores rows by ubatch token index, so
+        // output_swaps' indices don't apply.
+        if (embd_pre_norm.size > 0 && cparams.embeddings_pre_norm_masked) {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd_pre_norm.data[i0*n_embd + k], embd_pre_norm.data[i1*n_embd + k]);
             }
