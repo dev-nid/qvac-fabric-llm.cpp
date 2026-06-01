@@ -1302,7 +1302,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
-    GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
+    // MTP hook batches carry both token (next-token id) and embd (h_pre_norm
+    // row); accept either-or-both rather than requiring exactly one.
+    GGML_ASSERT(batch_inp.token || batch_inp.embd); // NOLINT
 
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -1592,7 +1594,9 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
+    // MTP hook batches carry both token (next-token id) and embd (h_pre_norm
+    // row); accept either-or-both rather than requiring exactly one.
+    GGML_ASSERT(batch_inp.token || batch_inp.embd); // NOLINT
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
