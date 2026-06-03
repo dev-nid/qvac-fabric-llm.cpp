@@ -25,16 +25,8 @@ ggml_metal_device_t ggml_metal_device_get(int device) {
     // which is a sizeable. Two concurrent library compiles inside MTLCompilerService blow
     // through its 100 MB ActiveSoft cap on iOS and the kernel jetsam-corpses it,
     // leaving the addon unable to build pipelines for the mmproj graph.
-    //
-    // The cache is intentionally leaked at process exit. A function-local static
-    // vector would invoke ~unique_ptr -> ggml_metal_device_free -> ggml_metal_rsets_free
-    // during C++ static finalization, and that asserts the residency set is empty
-    // By the time __cxa_finalize runs, the Node/bare runtime that owns Metal
-    // buffers has already gone away, so any not-yet-released
-    // buffer trips the assert. Heap-allocating + never deleting the cache skips the
-    // dtor chain. The OS reclaims GPU resources at exit.
     static std::mutex mutex;
-    static auto * devs = new std::vector<ggml_metal_device_ptr>();
+    static std::vector<ggml_metal_device_ptr> devs;
 
     std::lock_guard<std::mutex> lock(mutex);
 
@@ -42,16 +34,16 @@ ggml_metal_device_t ggml_metal_device_get(int device) {
         return nullptr;
     }
 
-    while ((int) devs->size() <= device) {
-        devs->emplace_back(nullptr);
+    while ((int) devs.size() <= device) {
+        devs.emplace_back(nullptr);
     }
 
-    if ((*devs)[device] == nullptr) {
+    if (devs[device] == nullptr) {
         GGML_LOG_INFO("ggml_metal_device_get: initialising device %d (this triggers a single newLibraryWithSource compile)\n", device);
-        (*devs)[device].reset(ggml_metal_device_init(device));
+        devs[device].reset(ggml_metal_device_init(device));
     }
 
-    return (*devs)[device].get();
+    return devs[device].get();
 }
 
 struct ggml_metal_pipelines {
