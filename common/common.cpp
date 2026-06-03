@@ -1141,6 +1141,8 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+common_init_result::common_init_result() : pimpl(new impl{}) {}
+
 common_init_result::common_init_result(common_params & params) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1391,10 +1393,21 @@ common_init_result_ptr common_init_from_params(common_params & params) {
 // and don't have a params.model.path the file-based constructor can open.
 common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params) {
     if (model == nullptr) {
-        return common_init_result_ptr();
+        // Mirror common_init_from_params: on load failure return a *valid* empty
+        // result (model()/context() == nullptr), never a null pointer. Callers
+        // adopt this result and inspect model()/context() to detect failure
+        // (e.g. and then throw); returning a null common_init_result_ptr here
+        // makes those callers dereference null and crash.
+        return common_init_result_ptr(new common_init_result());
     }
 
-    common_init_result_ptr res(new common_init_result(params));
+    // Adopt the externally-loaded model into an empty result. Do NOT use the
+    // file-based constructor here: it would load a throwaway model from
+    // params.model.path and build a context (and samplers) bound to it, and the
+    // pimpl->model.reset(model) below would then free that file model while its
+    // context/samplers still referenced it -- a heap-use-after-free in
+    // ~llama_context, plus a duplicated logit-bias/sampler setup.
+    common_init_result_ptr res(new common_init_result());
     auto & pimpl = res->pimpl;
     pimpl->model.reset(model);
 
