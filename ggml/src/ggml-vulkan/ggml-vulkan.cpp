@@ -3653,7 +3653,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
             } else if (!ggml_vk_matmul_shmem_support(device, l_warptile_mmqid, true, t)) {
                 device->mul_mat_id_l[i] = false;
             }
-            
+
             if (t == GGML_TYPE_F32 && device->coopmat_f32_support_16x16x16_f32acc) {
                 if (!ggml_vk_matmul_shmem_support(device, s_warptile_f32, false, t)) {
                     device->mul_mat_s[i] = false;
@@ -6242,7 +6242,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 if (prop.MSize > 16 || prop.NSize > 16 || prop.KSize > 16) {
                     continue;
                 }
-                
+
                 VK_LOG_DEBUG("ggml_vulkan: M: " << prop.MSize << " N: " << prop.NSize << " K: " << prop.KSize << " A: " << vk::to_string((vk::ComponentTypeKHR)prop.AType) << " B: " << vk::to_string((vk::ComponentTypeKHR)prop.BType) << " C: " << vk::to_string((vk::ComponentTypeKHR)prop.CType) << " Result: " << vk::to_string((vk::ComponentTypeKHR)prop.ResultType) << " saturatingAccumulation: " << prop.saturatingAccumulation << " scope: " << vk::to_string((vk::ScopeKHR)prop.scope));
 
                 if ((vk::ComponentTypeKHR)prop.AType == vk::ComponentTypeKHR::eFloat32 &&

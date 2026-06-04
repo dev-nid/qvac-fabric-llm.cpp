@@ -2855,7 +2855,7 @@ void llama_context::opt_epoch_iter(
             }
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
-            
+
             // Load optimizer tensors on first training iteration if pending
             if (train && should_load_optimizer_tensors && !optimizer_tensors_loaded) {
                 if (ggml_opt_load_tensors(opt_ctx, pending_optimizer_checkpoint_path.c_str())) {
