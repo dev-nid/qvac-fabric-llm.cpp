@@ -1262,6 +1262,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 &&
                    (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
+        case GGML_OP_CONV_2D_DW:
+            // The kernel addresses both weights and input by byte-stride, so a
+            // permuted (CWHN) weight is fine — no contiguity requirement. f32
+            // weights only (matches the CPU reference).
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32;
         case GGML_OP_UPSCALE:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_POOL_1D:
