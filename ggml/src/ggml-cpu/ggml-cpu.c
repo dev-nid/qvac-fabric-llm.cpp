@@ -39,8 +39,143 @@
 #endif
 
 #ifdef GGML_USE_OPENMP
-#include <omp.h>
+/* Runtime OpenMP support via shim library (LoadLibrary/dlopen) */
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
 #endif
+
+typedef void (*ggml_omp_parallel_cb_t)(void * data, int ith, int nth);
+typedef void (*ggml_omp_parallel_fn_t)(ggml_omp_parallel_cb_t cb, void * data, int n_threads);
+typedef void (*ggml_omp_barrier_fn_t)(void);
+typedef void (*ggml_omp_init_env_fn_t)(void);
+
+static struct {
+    void * handle;
+    ggml_omp_parallel_fn_t  parallel;
+    ggml_omp_barrier_fn_t   barrier;
+    ggml_omp_init_env_fn_t  init_env;
+    bool loaded;
+    bool init_done;
+} ggml_omp_rt = {0};
+
+static void ggml_omp_rt_init(void) {
+    if (ggml_omp_rt.init_done) return;
+    ggml_omp_rt.init_done = true;
+
+    if (getenv("GGML_NO_OPENMP")) {
+        GGML_LOG_INFO("OpenMP disabled by GGML_NO_OPENMP env\n");
+        return;
+    }
+
+#ifdef _WIN32
+    {
+        /* Build the full path to the shim DLL relative to the directory that
+           contains this module (.bare / .dll).  Plain LoadLibraryA("name.dll")
+           only searches the executable's directory, which is bare.exe / node.exe
+           — not the directory of the calling DLL. */
+        HMODULE self_mod = NULL;
+        char    self_path[MAX_PATH] = {0};
+        if (GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                (LPCSTR) ggml_omp_rt_init,
+                &self_mod) &&
+            GetModuleFileNameA(self_mod, self_path, MAX_PATH) > 0)
+        {
+            char * last_sep = strrchr(self_path, '\\');
+            if (!last_sep) last_sep = strrchr(self_path, '/');
+            if (last_sep) {
+                *(last_sep + 1) = '\0';
+                strcat_s(self_path, MAX_PATH, "ggml-omp-shim.dll");
+                ggml_omp_rt.handle = (void *) LoadLibraryA(self_path);
+                if (ggml_omp_rt.handle) {
+                    GGML_LOG_INFO("OpenMP shim loaded from: %s\n", self_path);
+                }
+            }
+        }
+        if (!ggml_omp_rt.handle) {
+            ggml_omp_rt.handle = (void *) LoadLibraryA("ggml-omp-shim.dll");
+        }
+    }
+#else
+    {
+        /* Use dladdr to find the directory of this shared object, then look
+           for the shim library next to it.  Bare dlopen("libname.so") only
+           searches LD_LIBRARY_PATH / system dirs which won't include the
+           .bare module's directory on Android or embedded deployments. */
+        const char * shim_name =
+#ifdef __APPLE__
+            "libggml-omp-shim.dylib";
+#else
+            "libggml-omp-shim.so";
+#endif
+        Dl_info dl_info;
+        if (dladdr((const void *) ggml_omp_rt_init, &dl_info) && dl_info.dli_fname) {
+            const char * last_sep = strrchr(dl_info.dli_fname, '/');
+            if (last_sep) {
+                size_t dir_len = (size_t)(last_sep - dl_info.dli_fname) + 1;
+                size_t shim_len = strlen(shim_name);
+                char * full_path = (char *) malloc(dir_len + shim_len + 1);
+                if (full_path) {
+                    memcpy(full_path, dl_info.dli_fname, dir_len);
+                    memcpy(full_path + dir_len, shim_name, shim_len + 1);
+                    ggml_omp_rt.handle = dlopen(full_path, RTLD_NOW);
+                    if (ggml_omp_rt.handle) {
+                        GGML_LOG_INFO("OpenMP shim loaded from: %s\n", full_path);
+                    }
+                    free(full_path);
+                }
+            }
+        }
+        if (!ggml_omp_rt.handle) {
+            ggml_omp_rt.handle = dlopen(shim_name, RTLD_NOW);
+        }
+    }
+#endif
+
+    if (!ggml_omp_rt.handle) {
+#ifndef _WIN32
+        GGML_LOG_INFO("OpenMP shim not found: %s (using pthreads)\n", dlerror());
+#else
+        GGML_LOG_INFO("OpenMP shim not found (using pthreads)\n");
+#endif
+        return;
+    }
+
+#ifdef _WIN32
+    #define GGML_OMP_DLSYM(name) (void *) GetProcAddress((HMODULE) ggml_omp_rt.handle, name)
+#else
+    #define GGML_OMP_DLSYM(name) dlsym(ggml_omp_rt.handle, name)
+#endif
+
+    ggml_omp_rt.parallel = (ggml_omp_parallel_fn_t) GGML_OMP_DLSYM("ggml_omp_shim_parallel");
+    ggml_omp_rt.barrier  = (ggml_omp_barrier_fn_t)  GGML_OMP_DLSYM("ggml_omp_shim_barrier");
+    ggml_omp_rt.init_env = (ggml_omp_init_env_fn_t) GGML_OMP_DLSYM("ggml_omp_shim_init_env");
+
+#undef GGML_OMP_DLSYM
+
+    if (ggml_omp_rt.parallel && ggml_omp_rt.barrier) {
+        ggml_omp_rt.loaded = true;
+        GGML_LOG_INFO("OpenMP support loaded via shim library\n");
+        if (ggml_omp_rt.init_env) {
+            ggml_omp_rt.init_env();
+        }
+    } else {
+        GGML_LOG_WARN("OpenMP shim incomplete, falling back to pthreads\n");
+        // Intentionally leak the handle: the OpenMP runtime (vcomp140.dll /
+        // libgomp) may have spawned internal threads already.  Calling
+        // FreeLibrary / dlclose here crashes on Windows and is unsafe on
+        // Linux.  The OS reclaims everything at process exit.
+        ggml_omp_rt.handle = NULL;
+    }
+}
+
+static inline bool ggml_omp_available(void) {
+    return ggml_omp_rt.loaded;
+}
+#endif // GGML_USE_OPENMP
 
 #if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
 #undef GGML_USE_LLAMAFILE
@@ -568,11 +703,9 @@ struct ggml_threadpool {
 
 // Per-thread state
 struct ggml_compute_state {
-#ifndef GGML_USE_OPENMP
     ggml_thread_t thrd;
     int  last_graph;
     bool pending;
-#endif
     bool cpumask[GGML_MAX_N_THREADS];
     struct ggml_threadpool * threadpool;
     int ith;
@@ -642,8 +775,11 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     }
 
 #ifdef GGML_USE_OPENMP
-    #pragma omp barrier
-#else
+    if (ggml_omp_available()) {
+        ggml_omp_rt.barrier();
+        return;
+    }
+#endif
     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
 
     // enter barrier (full seq-cst fence)
@@ -670,7 +806,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     #else
     atomic_thread_fence(memory_order_seq_cst);
     #endif
-#endif
 }
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
@@ -2769,7 +2904,9 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
 
     const int n_threads = threadpool->n_threads;
 
-#ifndef GGML_USE_OPENMP
+#ifdef GGML_USE_OPENMP
+    if (!ggml_omp_available()) {
+#endif
     struct ggml_compute_state* workers = threadpool->workers;
 
     ggml_mutex_lock(&threadpool->mutex);
@@ -2788,14 +2925,15 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
 
     ggml_mutex_destroy(&threadpool->mutex);
     ggml_cond_destroy(&threadpool->cond);
-#endif // GGML_USE_OPENMP
+#ifdef GGML_USE_OPENMP
+    }
+#endif
 
     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
     ggml_aligned_free(threadpool->workers, workers_size);
     ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
 }
 
-#ifndef GGML_USE_OPENMP
 // pause/resume must be called under mutex
 static void ggml_threadpool_pause_locked(struct ggml_threadpool * threadpool) {
     GGML_PRINT_DEBUG("Pausing threadpool\n");
@@ -2808,30 +2946,33 @@ static void ggml_threadpool_resume_locked(struct ggml_threadpool * threadpool) {
     threadpool->pause = false;
     ggml_cond_broadcast(&threadpool->cond);
 }
-#endif
 
 void ggml_threadpool_pause(struct ggml_threadpool * threadpool) {
-#ifndef GGML_USE_OPENMP
+#ifdef GGML_USE_OPENMP
+    if (ggml_omp_available()) {
+        UNUSED(threadpool);
+        return;
+    }
+#endif
     ggml_mutex_lock(&threadpool->mutex);
     if (!threadpool->pause) {
        ggml_threadpool_pause_locked(threadpool);
     }
     ggml_mutex_unlock(&threadpool->mutex);
-#else
-    UNUSED(threadpool);
-#endif
 }
 
 void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
-#ifndef GGML_USE_OPENMP
+#ifdef GGML_USE_OPENMP
+    if (ggml_omp_available()) {
+        UNUSED(threadpool);
+        return;
+    }
+#endif
     ggml_mutex_lock(&threadpool->mutex);
     if (threadpool->pause) {
        ggml_threadpool_resume_locked(threadpool);
     }
     ggml_mutex_unlock(&threadpool->mutex);
-#else
-    UNUSED(threadpool);
-#endif
 }
 
 struct ggml_cplan ggml_graph_plan(
@@ -3085,11 +3226,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.use_ref    =*/ cplan->use_ref,
     };
 
-#ifdef GGML_USE_OPENMP
-    GGML_PRINT_DEBUG("thread #%d compute-start cplan %p\n", state->ith, (const void *)cplan);
-#else
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
-#endif
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -3116,18 +3253,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
     }
 
-#ifdef GGML_USE_OPENMP
-    GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);
-#else
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
-#endif
 
     ggml_barrier(state->threadpool);
 
     return 0;
 }
-
-#ifndef GGML_USE_OPENMP
 
 // check if thread is ready to proceed (exit from polling or sleeping)
 // returns true if loops should exit, sets state->pending to indicate new work
@@ -3263,8 +3394,6 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     ggml_mutex_unlock(&threadpool->mutex);
 }
 
-#endif // GGML_USE_OPENMP
-
 static struct ggml_threadpool * ggml_threadpool_new_impl(
     struct ggml_threadpool_params * tpp,
                struct ggml_cgraph * cgraph,
@@ -3302,13 +3431,13 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     threadpool->workers = workers;
 
 #ifdef GGML_USE_OPENMP
-    int32_t cpumask_iter = 0;
-
-    // Compute CPU masks for each thread
-    for (int j = 0; j < tpp->n_threads; j++) {
-        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
-    }
-#else // GGML_USE_OPENMP
+    if (ggml_omp_available()) {
+        int32_t cpumask_iter = 0;
+        for (int j = 0; j < tpp->n_threads; j++) {
+            ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+        }
+    } else {
+#endif
     ggml_mutex_init(&threadpool->mutex);
     ggml_cond_init(&threadpool->cond);
 
@@ -3333,7 +3462,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
             ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
         }
     }
-#endif // GGML_USE_OPENMP
+#ifdef GGML_USE_OPENMP
+    }
+#endif
 
     return threadpool;
 }
@@ -3341,6 +3472,23 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp) {
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
+
+#ifdef GGML_USE_OPENMP
+static void ggml_omp_graph_compute_cb(void * data, int ith, int nth) {
+    struct ggml_threadpool * threadpool = (struct ggml_threadpool *) data;
+
+    if (ith == 0) {
+        atomic_store_explicit(&threadpool->n_graph, nth, memory_order_relaxed);
+    }
+    ggml_omp_rt.barrier();
+
+    ggml_thread_apply_priority(threadpool->prio);
+    if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+        ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
+    }
+    ggml_graph_compute_thread(&threadpool->workers[ith]);
+}
+#endif
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
@@ -3371,40 +3519,23 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     }
 
 #ifdef GGML_USE_OPENMP
-    if (n_threads > 1) {
-        #pragma omp parallel num_threads(n_threads)
-        {
-            #pragma omp single
-            {
-                // update the number of threads from the actual number of threads that we got from OpenMP
-                n_threads = omp_get_num_threads();
-                atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
-            }
-
-            // Apply thread CPU mask and priority
-            int ith = omp_get_thread_num();
-
-            ggml_thread_apply_priority(threadpool->prio);
-            if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
-                ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
-            }
-            ggml_graph_compute_thread(&threadpool->workers[ith]);
+    if (ggml_omp_available()) {
+        if (n_threads > 1) {
+            ggml_omp_rt.parallel(ggml_omp_graph_compute_cb, threadpool, n_threads);
+        } else {
+            atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
+            ggml_graph_compute_thread(&threadpool->workers[0]);
         }
     } else {
-        atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
+#endif
+        if (n_threads > threadpool->n_threads) {
+            GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads);
+            n_threads = threadpool->n_threads;
+        }
+        ggml_graph_compute_kickoff(threadpool, n_threads);
         ggml_graph_compute_thread(&threadpool->workers[0]);
+#ifdef GGML_USE_OPENMP
     }
-#else
-    if (n_threads > threadpool->n_threads) {
-        GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads);
-        n_threads = threadpool->n_threads;
-    }
-
-    // Kick all threads to start the new graph
-    ggml_graph_compute_kickoff(threadpool, n_threads);
-
-    // This is a work thread too
-    ggml_graph_compute_thread(&threadpool->workers[0]);
 #endif
 
     // don't leave affinity set on the main thread
@@ -3840,20 +3971,7 @@ void ggml_cpu_init(void) {
             GGML_PRINT_DEBUG("%s: GELU, Quick GELU, SILU and EXP tables initialized in %f ms\n", __func__, (t_end - t_start)/1000.0);
 
 #ifdef GGML_USE_OPENMP
-            //if (!getenv("OMP_WAIT_POLICY")) {
-            //    // set the wait policy to active, so that OpenMP threads don't sleep
-            //    setenv("OMP_WAIT_POLICY", "active", 0)
-            //}
-
-            if (!getenv("KMP_BLOCKTIME")) {
-                // set the time to wait before sleeping a thread
-                // this is less aggressive than setting the wait policy to active, but should achieve similar results in most cases
-#ifdef _WIN32
-                _putenv_s("KMP_BLOCKTIME", "200"); // 200ms
-#else
-                setenv("KMP_BLOCKTIME", "200", 0); // 200ms
-#endif
-            }
+            ggml_omp_rt_init();
 #endif
         }
 

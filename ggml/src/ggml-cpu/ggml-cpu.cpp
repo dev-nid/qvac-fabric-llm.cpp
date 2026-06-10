@@ -624,7 +624,7 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
         features.push_back({ "CPU_HBM", "1" });
     #endif
     #ifdef GGML_USE_OPENMP
-        features.push_back({ "OPENMP", "1" });
+        features.push_back({ "OPENMP", "runtime" });
     #endif
     #ifdef GGML_USE_CPU_KLEIDIAI
         features.push_back({ "KLEIDIAI", "1" });

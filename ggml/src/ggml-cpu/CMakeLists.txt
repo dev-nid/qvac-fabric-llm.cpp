@@ -76,9 +76,26 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         find_package(OpenMP)
         if (OpenMP_FOUND)
             set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
+            # GGML_USE_OPENMP now means "include runtime shim loader code"
+            # — ggml-cpu is NOT linked to OpenMP directly.
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
 
-            target_link_libraries(${GGML_CPU_NAME} PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+            # Build the shim as a separate shared library WITH OpenMP
+            if (NOT TARGET ggml-omp-shim)
+                add_library(ggml-omp-shim SHARED
+                    ggml-cpu/ggml-omp-shim.c)
+                target_include_directories(ggml-omp-shim PRIVATE ggml-cpu)
+                target_link_libraries(ggml-omp-shim PRIVATE OpenMP::OpenMP_C)
+                target_compile_definitions(ggml-omp-shim PRIVATE GGML_OMP_SHIM_BUILD)
+                set_target_properties(ggml-omp-shim PROPERTIES
+                    POSITION_INDEPENDENT_CODE ON
+                    OUTPUT_NAME "ggml-omp-shim"
+                )
+                install(TARGETS ggml-omp-shim
+                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+                )
+            endif()
         else()
             set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
             message(WARNING "OpenMP not found")

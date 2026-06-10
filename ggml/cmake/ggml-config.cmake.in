@@ -18,10 +18,8 @@ if (NOT GGML_SHARED_LIB)
         list(APPEND GGML_CPU_INTERFACE_LINK_LIBRARIES ${ACCELERATE_FRAMEWORK})
     endif()
 
-    if (GGML_OPENMP_ENABLED)
-        find_dependency(OpenMP)
-        list(APPEND GGML_CPU_INTERFACE_LINK_LIBRARIES OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
-    endif()
+    # OpenMP is now runtime-loaded via the shim library.
+    # Downstream consumers do NOT need to link OpenMP.
 
     if (GGML_CPU_HBM)
         find_library(memkind memkind)
