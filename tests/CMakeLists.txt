@@ -143,6 +143,10 @@ if (NOT WIN32)
     )
 endif()
 
+# POC vector-index smoke test (turbovec POC, ggml-vector-index.h). Standalone
+# C-API exercise: no model required, no llama runtime touched.
+llama_build_and_test(test-vector-index.cpp)
+
 if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
