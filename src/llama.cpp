@@ -1138,8 +1138,13 @@ struct llama_model * llama_model_load_from_file(
         const char * path_model,
         struct llama_model_params params) {
     std::vector<std::string> splits = {};
-    llama_model_loader ml = create_disk_fileloader(path_model, splits, params);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, /*file*/ nullptr, params);
+    try {
+        llama_model_loader ml = create_disk_fileloader(path_model, splits, params);
+        return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, /*file*/ nullptr, params);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
+        return nullptr;
+    }
 }
 
 static void override_and_disable_mmap(struct llama_model_params & params) {
@@ -1270,8 +1275,13 @@ struct llama_model * llama_model_load_from_splits(
     if (splits.empty()) {
         return nullptr;
     }
-    llama_model_loader ml = create_disk_fileloader(splits.front().c_str(), splits, params);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, /*file*/ nullptr, params);
+    try {
+        llama_model_loader ml = create_disk_fileloader(splits.front().c_str(), splits, params);
+        return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, /*file*/ nullptr, params);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
+        return nullptr;
+    }
 }
 
 struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_model_params params) {
