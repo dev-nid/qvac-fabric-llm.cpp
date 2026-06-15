@@ -111,7 +111,7 @@ GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 //
 //   offset  size   field
 //   ------  -----  -------------------------------------------------------
-//   0       4      magic = "TVPI" (0x49, 0x50, 0x56, 0x54)
+//   0       4      magic = "TVPI" (bytes 0x54, 0x56, 0x50, 0x49)
 //   4       1      version = 1
 //   5       1      bit_width
 //   6       2      reserved (zero)
