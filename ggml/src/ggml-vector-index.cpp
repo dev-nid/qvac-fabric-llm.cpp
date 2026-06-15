@@ -174,7 +174,7 @@ int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id) {
     return 1;
 }
 
-int ggml_vec_index_contains(ggml_vec_index_t * idx, uint64_t id) {
+int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id) {
     if (idx == nullptr) {
         return 0;
     }
@@ -248,12 +248,12 @@ void search_one(
 } // namespace
 
 int ggml_vec_index_search(
-    ggml_vec_index_t * idx,
-    const float      * queries,
-    int                n_q,
-    int                k,
-    float            * out_scores,
-    uint64_t         * out_ids) {
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    float                  * out_scores,
+    uint64_t               * out_ids) {
 
     if (idx == nullptr || queries == nullptr ||
         out_scores == nullptr || out_ids == nullptr) {

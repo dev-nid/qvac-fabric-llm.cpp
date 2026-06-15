@@ -70,29 +70,31 @@ GGML_API int ggml_vec_index_add(
 // negative on error.
 GGML_API int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id);
 
-// Returns 1 if the id is in the index, 0 otherwise.
-GGML_API int ggml_vec_index_contains(ggml_vec_index_t * idx, uint64_t id);
+// Returns 1 if the id is in the index, 0 otherwise. Read-only.
+GGML_API int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id);
 
 // No-op for the POC. Placeholder for future cache warming / codebook
-// resolution after a bulk add.
+// resolution after a bulk add. Reserved as a mutating op (warm-up may
+// materialize derived state inside the index).
 GGML_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 
 // Top-k search. `queries` is `n_q * dim` row-major. `out_scores` and
 // `out_ids` are caller-allocated buffers of size `n_q * k`. Each row is
 // sorted descending by score (higher = closer / more similar). If the index
 // holds fewer than k entries, the remaining slots in each row are filled
-// with sentinel values: -FLT_MAX for scores, UINT64_MAX for ids.
+// with sentinel values: -FLT_MAX for scores, UINT64_MAX for ids. Read-only
+// against the index (does not mutate state).
 //
 // Score semantics: scalar full-precision dot product. Callers that want
 // cosine similarity must L2-normalize their vectors before insert AND
 // before query; the index does NOT normalize internally.
 GGML_API int ggml_vec_index_search(
-    ggml_vec_index_t * idx,
-    const float      * queries,
-    int                n_q,
-    int                k,
-    float            * out_scores,
-    uint64_t         * out_ids);
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    float                  * out_scores,
+    uint64_t               * out_ids);
 
 // Persistence. Format is .tvim version 1; see bottom of this header.
 GGML_API int ggml_vec_index_write(
