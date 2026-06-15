@@ -42,12 +42,22 @@
 #include <omp.h>
 #endif
 
-#if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
-#undef GGML_USE_LLAMAFILE
-#endif
+// NOTE: upstream disables llamafile/tinyBLAS when SVE or i8mm are compiled in
+// (the repacked quant paths are preferred for LLM workloads there), but for
+// large F16xF16 GEMMs (conv im2col) tinyBLAS is the only blocked GEMM
+// available, so it is kept enabled here. OCR_NO_LLAMAFILE=1 disables it at
+// runtime for A/B measurement.
 
 #ifdef GGML_USE_LLAMAFILE
 #include "llamafile/sgemm.h"
+
+static bool ggml_ocr_llamafile_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("OCR_NO_LLAMAFILE") == NULL ? 1 : 0;
+    }
+    return enabled == 1;
+}
 #endif
 
 // Note: once we move threading into a separate C++ file
@@ -1355,7 +1365,7 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (src1_cont) {
+    if (src1_cont && ggml_ocr_llamafile_enabled()) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1384,7 +1394,7 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1403,9 +1413,28 @@ UseGgmlGemm1:;
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+                    if (src1->type == GGML_TYPE_F32) {
+                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                                   (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                                   (ne10_block_end - ne10_block_start) * bs);
+                    } else {
+                        // F16 src1 feeding a quantized src0 (e.g. an f16
+                        // im2col against Q8_0 conv weights): convert to f32
+                        // in cache-sized chunks, then quantize into wdata.
+                        const ggml_fp16_t * x16 = (const ggml_fp16_t *)((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11) + ne10_block_start*bs;
+                        char  * wrow = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
+                        const int64_t n = (ne10_block_end - ne10_block_start) * bs;
+                        float tmp_f32[1024]; // multiple of every block size
+                        int64_t done = 0;
+                        while (done < n) {
+                            const int64_t chunk = MIN(n - done, (int64_t) 1024);
+                            for (int64_t k = 0; k < chunk; ++k) {
+                                tmp_f32[k] = GGML_CPU_FP16_TO_FP32(x16[done + k]);
+                            }
+                            from_float(tmp_f32, (void *)(wrow + (done/bs)*nbw0), chunk);
+                            done += chunk;
+                        }
+                    }
                 }
             }
         }
@@ -1420,7 +1449,7 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
+    if (src1->type != vec_dot_type && ggml_ocr_llamafile_enabled()) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -3091,6 +3120,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    // OCR_CPU_PROF=1: per-op wall-clock accumulation on thread 0 (the barrier
+    // after each node makes thread-0 time representative of node wall time).
+    // One [CPUPROF] summary log line per graph compute.
+    const bool ocr_prof = state->ith == 0 && getenv("OCR_CPU_PROF") != NULL;
+    int64_t ocr_prof_us [GGML_OP_COUNT] = {0};
+    int32_t ocr_prof_cnt[GGML_OP_COUNT] = {0};
+    int64_t ocr_prof_total = 0;
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3103,7 +3140,86 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
-        ggml_compute_forward(&params, node);
+        const int64_t ocr_prof_t0 = ocr_prof ? ggml_time_us() : 0;
+
+        // Collapse CONV_2D -> ADD(per-channel bias) [-> UNARY(relu|hardswish)]
+        // chains into one fused kernel call: the bias add and activation are
+        // applied while the GEMM result is still hot instead of as separate
+        // full-tensor passes. The decision depends only on the (shared) graph,
+        // so every thread takes the same branch and the per-node barriers stay
+        // in sync; the skipped nodes' outputs are never read (single use,
+        // checked by ggml_can_fuse).
+        int fuse_extra = 0;
+        int32_t fuse_act = -1;
+        const struct ggml_tensor * fuse_bias = NULL;
+        struct ggml_tensor * fuse_out = NULL;
+        if (node->op == GGML_OP_CONV_2D) {
+            static const enum ggml_op fuse_ops3[3] = {GGML_OP_CONV_2D, GGML_OP_ADD, GGML_OP_UNARY};
+            static const enum ggml_op fuse_ops2[2] = {GGML_OP_CONV_2D, GGML_OP_ADD};
+            if (ggml_can_fuse(cgraph, node_n, fuse_ops3, 3)) {
+                struct ggml_tensor * unary_node = cgraph->nodes[node_n + 2];
+                const enum ggml_unary_op uop = ggml_get_unary_op(unary_node);
+                if ((uop == GGML_UNARY_OP_RELU || uop == GGML_UNARY_OP_HARDSWISH) &&
+                    unary_node->type == GGML_TYPE_F32) {
+                    fuse_extra = 2;
+                    fuse_act   = (int32_t) uop;
+                    fuse_out   = unary_node;
+                }
+            }
+            if (fuse_extra == 0 && ggml_can_fuse(cgraph, node_n, fuse_ops2, 2)) {
+                fuse_extra = 1;
+                fuse_out   = cgraph->nodes[node_n + 1];
+            }
+            if (fuse_extra > 0) {
+                const struct ggml_tensor * add_node = cgraph->nodes[node_n + 1];
+                const struct ggml_tensor * bias =
+                    add_node->src[0] == node ? add_node->src[1] : add_node->src[0];
+                // require ADD to broadcast a contiguous F32 [1,1,OC,1] row over
+                // the conv output (the conv must be the full-shape operand)
+                if (add_node->src[0] == node && add_node->type == GGML_TYPE_F32 &&
+                    bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
+                    bias->ne[0] == 1 && bias->ne[1] == 1 &&
+                    bias->ne[2] == node->ne[2] && bias->ne[3] == 1) {
+                    fuse_bias = bias;
+                } else {
+                    fuse_extra = 0;
+                    fuse_act   = -1;
+                    fuse_out   = NULL;
+                }
+            }
+        }
+
+        // Standalone ADD(per-channel bias) -> UNARY(relu|hardswish) pairs (e.g.
+        // after the explicit im2col+mul_mat conv lowering) fuse into one pass.
+        if (fuse_extra == 0 && node->op == GGML_OP_ADD) {
+            static const enum ggml_op fuse_au[2] = {GGML_OP_ADD, GGML_OP_UNARY};
+            if (ggml_can_fuse(cgraph, node_n, fuse_au, 2)) {
+                struct ggml_tensor * unary_node = cgraph->nodes[node_n + 1];
+                const enum ggml_unary_op uop = ggml_get_unary_op(unary_node);
+                const struct ggml_tensor * a0 = node->src[0];
+                const struct ggml_tensor * a1 = node->src[1];
+                if ((uop == GGML_UNARY_OP_RELU || uop == GGML_UNARY_OP_HARDSWISH) &&
+                    node->type == GGML_TYPE_F32 && unary_node->type == GGML_TYPE_F32 &&
+                    a0->type == GGML_TYPE_F32 && a1->type == GGML_TYPE_F32 &&
+                    ggml_are_same_shape(node, a0) &&
+                    ggml_is_contiguous(a0) && ggml_is_contiguous(a1) &&
+                    ggml_is_contiguous(unary_node) &&
+                    a1->ne[0] == 1 && a1->ne[1] == 1 &&
+                    a1->ne[2] == a0->ne[2] && a1->ne[3] == 1) {
+                    fuse_extra = 1;
+                    fuse_act   = (int32_t) uop;
+                    fuse_out   = unary_node;
+                    ggml_compute_forward_add_unary_fused(&params, node, fuse_act, fuse_out);
+                    node_n += fuse_extra;
+                }
+            }
+        } else if (fuse_extra > 0) {
+            ggml_compute_forward_conv_2d_fused(&params, node, fuse_bias, fuse_act, fuse_out);
+            node_n += fuse_extra;
+        }
+        if (fuse_extra == 0) {
+            ggml_compute_forward(&params, node);
+        }
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
@@ -3114,6 +3230,31 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+
+        if (ocr_prof) {
+            const int64_t ocr_prof_dt = ggml_time_us() - ocr_prof_t0;
+            ocr_prof_us [node->op] += ocr_prof_dt;
+            ocr_prof_cnt[node->op] += 1;
+            ocr_prof_total         += ocr_prof_dt;
+        }
+    }
+
+    if (ocr_prof && ocr_prof_total > 0) {
+        char ocr_prof_buf[768];
+        int  ocr_prof_off = snprintf(ocr_prof_buf, sizeof(ocr_prof_buf),
+            "[CPUPROF] nodes=%d total=%lldus", cgraph->n_nodes, (long long) ocr_prof_total);
+        for (int i = 0; i < GGML_OP_COUNT; i++) {
+            // report ops contributing >=1% of graph time
+            if (ocr_prof_us[i] * 100 >= ocr_prof_total && ocr_prof_off < (int) sizeof(ocr_prof_buf)) {
+                ocr_prof_off += snprintf(ocr_prof_buf + ocr_prof_off,
+                    sizeof(ocr_prof_buf) - (size_t) ocr_prof_off, " %s=%lldus/%d",
+                    ggml_op_name((enum ggml_op) i), (long long) ocr_prof_us[i], ocr_prof_cnt[i]);
+            }
+        }
+        GGML_LOG_WARN("%s\n", ocr_prof_buf);
+#ifndef __ANDROID__
+        fprintf(stderr, "%s\n", ocr_prof_buf);
+#endif
     }
 
 #ifdef GGML_USE_OPENMP

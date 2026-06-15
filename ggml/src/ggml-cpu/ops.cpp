@@ -6491,13 +6491,30 @@ static void ggml_compute_forward_im2col_f32(
     GGML_ASSERT(nb10 == sizeof(float));
 
     // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
+    //
+    // Parallelised over output rows (in, ioh): each thread writes complete,
+    // contiguous destination rows. (The previous channel-strided split made
+    // every thread write into every output row — false sharing on rows
+    // shorter than a few cache lines, e.g. 1x1 kernels with small IC.)
+    // When there are fewer rows than threads (1-D convs with a small batch
+    // have OH == 1), fall back to the channel-strided split so the work is
+    // still spread across threads.
     {
         float * const wdata = (float *) dst->data;
 
-        for (int64_t in = 0; in < N; in++) {
-            for (int64_t ioh = 0; ioh < OH; ioh++) { // 1
+        const int64_t rows_total      = N*OH;
+        const bool    by_row          = rows_total >= nth;
+        const int64_t rows_per_thread = (rows_total + nth - 1)/nth;
+        const int64_t ir0             = by_row ? rows_per_thread*ith : 0;
+        const int64_t ir1             = by_row ? MIN(ir0 + rows_per_thread, rows_total) : rows_total;
+        const int64_t ic_first        = by_row ? 0 : ith;
+        const int64_t ic_step         = by_row ? 1 : nth;
+
+        for (int64_t ir = ir0; ir < ir1; ir++) {
+            const int64_t in  = ir / OH;
+            const int64_t ioh = ir % OH;
                 for (int64_t iow = 0; iow < OW; iow++) {
-                    for (int64_t iic = ith; iic < IC; iic += nth) {
+                    for (int64_t iic = ic_first; iic < IC; iic += ic_step) {
 
                         // micro kernel
                         float * dst_data = wdata + (in*OH*OW + ioh*OW + iow)*(IC*KH*KW); // [IC, KH, KW]
@@ -6517,7 +6534,6 @@ static void ggml_compute_forward_im2col_f32(
                         }
                     }
                 }
-            }
         }
     }
 }
@@ -6568,14 +6584,104 @@ static void ggml_compute_forward_im2col_f16(
     GGML_ASSERT(nb00 == sizeof(ggml_fp16_t));
     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
 
+    // 1x1/stride-1/no-pad convolutions reduce im2col to a pure
+    // [IC, P] -> [P, IC] transpose (P = OH*OW pixels) with an optional
+    // fp32 -> fp16 conversion. The generic path below recomputes index
+    // arithmetic and bounds checks per element; this tight blocked loop is
+    // markedly faster and is the dominant im2col shape in pointwise-heavy
+    // CNNs (MobileNet expand/project convs).
+    if (is_2D && KW == 1 && KH == 1 && s0 == 1 && s1 == 1 && p0 == 0 && p1 == 0 &&
+        OW == IW && OH == IH) {
+        ggml_fp16_t * const wdata = (ggml_fp16_t *) dst->data;
+        const int64_t P = OH*OW;
+        // pixel blocks: each thread owns whole blocks so writes never share
+        // cache lines. Channels are additionally swept in BLK_C-wide chunks
+        // so the strided write tile (BLK x BLK_C fp16 = 8 KB) stays
+        // L1-resident even for wide layers (a full-IC sweep at IC ~1000 would
+        // touch ~0.5 MB per pixel block and thrash L1).
+        const int64_t BLK = 64;
+        const int64_t BLK_C = 64;
+        const int64_t blocks_total      = N*((P + BLK - 1)/BLK);
+        const int64_t blocks_per_thread = (blocks_total + nth - 1)/nth;
+        const int64_t ib0               = blocks_per_thread*ith;
+        const int64_t ib1               = MIN(ib0 + blocks_per_thread, blocks_total);
+        const int64_t blocks_per_image  = (P + BLK - 1)/BLK;
+
+        for (int64_t ib = ib0; ib < ib1; ib++) {
+            const int64_t in  = ib / blocks_per_image;
+            const int64_t ipb = (ib % blocks_per_image)*BLK;
+            const int64_t len = MIN(BLK, P - ipb);
+            ggml_fp16_t * dst_blk = wdata + (in*P + ipb)*IC;
+            for (int64_t icb = 0; icb < IC; icb += BLK_C) {
+            const int64_t ic_end = MIN(icb + BLK_C, IC);
+            int64_t iic = icb;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+            // channel pairs x 4 pixels per iteration: two vectorized
+            // f32->f16 conversions + a zip turn each pixel's channel pair
+            // into one 32-bit lane store (halves the strided-store count)
+            if (src1->type == GGML_TYPE_F32) {
+                for (; iic + 1 < ic_end; iic += 2) {
+                    const float * s0 = (const float *)((const char *) src1->data + in*ofs0 + (iic + 0)*ofs1) + ipb;
+                    const float * s1 = (const float *)((const char *) src1->data + in*ofs0 + (iic + 1)*ofs1) + ipb;
+                    ggml_fp16_t * d = dst_blk + iic;
+                    int64_t p = 0;
+                    for (; p + 3 < len; p += 4) {
+                        const float16x4_t h0 = vcvt_f16_f32(vld1q_f32(s0 + p));
+                        const float16x4_t h1 = vcvt_f16_f32(vld1q_f32(s1 + p));
+                        const uint16x4x2_t z = vzip_u16(vreinterpret_u16_f16(h0), vreinterpret_u16_f16(h1));
+                        const uint32x2_t z0 = vreinterpret_u32_u16(z.val[0]);
+                        const uint32x2_t z1 = vreinterpret_u32_u16(z.val[1]);
+                        vst1_lane_u32((uint32_t *)(void *)(d + (p + 0)*IC), z0, 0);
+                        vst1_lane_u32((uint32_t *)(void *)(d + (p + 1)*IC), z0, 1);
+                        vst1_lane_u32((uint32_t *)(void *)(d + (p + 2)*IC), z1, 0);
+                        vst1_lane_u32((uint32_t *)(void *)(d + (p + 3)*IC), z1, 1);
+                    }
+                    for (; p < len; p++) {
+                        d[p*IC + 0] = GGML_CPU_FP32_TO_FP16(s0[p]);
+                        d[p*IC + 1] = GGML_CPU_FP32_TO_FP16(s1[p]);
+                    }
+                }
+            }
+#endif // __aarch64__ && __ARM_NEON
+            for (; iic < ic_end; iic++) {
+                ggml_fp16_t * dst_col = dst_blk + iic;
+                if (src1->type == GGML_TYPE_F32) {
+                    const float * src_px = (const float *)((const char *) src1->data + in*ofs0 + iic*ofs1) + ipb;
+                    for (int64_t p = 0; p < len; p++) {
+                        dst_col[p*IC] = GGML_CPU_FP32_TO_FP16(src_px[p]);
+                    }
+                } else {
+                    const ggml_fp16_t * src_px = (const ggml_fp16_t *)((const char *) src1->data + in*ofs0 + iic*ofs1) + ipb;
+                    for (int64_t p = 0; p < len; p++) {
+                        dst_col[p*IC] = src_px[p];
+                    }
+                }
+            }
+            } // channel block
+        }
+        return;
+    }
+
     // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
+    //
+    // Parallelised over output rows (in, ioh) — see im2col_f32 above (incl.
+    // the channel-strided fallback for row counts below the thread count).
     {
         ggml_fp16_t * const wdata = (ggml_fp16_t *) dst->data;
 
-        for (int64_t in = 0; in < N; in++) {
-            for (int64_t ioh = 0; ioh < OH; ioh++) { // 1
+        const int64_t rows_total      = N*OH;
+        const bool    by_row          = rows_total >= nth;
+        const int64_t rows_per_thread = (rows_total + nth - 1)/nth;
+        const int64_t ir0             = by_row ? rows_per_thread*ith : 0;
+        const int64_t ir1             = by_row ? MIN(ir0 + rows_per_thread, rows_total) : rows_total;
+        const int64_t ic_first        = by_row ? 0 : ith;
+        const int64_t ic_step         = by_row ? 1 : nth;
+
+        for (int64_t ir = ir0; ir < ir1; ir++) {
+            const int64_t in  = ir / OH;
+            const int64_t ioh = ir % OH;
                 for (int64_t iow = 0; iow < OW; iow++) {
-                    for (int64_t iic = ith; iic < IC; iic += nth) {
+                    for (int64_t iic = ic_first; iic < IC; iic += ic_step) {
 
                         // micro kernel
                         ggml_fp16_t * dst_data = wdata + (in*OH*OW + ioh*OW + iow)*(IC*KH*KW); // [IC, KH, KW]
@@ -6604,7 +6710,6 @@ static void ggml_compute_forward_im2col_f16(
                         }
                     }
                 }
-            }
         }
     }
 }
@@ -6980,7 +7085,12 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
                                               const ggml_tensor *         kernel,  // [KW, KH, IC, OC]
                                               const ggml_tensor *         src,     // [W, H, C, N]
                                               ggml_tensor *               dst,     // [OW, OH, OC, N]
-                                              ggml_type                   kernel_type) {
+                                              ggml_type                   kernel_type,
+                                              // optional fused epilogue (see
+                                              // ggml_compute_forward_conv_2d_fused):
+                                              const ggml_tensor *         fuse_bias, // F32 [1,1,OC,1] or NULL
+                                              int32_t                     fuse_act,  // ggml_unary_op or -1
+                                              ggml_tensor *               out) {     // final destination
 
     GGML_ASSERT(ggml_is_contiguous(kernel));
     GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32);
@@ -7008,7 +7118,8 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
 
     const float * src_data = (float *) src->data;
     void  * knl_data       = kernel->data;
-    float * dst_data       = (float *) dst->data;
+    float * dst_data       = (float *) out->data;
+    const float * bias_data = fuse_bias ? (const float *) fuse_bias->data : NULL;
 
     const int64_t knl_n           = knl_w * knl_h * c_in;
     const int64_t patch_total     = dst->ne[3] * dst_w * dst_h;
@@ -7093,8 +7204,21 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
             const int64_t dst_x   = p % dst_w;
 
             for (int64_t oc = 0; oc < c_out; ++oc) {
-                const float value = gemm_output[i * c_out + oc];
-                float * dst_ptr = (float *)((char *)dst_data + dst_x * dst->nb[0] + dst_y * dst->nb[1] + oc * dst->nb[2] + batch_n * dst->nb[3]);
+                float value = gemm_output[i * c_out + oc];
+                // fused epilogue: per-channel bias add + activation applied
+                // while the GEMM result is still in registers, instead of as
+                // separate full-tensor ADD / UNARY graph passes
+                if (bias_data) {
+                    value += bias_data[oc];
+                }
+                if (fuse_act == (int32_t) GGML_UNARY_OP_RELU) {
+                    // matches op_relu in unary-ops.cpp
+                    value = value > 0.f ? value : 0.f;
+                } else if (fuse_act == (int32_t) GGML_UNARY_OP_HARDSWISH) {
+                    // bit-identical to op_hardswish in unary-ops.cpp
+                    value = value * fminf(1.0f, fmaxf(0.0f, (value + 3.0f) / 6.0f));
+                }
+                float * dst_ptr = (float *)((char *)dst_data + dst_x * out->nb[0] + dst_y * out->nb[1] + oc * out->nb[2] + batch_n * out->nb[3]);
                 *dst_ptr = value;
             }
         }
@@ -7108,7 +7232,74 @@ void ggml_compute_forward_conv_2d(
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    ggml_compute_forward_conv_2d_impl(params, src0, src1, dst, src0->type);
+    ggml_compute_forward_conv_2d_impl(params, src0, src1, dst, src0->type, NULL, -1, dst);
+}
+
+void ggml_compute_forward_conv_2d_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * conv_dst,
+        const ggml_tensor * fuse_bias,
+        int32_t fuse_act,
+        ggml_tensor * out) {
+
+    const ggml_tensor * src0 = conv_dst->src[0];
+    const ggml_tensor * src1 = conv_dst->src[1];
+
+    ggml_compute_forward_conv_2d_impl(params, src0, src1, conv_dst, src0->type, fuse_bias, fuse_act, out);
+}
+
+// Fused ADD(per-channel bias broadcast) + UNARY(relu|hardswish): one pass over
+// the tensor instead of two full read+write passes. Caller (the graph-compute
+// loop) guarantees: add_dst = src0 (full tensor, F32, contiguous) + src1
+// (F32 contiguous [1,1,C,1] with C == src0->ne[2]); out has the same shape.
+void ggml_compute_forward_add_unary_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * add_dst,
+        int32_t fuse_act,
+        ggml_tensor * out) {
+
+    const ggml_tensor * src0 = add_dst->src[0];
+    const ggml_tensor * src1 = add_dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(out->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(out));
+    GGML_ASSERT(ggml_are_same_shape(src0, out));
+
+    const int64_t ne0 = src0->ne[0];
+    const int64_t ne1 = src0->ne[1];
+    const int64_t ne2 = src0->ne[2];
+    const int64_t ne3 = src0->ne[3];
+    const float * bias = (const float *) src1->data;
+
+    const int64_t rows_total = ne1*ne2*ne3;
+    const int64_t rows_per_thread = (rows_total + params->nth - 1)/params->nth;
+    const int64_t ir0 = rows_per_thread*params->ith;
+    const int64_t ir1 = MIN(ir0 + rows_per_thread, rows_total);
+
+    for (int64_t ir = ir0; ir < ir1; ir++) {
+        const int64_t i2 = (ir / ne1) % ne2;
+        const float v = bias[i2];
+        const float * x = (const float *) src0->data + ir*ne0;
+        float       * y = (float *)        out->data + ir*ne0;
+        if (fuse_act == (int32_t) GGML_UNARY_OP_RELU) {
+            for (int64_t i0 = 0; i0 < ne0; i0++) {
+                const float t = x[i0] + v;
+                // matches op_relu in unary-ops.cpp
+                y[i0] = t > 0.f ? t : 0.f;
+            }
+        } else if (fuse_act == (int32_t) GGML_UNARY_OP_HARDSWISH) {
+            for (int64_t i0 = 0; i0 < ne0; i0++) {
+                const float t = x[i0] + v;
+                // bit-identical to op_hardswish in unary-ops.cpp
+                y[i0] = t * fminf(1.0f, fmaxf(0.0f, (t + 3.0f) / 6.0f));
+            }
+        } else {
+            for (int64_t i0 = 0; i0 < ne0; i0++) {
+                y[i0] = x[i0] + v;
+            }
+        }
+    }
 }
 
 // ggml_compute_forward_conv_3d
@@ -7295,29 +7486,75 @@ static void ggml_compute_forward_conv_transpose_2d_impl(
             }
         }
 
-        // permute source data (src1) from (Sw x Sh x Cin) to (Cin x Sw x Sh)
-        {
-            kernel_t * const wdata = (kernel_t *) params->wdata + nk;
-            for (int i12 = 0; i12 < ne12; i12++) {
-                for (int i11 = 0; i11 < ne11; i11++) {
-                    const float * const src = (float *)((char *) src1->data + i12*nb12 + i11*nb11);
-                    kernel_t * dst_data = wdata + i11*ne10*ne12;
-                    for (int i10 = 0; i10 < ne10; i10++) {
-                        if constexpr (std::is_same_v<kernel_t, ggml_fp16_t>) {
-                            dst_data[i10*ne12 + i12] = GGML_CPU_FP32_TO_FP16(src[i10]);
-                        } else {
-                            dst_data[i10*ne12 + i12] = src[i10];
-                        }
-                    }
-                }
-            }
-        }
-
         memset(dst->data, 0, ggml_nbytes(dst));
     }
     ggml_barrier(params->threadpool);
 
+    // permute source data (src1) from (Sw x Sh x Cin) to (Cin x Sw x Sh),
+    // rows (i11) split across threads
+    {
+        kernel_t * const wdata = (kernel_t *) params->wdata + nk;
+        const int rows_per_thread = (ne11 + nth - 1)/nth;
+        const int ir0 = rows_per_thread*ith;
+        const int ir1 = MIN(ir0 + rows_per_thread, ne11);
+        for (int i12 = 0; i12 < ne12; i12++) {
+            for (int i11 = ir0; i11 < ir1; i11++) {
+                const float * const src = (float *)((char *) src1->data + i12*nb12 + i11*nb11);
+                kernel_t * dst_data = wdata + i11*ne10*ne12;
+                for (int i10 = 0; i10 < ne10; i10++) {
+                    if constexpr (std::is_same_v<kernel_t, ggml_fp16_t>) {
+                        dst_data[i10*ne12 + i12] = GGML_CPU_FP32_TO_FP16(src[i10]);
+                    } else {
+                        dst_data[i10*ne12 + i12] = src[i10];
+                    }
+                }
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+
     const int32_t stride = ggml_get_op_params_i32(dst, 0);
+
+    kernel_t * const wdata = (kernel_t *) params->wdata + 0;
+    kernel_t * const wdata_src = wdata + nk;
+
+    // Distinct source rows i11 write to distinct output rows (i11*stride+i01)
+    // when the kernel height fits within the stride, so (Cout x src-row)
+    // tasks can be split across threads. This matters when Cout is tiny
+    // (e.g. a Cout=1 upsampling head, which would otherwise run on a single
+    // thread). Fall back to the per-Cout split when kernel rows overlap.
+    if (ne01 <= stride) {
+        const int np = ne2*ne11;
+        const int dp = (np + nth - 1)/nth;
+        const int ip0 = dp*ith;
+        const int ip1 = MIN(ip0 + dp, np);
+
+        for (int ip = ip0; ip < ip1; ip++) {
+            const int i2  = ip / ne11; // Cout
+            const int i11 = ip % ne11; // src row
+            float * dst_data = (float *)((char *) dst->data + i2*nb2);
+            kernel_t * wdata_kernel = wdata + i2*ne01*ne00*ne03;
+            for (int i10 = 0; i10 < ne10; i10++) {
+                const int i1n = i11*ne10*ne12 + i10*ne12;
+                for (int i01 = 0; i01 < ne01; i01++) {
+                    for (int i00 = 0; i00 < ne00; i00++) {
+                        float v = 0;
+                        if constexpr (std::is_same_v<kernel_t, ggml_fp16_t>) {
+                            ggml_vec_dot_f16(ne03, &v, 0,
+                                    wdata_src + i1n, 0,
+                                    wdata_kernel + i01*ne00*ne03 + i00*ne03, 0, 1);
+                        } else {
+                            ggml_vec_dot_f32(ne03, &v, 0,
+                                    wdata_src + i1n, 0,
+                                    wdata_kernel + i01*ne00*ne03 + i00*ne03, 0, 1);
+                        }
+                        dst_data[(i11*stride + i01)*ne0 + i10*stride + i00] += v;
+                    }
+                }
+            }
+        }
+        return;
+    }
 
     // total patches in dst
     const int np = ne2;
@@ -7328,9 +7565,6 @@ static void ggml_compute_forward_conv_transpose_2d_impl(
     // patch range for this thread
     const int ip0 = dp*ith;
     const int ip1 = MIN(ip0 + dp, np);
-
-    kernel_t * const wdata = (kernel_t *) params->wdata + 0;
-    kernel_t * const wdata_src = wdata + nk;
 
     for (int i2 = ip0; i2 < ip1; i2++) { // Cout
         float * dst_data = (float *)((char *) dst->data + i2*nb2);
@@ -7495,6 +7729,102 @@ static void ggml_compute_forward_conv_2d_dw_whcn(
         const float * knl_data = (const float *)kernel->data + (i % p.channels) * p.knl_w * p.knl_h;
         const float * src_data = (const float *)src->data + i * p.src_w * p.src_h;
         float * dst_data = (float *)dst->data + i * p.dst_w * p.dst_h;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        // Explicit 128-bit NEON (always available on aarch64, including SVE
+        // builds where the GGML_F32_VEC macros are unusable for fixed-width
+        // loops: GGML_F32_EPR is 8 there but svld1 only fills the hardware
+        // vector length).
+        #define OCR_DW_VEC          float32x4_t
+        #define OCR_DW_EPR          4
+        #define OCR_DW_VEC_ZERO     vdupq_n_f32(0.0f)
+        #define OCR_DW_VEC_SET1(x)  vdupq_n_f32(x)
+        #define OCR_DW_VEC_LOAD(x)  vld1q_f32(x)
+        #define OCR_DW_VEC_FMA(a, b, c) vfmaq_f32(a, b, c)
+        #define OCR_DW_VEC_STORE(p, v)  vst1q_f32(p, v)
+#elif defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE)
+        #define OCR_DW_VEC          GGML_F32_VEC
+        #define OCR_DW_EPR          GGML_F32_EPR
+        #define OCR_DW_VEC_ZERO     GGML_F32_VEC_ZERO
+        #define OCR_DW_VEC_SET1(x)  GGML_F32_VEC_SET1(x)
+        #define OCR_DW_VEC_LOAD(x)  GGML_F32_VEC_LOAD(x)
+        #define OCR_DW_VEC_FMA(a, b, c) GGML_F32_VEC_FMA(a, b, c)
+        #define OCR_DW_VEC_STORE(p, v)  GGML_F32_VEC_STORE(p, v)
+#endif
+#ifdef OCR_DW_VEC
+        // Vectorized x-interior path for the common unit-stride-x case: each
+        // SIMD lane computes one consecutive dst_x, so kernel taps become
+        // contiguous unaligned row loads. Rows with clipped kernel-y still
+        // vectorize (the ky range is clipped per row); the x edges where the
+        // kernel x-window is clipped fall through to the scalar loop below.
+        if (p.stride_x == 1 && p.dilation_x == 1 && p.dilation_y == 1) {
+            // dst_x in [x_lo, x_hi] has the full kernel x-window in bounds
+            const int64_t x_lo = MIN(p.pad_x, p.dst_w);
+            const int64_t x_hi = MIN(p.src_w - p.knl_w + p.pad_x, p.dst_w - 1);
+            for (int64_t dst_y = 0; dst_y < p.dst_h; ++dst_y) {
+                const int64_t src_y_base = dst_y * p.stride_y - p.pad_y;
+                float * dst_row = dst_data + dst_y * p.dst_w;
+
+                // scalar edges (x < x_lo and x > x_hi) + any row fully scalar
+                for (int64_t dst_x = 0; dst_x < p.dst_w; ++dst_x) {
+                    if (dst_x == x_lo && x_hi >= x_lo) {
+                        dst_x = x_hi; // skip interior; handled vectorized below
+                        continue;
+                    }
+                    float sum = 0.0f;
+                    for (int64_t knl_y = 0; knl_y < p.knl_h; ++knl_y) {
+                        const int64_t src_y = src_y_base + knl_y;
+                        if (src_y < 0 || src_y >= p.src_h) {
+                            continue;
+                        }
+                        for (int64_t knl_x = 0; knl_x < p.knl_w; ++knl_x) {
+                            const int64_t src_x = dst_x + knl_x - p.pad_x;
+                            if (src_x < 0 || src_x >= p.src_w) {
+                                continue;
+                            }
+                            sum += knl_data[knl_y * p.knl_w + knl_x]
+                                 * src_data[src_y * p.src_w + src_x];
+                        }
+                    }
+                    dst_row[dst_x] = sum;
+                }
+
+                int64_t dst_x = x_lo;
+                for (; dst_x + OCR_DW_EPR - 1 <= x_hi; dst_x += OCR_DW_EPR) {
+                    OCR_DW_VEC sum = OCR_DW_VEC_ZERO;
+                    for (int64_t knl_y = 0; knl_y < p.knl_h; ++knl_y) {
+                        const int64_t src_y = src_y_base + knl_y;
+                        if (src_y < 0 || src_y >= p.src_h) {
+                            continue;
+                        }
+                        const float * src_row = src_data + src_y * p.src_w + dst_x - p.pad_x;
+                        for (int64_t knl_x = 0; knl_x < p.knl_w; ++knl_x) {
+                            OCR_DW_VEC k = OCR_DW_VEC_SET1(knl_data[knl_y * p.knl_w + knl_x]);
+                            OCR_DW_VEC s = OCR_DW_VEC_LOAD(src_row + knl_x);
+                            sum = OCR_DW_VEC_FMA(sum, k, s);
+                        }
+                    }
+                    OCR_DW_VEC_STORE(dst_row + dst_x, sum);
+                }
+                // vector-width remainder of the interior, scalar
+                for (; dst_x <= x_hi; ++dst_x) {
+                    float sum = 0.0f;
+                    for (int64_t knl_y = 0; knl_y < p.knl_h; ++knl_y) {
+                        const int64_t src_y = src_y_base + knl_y;
+                        if (src_y < 0 || src_y >= p.src_h) {
+                            continue;
+                        }
+                        for (int64_t knl_x = 0; knl_x < p.knl_w; ++knl_x) {
+                            sum += knl_data[knl_y * p.knl_w + knl_x]
+                                 * src_data[src_y * p.src_w + dst_x + knl_x - p.pad_x];
+                        }
+                    }
+                    dst_row[dst_x] = sum;
+                }
+            }
+            continue;
+        }
+#endif // OCR_DW_VEC
 
         for (int64_t dst_y = 0; dst_y < p.dst_h; ++dst_y) {
             for (int64_t dst_x = 0; dst_x < p.dst_w; ++dst_x) {
@@ -7880,7 +8210,34 @@ static void ggml_compute_forward_upscale_f32(
         sf1 = ne1 > 1 && ne01 > 1 ? (float)(ne1 - 1) / (ne01 - 1) : sf1;
     }
 
-    if (mode == GGML_SCALE_MODE_NEAREST) {
+    if (mode == GGML_SCALE_MODE_NEAREST && nb0 == sizeof(float) && nb00 == sizeof(float)) {
+        // contiguous-row fast path: hoist the row pointers out of the inner
+        // loop and duplicate repeated output rows with a memcpy of the row
+        // just built (values are identical to the generic path: same i0/sf0
+        // index expression, same row data).
+        for (int64_t i3 = 0; i3 < ne3; i3++) {
+            const int64_t i03 = i3 / sf3;
+            for (int64_t i2 = ith; i2 < ne2; i2 += nth) {
+                const int64_t i02 = i2 / sf2;
+                const float * prev_row = NULL;
+                int64_t prev_i01 = -1;
+                for (int64_t i1 = 0; i1 < ne1; i1++) {
+                    const int64_t i01 = i1 / sf1;
+                    float * y_row = (float *)((char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3);
+                    if (i01 == prev_i01) {
+                        memcpy(y_row, prev_row, ne0*sizeof(float));
+                        continue;
+                    }
+                    const float * x_row = (const float *)((const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                    for (int64_t i0 = 0; i0 < ne0; i0++) {
+                        y_row[i0] = x_row[(int64_t)(i0 / sf0)];
+                    }
+                    prev_i01 = i01;
+                    prev_row = y_row;
+                }
+            }
+        }
+    } else if (mode == GGML_SCALE_MODE_NEAREST) {
         for (int64_t i3 = 0; i3 < ne3; i3++) {
             const int64_t i03 = i3 / sf3;
             for (int64_t i2 = ith; i2 < ne2; i2 += nth) {
