@@ -3120,14 +3120,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
-    // OCR_CPU_PROF=1: per-op wall-clock accumulation on thread 0 (the barrier
-    // after each node makes thread-0 time representative of node wall time).
-    // One [CPUPROF] summary log line per graph compute.
-    const bool ocr_prof = state->ith == 0 && getenv("OCR_CPU_PROF") != NULL;
-    int64_t ocr_prof_us [GGML_OP_COUNT] = {0};
-    int32_t ocr_prof_cnt[GGML_OP_COUNT] = {0};
-    int64_t ocr_prof_total = 0;
-
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3139,8 +3131,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
-
-        const int64_t ocr_prof_t0 = ocr_prof ? ggml_time_us() : 0;
 
         // Collapse CONV_2D -> ADD(per-channel bias) [-> UNARY(relu|hardswish)]
         // chains into one fused kernel call: the bias add and activation are
@@ -3230,31 +3220,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
-
-        if (ocr_prof) {
-            const int64_t ocr_prof_dt = ggml_time_us() - ocr_prof_t0;
-            ocr_prof_us [node->op] += ocr_prof_dt;
-            ocr_prof_cnt[node->op] += 1;
-            ocr_prof_total         += ocr_prof_dt;
-        }
-    }
-
-    if (ocr_prof && ocr_prof_total > 0) {
-        char ocr_prof_buf[768];
-        int  ocr_prof_off = snprintf(ocr_prof_buf, sizeof(ocr_prof_buf),
-            "[CPUPROF] nodes=%d total=%lldus", cgraph->n_nodes, (long long) ocr_prof_total);
-        for (int i = 0; i < GGML_OP_COUNT; i++) {
-            // report ops contributing >=1% of graph time
-            if (ocr_prof_us[i] * 100 >= ocr_prof_total && ocr_prof_off < (int) sizeof(ocr_prof_buf)) {
-                ocr_prof_off += snprintf(ocr_prof_buf + ocr_prof_off,
-                    sizeof(ocr_prof_buf) - (size_t) ocr_prof_off, " %s=%lldus/%d",
-                    ggml_op_name((enum ggml_op) i), (long long) ocr_prof_us[i], ocr_prof_cnt[i]);
-            }
-        }
-        GGML_LOG_WARN("%s\n", ocr_prof_buf);
-#ifndef __ANDROID__
-        fprintf(stderr, "%s\n", ocr_prof_buf);
-#endif
     }
 
 #ifdef GGML_USE_OPENMP
