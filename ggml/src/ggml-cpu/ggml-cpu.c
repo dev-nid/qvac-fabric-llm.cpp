@@ -42,22 +42,12 @@
 #include <omp.h>
 #endif
 
-// NOTE: upstream disables llamafile/tinyBLAS when SVE or i8mm are compiled in
-// (the repacked quant paths are preferred for LLM workloads there), but for
-// large F16xF16 GEMMs (conv im2col) tinyBLAS is the only blocked GEMM
-// available, so it is kept enabled here. OCR_NO_LLAMAFILE=1 disables it at
-// runtime for A/B measurement.
+#if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
+#undef GGML_USE_LLAMAFILE
+#endif
 
 #ifdef GGML_USE_LLAMAFILE
 #include "llamafile/sgemm.h"
-
-static bool ggml_ocr_llamafile_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        enabled = getenv("OCR_NO_LLAMAFILE") == NULL ? 1 : 0;
-    }
-    return enabled == 1;
-}
 #endif
 
 // Note: once we move threading into a separate C++ file
@@ -1365,7 +1355,7 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (src1_cont && ggml_ocr_llamafile_enabled()) {
+    if (src1_cont) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1394,7 +1384,7 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1413,28 +1403,9 @@ UseGgmlGemm1:;
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    if (src1->type == GGML_TYPE_F32) {
-                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                                   (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                                   (ne10_block_end - ne10_block_start) * bs);
-                    } else {
-                        // F16 src1 feeding a quantized src0 (e.g. an f16
-                        // im2col against Q8_0 conv weights): convert to f32
-                        // in cache-sized chunks, then quantize into wdata.
-                        const ggml_fp16_t * x16 = (const ggml_fp16_t *)((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11) + ne10_block_start*bs;
-                        char  * wrow = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
-                        const int64_t n = (ne10_block_end - ne10_block_start) * bs;
-                        float tmp_f32[1024]; // multiple of every block size
-                        int64_t done = 0;
-                        while (done < n) {
-                            const int64_t chunk = MIN(n - done, (int64_t) 1024);
-                            for (int64_t k = 0; k < chunk; ++k) {
-                                tmp_f32[k] = GGML_CPU_FP16_TO_FP32(x16[done + k]);
-                            }
-                            from_float(tmp_f32, (void *)(wrow + (done/bs)*nbw0), chunk);
-                            done += chunk;
-                        }
-                    }
+                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                               (ne10_block_end - ne10_block_start) * bs);
                 }
             }
         }
@@ -1449,7 +1420,7 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type && ggml_ocr_llamafile_enabled()) {
+    if (src1->type != vec_dot_type) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
