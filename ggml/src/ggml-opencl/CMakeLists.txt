@@ -132,6 +132,9 @@ set(GGML_OPENCL_KERNELS
     mul
     neg
     norm
+    hardsigmoid
+    hardswish
+    pool_2d
     relu
     l2_norm
     gated_delta_net
@@ -165,6 +168,7 @@ set(GGML_OPENCL_KERNELS
     mul_mm_f16_f32_kq_kqv
     conv2d
     conv2d_f16_f32
+    conv2d_dw
     flash_attn_f32_f16
     flash_attn_f16
     flash_attn_f32
