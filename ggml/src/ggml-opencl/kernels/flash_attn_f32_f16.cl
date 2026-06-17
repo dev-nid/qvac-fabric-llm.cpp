@@ -15,6 +15,78 @@
 #define WG_SIZE (BLOCK_M)
 #define Q1_WG_SIZE 64
 
+// --- Quantized KV dequantization helpers (on-the-fly to half4) ---
+
+#if defined(K_QUANT_Q8_0) || defined(V_QUANT_Q8_0)
+#ifndef QK8_0
+#define QK8_0 32
+#define SIZEOF_BLK_Q8_0 34
+#endif
+inline KV_DATA_TYPE4 dequant_q8_0_half4(const global char * row_ptr, int col) {
+    int elem = col * 4;
+    int bi = elem >> 5;
+    int qi = elem & 31;
+    const global char * blk = row_ptr + bi * SIZEOF_BLK_Q8_0;
+    half d = *(const global half *)blk;
+    uint packed = *(const global uint *)(blk + 2 + qi);
+    return (KV_DATA_TYPE4)(
+        convert_half((char)(packed))       * d,
+        convert_half((char)(packed >> 8))  * d,
+        convert_half((char)(packed >> 16)) * d,
+        convert_half((char)(packed >> 24)) * d
+    );
+}
+#endif
+
+#if defined(K_QUANT_Q4_0) || defined(V_QUANT_Q4_0)
+#ifndef QK4_0
+#define QK4_0 32
+#define SIZEOF_BLK_Q4_0 18
+#endif
+inline KV_DATA_TYPE4 dequant_q4_0_half4(const global char * row_ptr, int col) {
+    int elem = col * 4;
+    int bi = elem >> 5;
+    int qi = elem & 31;
+    const global char * blk = row_ptr + bi * SIZEOF_BLK_Q4_0;
+    half d = *(const global half *)blk;
+    half md = (half)-8.0h * d;
+    uint packed = *(const global uint *)(blk + 2 + (qi < 16 ? qi : qi - 16));
+    if (qi < 16) {
+        return (KV_DATA_TYPE4)(
+            convert_half((uchar)( packed        & 0xF)) * d + md,
+            convert_half((uchar)((packed >>  8) & 0xF)) * d + md,
+            convert_half((uchar)((packed >> 16) & 0xF)) * d + md,
+            convert_half((uchar)((packed >> 24) & 0xF)) * d + md
+        );
+    } else {
+        return (KV_DATA_TYPE4)(
+            convert_half((uchar)(( packed >>  4) & 0xF)) * d + md,
+            convert_half((uchar)(( packed >> 12) & 0xF)) * d + md,
+            convert_half((uchar)(( packed >> 20) & 0xF)) * d + md,
+            convert_half((uchar)(  packed >> 28))        * d + md
+        );
+    }
+}
+#endif
+
+// K load dispatch
+#if defined(K_QUANT_Q8_0)
+#define LOAD_K_VEC4(row_ptr, col) dequant_q8_0_half4(row_ptr, col)
+#elif defined(K_QUANT_Q4_0)
+#define LOAD_K_VEC4(row_ptr, col) dequant_q4_0_half4(row_ptr, col)
+#else
+#define LOAD_K_VEC4(row_ptr, col) ((const global KV_DATA_TYPE4*)(row_ptr))[col]
+#endif
+
+// V load dispatch
+#if defined(V_QUANT_Q8_0)
+#define LOAD_V_VEC4(row_ptr, col) dequant_q8_0_half4(row_ptr, col)
+#elif defined(V_QUANT_Q4_0)
+#define LOAD_V_VEC4(row_ptr, col) dequant_q4_0_half4(row_ptr, col)
+#else
+#define LOAD_V_VEC4(row_ptr, col) ((const global KV_DATA_TYPE4*)(row_ptr))[col]
+#endif
+
 inline float get_alibi_slope(
     const float max_bias, const uint h, const uint n_head_log2, const float m0, const float m1
 ) {
@@ -110,7 +182,7 @@ __kernel void flash_attn_f32_f16(
             const int k_row_idx = k_start + row;
             if (k_row_idx < n_kv) {
                 const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_row_idx * k_nb1;
-                l_k[row][col] = ((__global KV_DATA_TYPE4*)(k_base + k_row_offset))[col];
+                l_k[row][col] = LOAD_K_VEC4(k_base + k_row_offset, col);
             }
         }
         for (int i = tid; i < BLOCK_N * DV_VEC; i += WG_SIZE) {
@@ -119,7 +191,7 @@ __kernel void flash_attn_f32_f16(
             const int v_row_idx = k_start + row;
             if (v_row_idx < n_kv) {
                 const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + v_row_idx * v_nb1;
-                l_v[row][col] = ((__global KV_DATA_TYPE4*)(v_base + v_row_offset))[col];
+                l_v[row][col] = LOAD_V_VEC4(v_base + v_row_offset, col);
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -276,11 +348,10 @@ __kernel void flash_attn_f32_f16_q1(
     ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : -INFINITY;
     for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
         const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
-        const global KV_DATA_TYPE4* k_ptr = (const global KV_DATA_TYPE4*)(k_base + k_row_offset);
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
         #pragma unroll
         for (int k = 0; k < DK_VEC; k++) {
-            dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
+            dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(LOAD_K_VEC4(k_base + k_row_offset, k)), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
         if (mask_base != NULL) {
@@ -311,12 +382,10 @@ __kernel void flash_attn_f32_f16_q1(
     for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
         const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
         const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
-        const global KV_DATA_TYPE4* k_ptr = (const global KV_DATA_TYPE4*)(k_base + k_row_offset);
-        const global KV_DATA_TYPE4* v_ptr = (const global KV_DATA_TYPE4*)(v_base + v_row_offset);
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
         #pragma unroll
         for (int k = 0; k < DK_VEC; k++) {
-            dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
+            dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(LOAD_K_VEC4(k_base + k_row_offset, k)), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
         if (mask_base != NULL) {
@@ -330,7 +399,7 @@ __kernel void flash_attn_f32_f16_q1(
         l_i += p;
         #pragma unroll
         for (int i = 0; i < DV_VEC; i++) {
-            o_acc[i] = mad(p, CONVERT_KV_ACC4(v_ptr[i]), o_acc[i]);
+            o_acc[i] = mad(p, CONVERT_KV_ACC4(LOAD_V_VEC4(v_base + v_row_offset, i)), o_acc[i]);
         }
     }
 

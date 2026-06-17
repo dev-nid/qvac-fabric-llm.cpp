@@ -5,8 +5,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
+#ifdef __cplusplus
 #include <map>
+#endif
 
 // !!! Internal header, to be used by mtmd only !!!
 
@@ -40,9 +41,10 @@ struct clip_context_params {
     int image_min_tokens;
     int image_max_tokens;
     bool warmup;
+    bool has_bf16_weights;
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
-    bool no_alloc;
+    const char * backend_device; // optional, if null will use env var or default GPU backend
 };
 
 struct clip_init_result {
@@ -105,6 +107,8 @@ struct ggml_tensor * clip_get_newline_tensor(const struct clip_ctx * ctx);
 bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, struct clip_image_f32 * img, float * vec);
 bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, float * vec);
 
+int clip_is_minicpmv(const struct clip_ctx * ctx);
+bool clip_is_glm(const struct clip_ctx * ctx);
 bool clip_is_llava(const struct clip_ctx * ctx);
 // note for contributor: this clip_is_(model) pattern is deprecated
 //                       do NOT add new functions like this
@@ -116,11 +120,11 @@ void clip_image_f32_batch_add_mel(struct clip_image_f32_batch * batch, int n_mel
 
 bool clip_has_vision_encoder(const struct clip_ctx * ctx);
 bool clip_has_audio_encoder(const struct clip_ctx * ctx);
+bool clip_has_whisper_encoder(const struct clip_ctx * ctx);
 
+#ifdef __cplusplus
+// qvac: per-device memory usage of an initialised clip_ctx — weight buffers
+// summed with the scheduler's compute reservations. Used by mtmd_get_memory_usage
+// (and ultimately by common/fit.cpp's heuristic). Restored from upstream b9341.
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx);
-
-struct clip_cap {
-    bool has_vision;
-    bool has_audio;
-};
-struct clip_cap clip_get_cap(const char * fname);
+#endif

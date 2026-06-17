@@ -74,18 +74,39 @@ extern "C" {
 
         // if not NULL, create a ggml_context and allocate the tensor data in it
         struct ggml_context ** ctx;
-    };
 
-    // callback to simulate or wrap a FILE pointer - read up to `len` bytes at `offset` into `output` and return the number of bytes read
-    typedef size_t (*gguf_reader_callback_t)(void * userdata, void * output, uint64_t offset, size_t len);
+        // if true, stop parsing immediately after the KV pairs and skip tensor info entirely;
+        // ctx is ignored when this flag is set
+#ifdef __cplusplus
+        bool kv_only = false;
+#else
+        bool kv_only;
+#endif
+    };
 
     GGML_API struct gguf_context * gguf_init_empty(void);
     GGML_API struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_params params);
     GGML_API struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params);
+
+    // qvac: read GGUF from an in-memory buffer (raw pointer + size). Matches the
+    // upstream b9341 signature added in commit 66efd1337; our rebase silently
+    // dropped it when a streambuf-based variant from our patch chain took
+    // precedence. Kept alongside the streambuf overload defined below.
     GGML_API struct gguf_context * gguf_init_from_buffer(const void * data, size_t size, struct gguf_init_params params);
 
-    // max_chunk_read is the maximum number of bytes that the GGUF code will read at once from the callback, a value of 0 means no limit
-    GGML_API struct gguf_context * gguf_init_from_callback(gguf_reader_callback_t callback, void * userdata, size_t max_chunk_read, uint64_t max_expected_size, struct gguf_init_params params);
+    // qvac: read GGUF via a chunked callback. The callback is invoked with
+    // (userdata, output, offset, len) and must copy `len` bytes from logical
+    // offset `offset` into `output`, returning the number of bytes written
+    // (0 indicates failure / out-of-range).
+    //   chunk_size: granularity at which the reader requests bytes
+    //   max_size : an upper bound on the logical byte count (safety cap)
+    typedef size_t (*gguf_read_callback_t)(void * userdata, void * output, uint64_t offset, size_t len);
+    GGML_API struct gguf_context * gguf_init_from_callback(
+            gguf_read_callback_t cb,
+            void *               userdata,
+            size_t               chunk_size,
+            uint64_t             max_size,
+            struct gguf_init_params params);
 
     GGML_API void gguf_free(struct gguf_context * ctx);
 
@@ -93,7 +114,7 @@ extern "C" {
 
     GGML_API uint32_t gguf_get_version    (const struct gguf_context * ctx);
     GGML_API size_t   gguf_get_alignment  (const struct gguf_context * ctx);
-    GGML_API size_t   gguf_get_data_offset(const struct gguf_context * ctx);  // padded to gguf_get_alignment if and only if the gguf_context contains at least one tensor
+    GGML_API size_t   gguf_get_data_offset(const struct gguf_context * ctx);
 
     GGML_API int64_t      gguf_get_n_kv(const struct gguf_context * ctx);
     GGML_API int64_t      gguf_find_key(const struct gguf_context * ctx, const char * key); // returns -1 if key is not found
@@ -207,4 +228,9 @@ extern "C" {
 
 #ifdef  __cplusplus
 }
+#endif
+
+#if defined(__cplusplus)
+#include <streambuf>
+GGML_API struct gguf_context * gguf_init_from_buffer(std::basic_streambuf<char>& streambuf, struct gguf_init_params params);
 #endif

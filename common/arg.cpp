@@ -298,7 +298,7 @@ static bool common_params_handle_remote_preset(common_params & params, llama_exa
         hf_tag = "default";
     }
 
-    std::string model_endpoint = common_get_model_endpoint();
+    std::string model_endpoint = get_model_endpoint();
     auto preset_url = model_endpoint + hf_repo + "/resolve/main/preset.ini";
 
     // prepare local path for caching
@@ -406,6 +406,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TBQ3_0,
+    GGML_TYPE_TBQ4_0,
+    GGML_TYPE_PQ3_0,
+    GGML_TYPE_PQ4_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2222,6 +2226,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.mmproj_use_gpu = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
+    add_opt(common_arg(
+        {"--mmproj-backend"}, "NAME",
+        "GPU backend for multimodal projector (e.g. CUDA, Metal, Vulkan)\n"
+        "if not specified, will use MTMD_BACKEND_DEVICE env var or default GPU backend",
+        [](common_params & params, const std::string & value) {
+            params.mmproj_backend = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--image", "--audio"}, "FILE",
         "path to an image or audio file. use with multimodal models, use comma-separated values for multiple files\n",

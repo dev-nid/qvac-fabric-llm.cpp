@@ -1,10 +1,8 @@
+# common
+
 find_package(Threads REQUIRED)
 
 llama_add_compile_flags()
-
-#
-# llama-common-base
-#
 
 # Build info header
 
@@ -35,107 +33,110 @@ endif()
 
 set(TEMPLATE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/build-info.cpp.in")
 set(OUTPUT_FILE   "${CMAKE_CURRENT_BINARY_DIR}/build-info.cpp")
-
 configure_file(${TEMPLATE_FILE} ${OUTPUT_FILE})
 
-set(TARGET llama-common-base)
-add_library(${TARGET} STATIC ${OUTPUT_FILE})
-
-target_include_directories(${TARGET} PUBLIC .)
-
+set(TARGET build_info)
+add_library(${TARGET} OBJECT ${OUTPUT_FILE})
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
+# qvac: the generated build-info.cpp lives under ${CMAKE_CURRENT_BINARY_DIR}, so
+# CMake didn't pick up the sibling build-info.h from the source tree without an
+# explicit include path. The rebase onto upstream b9341 dropped these.
+target_include_directories(${TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-#
-# llama-common
-#
+set(TARGET common)
 
-set(TARGET llama-common)
+set(${TARGET}_HEADERS
+  arg.h
+  base64.hpp
+  chat-auto-parser.h
+  chat-peg-parser.h
+  chat.h
+  common.h
+  console.h
+  debug.h
+  download.h
+  fit.h   # qvac: declarations for the fit helpers (memory_breakdown_print, get_device_memory_data)
+  hf-cache.h
+  http.h
+  json-partial.h
+  json-schema-to-grammar.h
+  log.h
+  ngram-cache.h
+  ngram-map.h
+  ngram-mod.h
+  peg-parser.h
+  preset.h
+  reasoning-budget.h
+  regex-partial.h
+  sampling.h
+  speculative.h
+  unicode.h
+)
 
-add_library(${TARGET}
+set(${TARGET}_JINJA_HEADERS
+  jinja/caps.h
+  jinja/lexer.h
+  jinja/parser.h
+  jinja/runtime.h
+  jinja/string.h
+  jinja/utils.h
+  jinja/value.h
+)
+
+list(TRANSFORM ${TARGET}_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
+list(TRANSFORM ${TARGET}_JINJA_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
+
+add_library(${TARGET} STATIC
     arg.cpp
-    arg.h
-    base64.hpp
     chat-auto-parser-generator.cpp
     chat-auto-parser-helpers.cpp
-    chat-auto-parser.h
     chat-diff-analyzer.cpp
     chat-peg-parser.cpp
-    chat-peg-parser.h
     chat.cpp
-    chat.h
     common.cpp
-    common.h
     console.cpp
-    console.h
     debug.cpp
-    debug.h
     download.cpp
-    download.h
-    fit.cpp
-    fit.h
+    fit.cpp   # qvac: common_memory_breakdown_print / common_get_device_memory_data live here; was missing from this list after the rebase
     hf-cache.cpp
-    hf-cache.h
-    http.h
     json-partial.cpp
-    json-partial.h
     json-schema-to-grammar.cpp
     llguidance.cpp
     log.cpp
-    log.h
     ngram-cache.cpp
-    ngram-cache.h
     ngram-map.cpp
-    ngram-map.h
     ngram-mod.cpp
-    ngram-mod.h
     peg-parser.cpp
-    peg-parser.h
     preset.cpp
-    preset.h
     regex-partial.cpp
     reasoning-budget.cpp
-    reasoning-budget.h
-    regex-partial.h
     sampling.cpp
-    sampling.h
     speculative.cpp
-    speculative.h
     unicode.cpp
-    unicode.h
     jinja/lexer.cpp
-    jinja/lexer.h
     jinja/parser.cpp
-    jinja/parser.h
     jinja/runtime.cpp
-    jinja/runtime.h
     jinja/value.cpp
-    jinja/value.h
     jinja/string.cpp
-    jinja/string.h
     jinja/caps.cpp
-    jinja/caps.h
+    ${${TARGET}_HEADERS}
+    ${${TARGET}_JINJA_HEADERS}
     )
 
-set_target_properties(${TARGET} PROPERTIES
-    VERSION ${LLAMA_INSTALL_VERSION}
-    SOVERSION 0
-    MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
-)
-
-target_include_directories(${TARGET} PUBLIC . ../vendor)
-target_compile_features   (${TARGET} PUBLIC cxx_std_17)
+set_target_properties(${TARGET} PROPERTIES PUBLIC_HEADER "${${TARGET}_HEADERS}")
+install(FILES ${${TARGET}_JINJA_HEADERS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/llama/common/jinja)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-    # TODO: make fine-grained exports in the future
-    set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
 
-target_link_libraries(${TARGET} PUBLIC  llama-common-base)
-target_link_libraries(${TARGET} PRIVATE cpp-httplib)
+target_link_libraries(${TARGET} PRIVATE
+    build_info
+    cpp-httplib
+)
 
 if (LLAMA_LLGUIDANCE)
     include(ExternalProject)
@@ -163,10 +164,49 @@ if (LLAMA_LLGUIDANCE)
     add_dependencies(llguidance llguidance_ext)
 
     target_include_directories(${TARGET} PRIVATE ${LLGUIDANCE_PATH})
-    target_link_libraries(${TARGET} PRIVATE llguidance)
+    # Add platform libraries to the main target
+    set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} llguidance)
     if (WIN32)
-        target_link_libraries(${TARGET} PRIVATE ws2_32 userenv ntdll bcrypt)
+        set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ws2_32 userenv ntdll bcrypt)
     endif()
+endif ()
+
+target_include_directories(
+  ${TARGET}
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}$<SEMICOLON>${CMAKE_CURRENT_SOURCE_DIR}/../vendor>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
+target_compile_features   (${TARGET} PUBLIC cxx_std_17)
+target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
+
+# qvac: rebase onto upstream b9341 renamed the common target to `llama-common`.
+# Keep both names addressable so qvac-side CMakeLists (target `common`) and
+# upstream/example/tool CMakeLists (target `llama-common`) both link.
+if (NOT TARGET llama-common)
+    add_library(llama-common ALIAS ${TARGET})
 endif()
 
-target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
+
+#
+# copy the license files
+#
+
+# Check if running in GitHub Actions
+if (DEFINED ENV{GITHUB_ACTIONS} AND "$ENV{GITHUB_ACTIONS}" STREQUAL "true")
+    message(STATUS "Running inside GitHub Actions - copying license files")
+
+    # Copy all files from licenses/ to build/bin/
+    file(GLOB LICENSE_FILES "${CMAKE_SOURCE_DIR}/licenses/*")
+    foreach(LICENSE_FILE ${LICENSE_FILES})
+        get_filename_component(FILENAME ${LICENSE_FILE} NAME)
+        add_custom_command(
+            POST_BUILD
+            TARGET ${TARGET}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LICENSE_FILE}"
+                "$<TARGET_FILE_DIR:llama>/${FILENAME}"
+            COMMENT "Copying ${FILENAME} to ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+        message(STATUS "Copying ${LICENSE_FILE} to ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${FILENAME}")
+    endforeach()
+endif()

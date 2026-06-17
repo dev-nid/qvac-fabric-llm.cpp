@@ -185,10 +185,6 @@ endif()
 
 # ggml
 
-if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
-    message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
-endif()
-
 add_library(ggml-base
             ../include/ggml.h
             ../include/ggml-alloc.h
@@ -196,6 +192,7 @@ add_library(ggml-base
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
             ../include/gguf.h
+            ../include/uint8-buff-stream.h
             ggml.c
             ggml.cpp
             ggml-alloc.c
@@ -206,7 +203,8 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
-            gguf.cpp)
+            gguf.cpp
+            uint8-buff-stream.cpp)
 
 set_target_properties(ggml-base PROPERTIES
     VERSION ${GGML_VERSION}
@@ -266,24 +264,37 @@ function(ggml_add_backend_library backend)
     if (GGML_BACKEND_DL)
         add_library(${backend} MODULE ${ARGN})
         # write the shared library to the output directory
-        set_target_properties(${backend} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+        # Set output name with qvac- prefix to match backend_filename_prefix() in ggml-backend-reg.cpp
+        set_target_properties(${backend} PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+            OUTPUT_NAME "qvac-${backend}")
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_DL)
-        add_dependencies(ggml ${backend})
+        # Do not add dependency, the User will have to explicitely build and install
+        # the available `ggml::ggml-*` backend targets. This is for better integration
+        # with cmake-bare
+        # add_dependencies(ggml ${backend})
+
         if (GGML_BACKEND_DIR)
-            install(TARGETS ${backend} LIBRARY DESTINATION ${GGML_BACKEND_DIR})
+            install(TARGETS ${backend}
+                    EXPORT ggml-targets
+                    LIBRARY DESTINATION ${GGML_BACKEND_DIR}
+                    RUNTIME DESTINATION ${GGML_BACKEND_DIR})
         else()
-            install(TARGETS ${backend} LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR})
+            install(TARGETS ${backend}
+                    EXPORT ggml-targets
+                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
         endif()
     else()
         add_library(${backend} ${ARGN})
         target_link_libraries(ggml PUBLIC ${backend})
-        install(TARGETS ${backend} LIBRARY)
+        install(TARGETS ${backend} EXPORT ggml-targets)
     endif()
 
     target_link_libraries(${backend} PRIVATE ggml-base)
     target_include_directories(${backend} PRIVATE ..)
 
-    if (${BUILD_SHARED_LIBS})
+    if (${BUILD_SHARED_LIBS} OR GGML_BACKEND_DL)
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_BUILD)
         target_compile_definitions(${backend} PUBLIC  GGML_BACKEND_SHARED)
     endif()
@@ -501,7 +512,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "visionOS")
     target_compile_definitions(ggml-base PUBLIC _DARWIN_C_SOURCE)
 endif()
 
-if (BUILD_SHARED_LIBS)
+if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
     foreach (target ggml-base ggml)
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)

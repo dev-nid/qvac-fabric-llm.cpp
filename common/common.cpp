@@ -1,14 +1,13 @@
 #include "ggml.h"
 #include "gguf.h"
 
-#include "build-info.h"
 #include "common.h"
-#include "fit.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
-#include "speculative.h"
 #include "unicode.h"
+#include "chat.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cinttypes>
@@ -71,7 +70,7 @@ common_time_meas::~common_time_meas() {
 // CPU utils
 //
 
-int32_t common_cpu_get_num_physical_cores() {
+int32_t cpu_get_num_physical_cores() {
 #ifdef __linux__
     // enumerate the set of thread siblings, num entries is num cores
     std::unordered_set<std::string> siblings;
@@ -186,11 +185,11 @@ static int cpu_count_math_cpus(int n_cpu) {
 /**
  * Returns number of CPUs on system that are useful for math.
  */
-int32_t common_cpu_get_num_math() {
+int32_t cpu_get_num_math() {
 #if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
     int n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (n_cpu < 1) {
-        return common_cpu_get_num_physical_cores();
+        return cpu_get_num_physical_cores();
     }
     if (is_hybrid_cpu()) {
         cpu_set_t affinity;
@@ -203,7 +202,7 @@ int32_t common_cpu_get_num_math() {
         }
     }
 #endif
-    return common_cpu_get_num_physical_cores();
+    return cpu_get_num_physical_cores();
 }
 
 // Helper for setting process priority
@@ -264,7 +263,7 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 //
 
 
-void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_params * role_model) {
+void postprocess_cpu_params(cpu_params& cpuparams, const cpu_params* role_model) {
     int32_t n_set = 0;
 
     if (cpuparams.n_threads < 0) {
@@ -272,7 +271,7 @@ void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_para
         if (role_model != nullptr) {
             cpuparams = *role_model;
         } else {
-            cpuparams.n_threads = common_cpu_get_num_math();
+            cpuparams.n_threads = cpu_get_num_math();
         }
     }
 
@@ -367,30 +366,37 @@ void common_init() {
     SetConsoleCP(CP_UTF8);
 #endif
 
-    common_log_set_prefix(common_log_main(), true);
-    common_log_set_timestamps(common_log_main(), true);
-
     llama_log_set(common_log_default_callback, NULL);
+
+#ifdef NDEBUG
+    const char * build_type = "";
+#else
+    const char * build_type = " (debug)";
+#endif
+
+    LOG_DBG("build: %d (%s) with %s for %s%s\n", LLAMA_BUILD_NUMBER, LLAMA_COMMIT, LLAMA_COMPILER, LLAMA_BUILD_TARGET, build_type);
 }
 
+// qvac: upstream b9341 — logs build info and (optionally) device list. The
+// rebase silently dropped this; restored so tools/server compiles.
 void common_params_print_info(const common_params & params, bool print_devices) {
 #ifdef NDEBUG
     const char * build_type = "";
 #else
     const char * build_type = " (debug)";
 #endif
-    LOG_TRC("%s: build %d (%s) with %s for %s%s\n", __func__, llama_build_number(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
+    LOG_INF("build: %d (%s) with %s for %s%s\n",
+            LLAMA_BUILD_NUMBER, LLAMA_COMMIT, LLAMA_COMPILER, LLAMA_BUILD_TARGET, build_type);
 
-    LOG_INF("log_info: verbosity = %d (adjust with the `-lv N` CLI arg)\n", common_log_get_verbosity_thold());
-
-    // device enumeration creates a primary context on CUDA backends, skip it when the caller does not own any device
     if (print_devices) {
         LOG_INF("device_info:\n");
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             auto * dev = ggml_backend_dev_get(i);
             size_t free, total;
             ggml_backend_dev_memory(dev, &free, &total);
-            LOG_INF("  - %-8s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);
+            LOG_INF("  - %-8s: %s (%zu MiB, %zu MiB free)\n",
+                    ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                    total / 1024 / 1024, free / 1024 / 1024);
         }
     }
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
@@ -443,27 +449,6 @@ std::string string_strip(const std::string & str) {
         end--;
     }
     return str.substr(start, end - start);
-}
-
-std::string string_lcs(std::string_view a, std::string_view b) {
-    if (a.empty() || b.empty()) return {};
-
-    std::vector<std::vector<size_t>> dp(a.size() + 1, std::vector<size_t>(b.size() + 1, 0));
-    size_t best_len = 0;
-    size_t best_end_a = 0;
-
-    for (size_t i = 1; i <= a.size(); ++i) {
-        for (size_t j = 1; j <= b.size(); ++j) {
-            if (a[i - 1] == b[j - 1]) {
-                dp[i][j] = dp[i - 1][j - 1] + 1;
-                if (dp[i][j] > best_len) {
-                    best_len = dp[i][j];
-                    best_end_a = i;
-                }
-            }
-        }
-    }
-    return std::string(a.substr(best_end_a - best_len, best_len));
 }
 
 std::string string_get_sortable_timestamp() {
@@ -1181,20 +1166,21 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+common_init_result::common_init_result() : pimpl(new impl{}) {}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
-        LOG_INF("%s: fitting params to device memory ...\n", __func__);
-        LOG_INF("%s: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n", __func__);
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+        LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
+        llama_params_fit(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1241,7 +1227,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // initialize once
     for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
         if (llama_vocab_is_eog(vocab, i)) {
-            LOG_TRC("%s: added %s logit bias = %f\n", __func__, common_token_to_piece(vocab, i).c_str(), -INFINITY);
+            LOG_INF("%s: added %s logit bias = %f\n", __func__, common_token_to_piece(vocab, i).c_str(), -INFINITY);
             params.sampling.logit_bias_eog.push_back({i, -INFINITY});
         }
     }
@@ -1254,12 +1240,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     //if (params.sampling.penalty_last_n == -1) {
-    //    LOG_TRC("%s: setting penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
+    //    LOG_INF("%s: setting penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
     //    params.sampling.penalty_last_n = llama_n_ctx(lctx);
     //}
 
     //if (params.sampling.dry_penalty_last_n == -1) {
-    //    LOG_TRC("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
+    //    LOG_INF("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
     //    params.sampling.dry_penalty_last_n = llama_n_ctx(lctx);
     //}
 
@@ -1311,26 +1297,14 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
-
-    llama_model * model = res->model();
-    if (model == NULL) {
-        LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
-        return res;
-    }
-
-    if (model_only) {
-        return res;
-    }
+common_init_result_ptr common_init_from_model_and_params(llama_model* model, common_init_result_ptr res, common_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     llama_context * lctx = res->context();
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
         return res;
     }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
         LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
@@ -1387,7 +1361,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (params.warmup) {
-        LOG_INF("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
+        LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
         llama_set_warmup(lctx, true);
 
@@ -1432,7 +1406,107 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
 common_init_result::~common_init_result() = default;
 
-std::string common_get_model_endpoint() {
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
+
+    llama_model * model = res->model();
+    if (model == NULL) {
+        LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
+        return res;
+    }
+
+    return common_init_from_model_and_params(model, std::move(res), params);
+}
+
+// Compat overload for callers that have already loaded a model externally
+// and don't have a params.model.path the file-based constructor can open.
+common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params) {
+    if (model == nullptr) {
+        // Mirror common_init_from_params: on load failure return a *valid* empty
+        // result (model()/context() == nullptr), never a null pointer. Callers
+        // adopt this result and inspect model()/context() to detect failure
+        // (e.g. and then throw); returning a null common_init_result_ptr here
+        // makes those callers dereference null and crash.
+        return common_init_result_ptr(new common_init_result());
+    }
+
+    // Adopt the externally-loaded model into an empty result. Do NOT use the
+    // file-based constructor here: it would load a throwaway model from
+    // params.model.path and build a context (and samplers) bound to it, and the
+    // pimpl->model.reset(model) below would then free that file model while its
+    // context/samplers still referenced it -- a heap-use-after-free in
+    // ~llama_context, plus a duplicated logit-bias/sampler setup.
+    common_init_result_ptr res(new common_init_result());
+    auto & pimpl = res->pimpl;
+    pimpl->model.reset(model);
+
+    auto cparams = common_context_params_to_llama(params);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    for (auto & la : params.lora_adapters) {
+        llama_adapter_lora_ptr lora;
+        lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
+        if (lora == nullptr) {
+            LOG_ERR("%s: failed to load lora adapter '%s'\n", __func__, la.path.c_str());
+            return res;
+        }
+
+        char buf[1024];
+        la.ptr = lora.get();
+        llama_adapter_meta_val_str(la.ptr, "adapter.lora.task_name", buf, sizeof(buf));
+        la.task_name = buf;
+        llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
+        la.prompt_prefix = buf;
+        pimpl->lora.emplace_back(std::move(lora));
+    }
+
+    common_init_sampler_from_model(model, params.sampling);
+
+    if (params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
+        LOG_WRN("%s: warning: vocab does not have an EOS token, ignoring --ignore-eos\n", __func__);
+        params.sampling.ignore_eos = false;
+    }
+
+    for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
+        if (llama_vocab_is_eog(vocab, i)) {
+            LOG_INF("%s: added %s logit bias = %f\n", __func__, common_token_to_piece(vocab, i).c_str(), -INFINITY);
+            params.sampling.logit_bias_eog.push_back({i, -INFINITY});
+        }
+    }
+
+    if (params.sampling.ignore_eos) {
+        params.sampling.logit_bias.insert(
+                params.sampling.logit_bias.end(),
+                params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
+    }
+
+    pimpl->samplers.resize(cparams.n_seq_max);
+    pimpl->samplers_seq_config.resize(cparams.n_seq_max);
+    for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
+        pimpl->samplers[i].reset(common_sampler_init(model, params.sampling));
+        pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
+    }
+
+    if (params.sampling.backend_sampling) {
+        cparams.samplers   = pimpl->samplers_seq_config.data();
+        cparams.n_samplers = pimpl->samplers_seq_config.size();
+    }
+
+    llama_context * lctx = llama_init_from_model(model, cparams);
+    if (lctx == NULL) {
+        LOG_ERR("%s: failed to create context with externally-loaded model\n", __func__);
+        return res;
+    }
+    pimpl->context.reset(lctx);
+
+    return common_init_from_model_and_params(model, std::move(res), params);
+}
+
+std::string get_model_endpoint() {
     const char * model_endpoint_env = getenv("MODEL_ENDPOINT");
     // We still respect the use of environment-variable "HF_ENDPOINT" for backward-compatibility.
     const char * hf_endpoint_env = getenv("HF_ENDPOINT");
@@ -1446,6 +1520,9 @@ std::string common_get_model_endpoint() {
     }
     return model_endpoint;
 }
+
+// qvac: upstream b9341 (MTP support, 255582687) added these. The rebase silently
+// dropped them; restored here so the server/cli/speculative-simple callers link.
 
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     auto * mem = llama_get_memory(ctx);
@@ -1475,9 +1552,8 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         goto done;
     }
 
-    // try to remove the last tokens
     if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
-        LOG_TRC("%s: the context does not support partial sequence removal\n", __func__);
+        LOG_DBG("%s: the context does not support partial sequence removal\n", __func__);
         res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
         goto done;
     }
@@ -1504,6 +1580,80 @@ void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_s
 void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
+}
+
+size_t common_prompt_checkpoint::size() const {
+    return data_tgt.size() + data_dft.size();
+}
+
+bool common_prompt_checkpoint::empty() const {
+    return data_tgt.empty();
+}
+
+void common_prompt_checkpoint::clear() {
+    n_tokens = 0;
+    pos_min  = 0;
+    pos_max  = 0;
+    data_tgt.clear();
+    data_dft.clear();
+}
+
+void common_prompt_checkpoint::update_pos(int64_t n_tokens, llama_pos pos_min, llama_pos pos_max) {
+    this->n_tokens = n_tokens;
+    this->pos_min  = pos_min;
+    this->pos_max  = pos_max;
+}
+
+void common_prompt_checkpoint::update_tgt(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (ctx == nullptr) {
+        return;
+    }
+    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    data_tgt.resize(ckpt_size);
+    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    if (n != ckpt_size) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    }
+}
+
+void common_prompt_checkpoint::update_dft(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (ctx == nullptr) {
+        return;
+    }
+    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    data_dft.resize(ckpt_size);
+    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    if (n != ckpt_size) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    }
+}
+
+void common_prompt_checkpoint::load_tgt(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (ctx == nullptr || data_tgt.empty()) {
+        return;
+    }
+    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
+    if (n != data_tgt.size()) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
+    }
+}
+
+void common_prompt_checkpoint::load_dft(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (ctx == nullptr || data_dft.empty()) {
+        return;
+    }
+    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
+    if (n != data_dft.size()) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
+    }
+}
+
+void common_prompt_checkpoint::clear_tgt() {
+    data_tgt.clear();
+}
+
+void common_prompt_checkpoint::clear_dft() {
+    data_dft.clear();
 }
 
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
@@ -1562,7 +1712,6 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;
@@ -1586,6 +1735,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
+    cparams.training          = params.training;
     cparams.kv_unified        = params.kv_unified;
 
     cparams.type_k = params.cache_type_k;
@@ -1594,7 +1744,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     return cparams;
 }
 
-struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params) {
+struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_params & params) {
     struct ggml_threadpool_params tpp;
 
     ggml_threadpool_params_init(&tpp, params.n_threads); // setup the defaults
@@ -2034,109 +2184,330 @@ bool common_prompt_batch_decode(
     return true;
 }
 
-size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size();
-}
+ggml_opt_dataset_t common_opt_sft_dataset_init(
+        struct llama_context * ctx,
+        const std::string    & json_content,
+        int64_t                stride,
+        const std::string    & chat_template_path) {
+    using json = nlohmann::json;
 
-bool common_prompt_checkpoint::empty() const {
-    return data_tgt.empty();
-}
-
-void common_prompt_checkpoint::clear() {
-    n_tokens = 0;
-
-    pos_min = 0;
-    pos_max = 0;
-
-    data_tgt.clear();
-    data_dft.clear();
-}
-
-void common_prompt_checkpoint::update_pos(
-        int64_t n_tokens,
-        llama_pos pos_min,
-        llama_pos pos_max) {
-    this->n_tokens = n_tokens;
-    this->pos_min  = pos_min;
-    this->pos_max  = pos_max;
-}
-
-void common_prompt_checkpoint::update_tgt(
-        llama_context * ctx,
-        llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
-    if (ctx == nullptr) {
-        return;
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    common_chat_templates_ptr chat_templates;
+    std::string chat_template_source;
+    if (!chat_template_path.empty()) {
+        std::ifstream tmpl_file(chat_template_path);
+        if (!tmpl_file.is_open()) {
+            LOG_ERR("Warning: Failed to open chat template file: %s\n", chat_template_path.c_str());
+        } else {
+            chat_template_source.assign(std::istreambuf_iterator<char>(tmpl_file), std::istreambuf_iterator<char>());
+            tmpl_file.close();
+        }
     }
 
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
-
-    data_tgt.resize(ckpt_size);
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
-    if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
-    }
-}
-
-void common_prompt_checkpoint::update_dft(
-        llama_context * ctx,
-        llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
-    if (ctx == nullptr) {
-        return;
+    try {
+        chat_templates = common_chat_templates_init(llama_get_model(ctx), chat_template_source);
+        if (chat_template_source.empty()) {
+            LOG_INF("Using model's built-in chat template\n");
+        } else {
+            LOG_INF("Using custom chat template from: %s\n", chat_template_path.c_str());
+        }
+    } catch (const std::exception & e) {
+        if (!chat_template_path.empty()) {
+            LOG_ERR("Warning: Failed to parse chat template '%s': %s\n", chat_template_path.c_str(), e.what());
+        } else {
+            LOG_ERR("Warning: Failed to initialize chat template: %s\n", e.what());
+        }
     }
 
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    std::vector<json> conversations;
+    std::istringstream content_stream(json_content);
 
-    data_dft.resize(ckpt_size);
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
-    if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
-    }
-}
-
-void common_prompt_checkpoint::load_tgt(
-        llama_context * ctx,
-        llama_seq_id seq_id,
-        llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
+    std::string line;
+    while (std::getline(content_stream, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        try {
+            json conv = json::parse(line);
+            if (conv.contains("messages") && conv["messages"].is_array()) {
+                conversations.push_back(conv);
+            }
+        } catch (const json::exception & e) {
+            LOG_DBG("Warning: Failed to parse JSON line: %s\n", e.what());
+        }
     }
 
-    if (data_tgt.empty()) {
-        return;
+    if (conversations.empty()) {
+        LOG_ERR("Error: No valid conversations found\n");
+        return nullptr;
+    }
+    LOG_INF("Loaded %zu conversations\n", conversations.size());
+
+    const int64_t ne_datapoint = llama_n_ctx(ctx);
+    if (stride <= 0) stride = ne_datapoint;
+    if (stride >  ne_datapoint) stride = ne_datapoint;
+
+    std::vector<std::vector<llama_token>> all_tokenized_data;
+    std::vector<std::vector<int32_t>>     all_assistant_masks;
+
+    auto token_count_prefix = [&](const std::string & render, size_t char_count) -> size_t {
+        std::string prefix = render.substr(0, char_count);
+        auto t = common_tokenize(ctx, prefix, /*add_special=*/false, /*parse_special=*/true);
+        return t.size();
+    };
+
+    // TODO: The masking logic currently relies on string searching for specific role tags.
+    // While chat templates render appropriately, we must parse the rendered string to find
+    // the boundaries of the "assistant" role to calculate loss gracefully.
+    // Currently, this only supports ChatML (Qwen, etc.) and Gemma formats.
+    // A more reliable, model-agnostic method would require common_chat_templates_apply to
+    // return token role spans directly, which is not yet supported in common/chat.cpp.
+    const std::string START_TAG = "<|im_start|>";
+    const std::string START_SYS = "<|im_start|>system\n";
+    const std::string START_USR = "<|im_start|>user\n";
+    const std::string START_AST = "<|im_start|>assistant\n";
+    const std::string END_TAG   = "<|im_end|>";
+    const std::string NL        = "\n";
+
+    for (size_t i = 0; i < conversations.size(); ++i) {
+        const auto & messages = conversations[i]["messages"];
+        if (!messages.is_array() || messages.empty()) continue;
+
+        std::string render;
+
+        if (chat_templates) {
+            std::vector<common_chat_msg> chat_msgs;
+            chat_msgs.reserve(messages.size());
+            for (const auto & msg : messages) {
+                if (!msg.contains("role") || !msg.contains("content")) {
+                    continue;
+                }
+                common_chat_msg chat_msg;
+                chat_msg.role    = msg["role"].get<std::string>();
+                chat_msg.content = msg["content"].get<std::string>();
+                chat_msgs.push_back(std::move(chat_msg));
+            }
+
+            if (!chat_msgs.empty()) {
+                common_chat_templates_inputs inputs;
+                inputs.messages = std::move(chat_msgs);
+                inputs.add_generation_prompt = false;
+                inputs.use_jinja = true;
+                try {
+                    render = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
+
+                    size_t last_im_end = render.rfind("<|im_end|>");
+                    if (last_im_end != std::string::npos) {
+                        size_t end_pos = last_im_end + 10; // length of "<|im_end|>"
+                        // Remove any trailing whitespace/newlines after the final <|im_end|>
+                        while (end_pos < render.size() && (render[end_pos] == '\n' || render[end_pos] == '\r' || render[end_pos] == ' ')) {
+                            end_pos++;
+                        }
+                        if (end_pos < render.size()) {
+                            render = render.substr(0, last_im_end + 10); // Keep only up to </im_end>
+                        }
+                    }
+                } catch (const std::exception & e) {
+                    LOG_WRN("Warning: chat template rendering failed for conversation %zu: %s. Falling back to default ChatML rendering.\n",
+                           i, e.what());
+                }
+            }
+        }
+
+        if (render.empty()) {
+            render.reserve(4096);
+            for (const auto & msg : messages) {
+                if (!msg.contains("role") || !msg.contains("content")) continue;
+                const std::string role    = msg["role"].get<std::string>();
+                const std::string content = msg["content"].get<std::string>();
+
+                if (role == "system") {
+                    render += START_SYS; render += content; render += END_TAG + NL;
+                } else if (role == "user") {
+                    render += START_USR; render += content; render += END_TAG + NL;
+                } else if (role == "assistant") {
+                    render += START_AST; render += content; render += END_TAG + NL;
+                }
+            }
+        }
+
+        if (render.empty()) {
+            continue;
+        }
+
+        struct Span { size_t lo, hi; };
+        std::vector<Span> assistant_spans;
+
+        {
+            bool is_gemma = render.find("<start_of_turn>model\n") != std::string::npos;
+
+            if (is_gemma) {
+                const std::string GEMMA_START = "<start_of_turn>model\n";
+                const std::string GEMMA_END = "<end_of_turn>";
+
+                size_t from = 0;
+                while (true) {
+                    size_t open = render.find(GEMMA_START, from);
+                    if (open == std::string::npos) break;
+                    // Skip past "<start_of_turn>model\n" — supervise content only, not the role header
+                    size_t lo = open + GEMMA_START.size();
+                    size_t close = render.find(GEMMA_END, lo);
+                    if (close == std::string::npos) {
+                        assistant_spans.push_back({lo, render.size()});
+                        break;
+                    }
+
+                    size_t hi = close + GEMMA_END.size();
+                    assistant_spans.push_back({lo, std::min(hi, render.size())});
+
+                    from = hi;
+                }
+            } else {
+                size_t from = 0;
+                while (true) {
+                    size_t open = render.find(START_AST, from);
+                    if (open == std::string::npos) break;
+
+                    // Skip past "<|im_start|>assistant\n" — supervise content only, not the role header
+                    size_t lo = open + START_AST.size();
+                    if (lo > render.size()) {
+                        lo = render.size();
+                    }
+
+                    size_t close = render.find(END_TAG, open + START_AST.size());
+                    if (close == std::string::npos) {
+                        assistant_spans.push_back({lo, render.size()});
+                        break;
+                    }
+
+                    size_t hi = close + END_TAG.size();
+                    if (hi <= lo) {
+                        lo = open;
+                        hi = close + END_TAG.size();
+                    }
+
+                    assistant_spans.push_back({lo, std::min(hi, render.size())});
+
+                    size_t next_from = hi;
+                    from = next_from;
+                }
+            }
+        }
+
+        if (assistant_spans.empty()) {
+            LOG_WRN("Conversation %zu has no assistant spans\n", i);
+            continue;
+        }
+
+        auto tokens_full = common_tokenize(ctx, render, /*add_special=*/false, /*parse_special=*/true);
+        if (tokens_full.empty()) continue;
+
+        std::vector<int32_t> assistant_mask(tokens_full.size(), 0);
+        size_t assistant_token_count = 0;
+
+        for (const auto & sp : assistant_spans) {
+            size_t t_lo = token_count_prefix(render, sp.lo);
+            size_t t_hi = token_count_prefix(render, sp.hi);
+            if (t_lo > tokens_full.size()) t_lo = tokens_full.size();
+            if (t_hi > tokens_full.size()) t_hi = tokens_full.size();
+
+
+            for (size_t t = t_lo; t < t_hi; ++t) {
+                assistant_mask[t] = 1;
+                ++assistant_token_count;
+            }
+        }
+
+        if (assistant_token_count == 0) {
+            LOG_WRN("Warning: Conversation %zu has zero assistant tokens after masking\n", i);
+            continue;
+        }
+
+        all_tokenized_data.push_back(tokens_full);
+        all_assistant_masks.push_back(assistant_mask);
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
-    if (n != data_tgt.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
-    }
-}
-
-void common_prompt_checkpoint::load_dft(
-        llama_context * ctx,
-        llama_seq_id seq_id,
-        llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
+    if (all_tokenized_data.empty()) {
+        LOG_ERR("ERROR: No valid training samples generated after processing %zu conversations\n", conversations.size());
+        return nullptr;
     }
 
-    if (data_dft.empty()) {
-        return;
+    std::vector<std::vector<llama_token>> final_samples;
+    std::vector<std::vector<int32_t>> final_masks;
+
+    llama_token pad_token = llama_vocab_pad(vocab);
+    if (pad_token == LLAMA_TOKEN_NULL) {
+        pad_token = llama_vocab_eos(vocab);
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
-    if (n != data_dft.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
+    for (size_t i = 0; i < all_tokenized_data.size(); ++i) {
+        const auto& conv_tokens = all_tokenized_data[i];
+        const auto& conv_mask = all_assistant_masks[i];
+
+        if ((int64_t)conv_tokens.size() > ne_datapoint) {
+            LOG_WRN("Skipping conversation %zu: too long (%zu tokens > %lld)\n", i, conv_tokens.size(), (long long)ne_datapoint);
+            continue;
+        }
+
+        size_t conv_assistant_tokens = 0;
+        for (int32_t mask_val : conv_mask) {
+            if (mask_val == 1) conv_assistant_tokens++;
+        }
+
+        if (conv_assistant_tokens == 0) {
+            LOG_WRN("Skipping conversation %zu: no assistant tokens\n", i);
+            continue;
+        }
+
+        std::vector<llama_token> sample_tokens = conv_tokens;
+        std::vector<int32_t> sample_mask = conv_mask;
+
+        sample_tokens.resize(ne_datapoint, pad_token);
+        sample_mask.resize(ne_datapoint, 0); // Padding tokens are not trained on
+
+        final_samples.push_back(sample_tokens);
+        final_masks.push_back(sample_mask);
     }
-}
 
-void common_prompt_checkpoint::clear_tgt() {
-    data_tgt.clear();
-}
+    all_tokenized_data = std::move(final_samples);
+    all_assistant_masks = std::move(final_masks);
 
-void common_prompt_checkpoint::clear_dft() {
-    data_dft.clear();
+    const int64_t ndata = all_tokenized_data.size();
+
+    ggml_opt_dataset_t result = ggml_opt_dataset_init_with_masks(
+        GGML_TYPE_I32, GGML_TYPE_I32, GGML_TYPE_I32,
+        /*ne_datapoint=*/ne_datapoint, /*ne_label=*/ne_datapoint, /*ne_mask=*/ne_datapoint,
+        /*ndata=*/ndata, /*ndata_shard=*/1);
+
+    if (result == nullptr) {
+        return nullptr;
+    }
+
+    int32_t * data   = (int32_t *) ggml_opt_dataset_data(result)->data;
+    int32_t * labels = (int32_t *) ggml_opt_dataset_labels(result)->data;
+    int32_t * masks  = (int32_t *) ggml_opt_dataset_masks(result)->data;
+
+    for (int64_t idata = 0; idata < ndata; ++idata) {
+        const auto & sample_tokens = all_tokenized_data[idata];
+        const auto & sample_mask   = all_assistant_masks[idata];
+
+        // inputs
+        for (int64_t i = 0; i < ne_datapoint; ++i) {
+            data[idata * ne_datapoint + i] = sample_tokens[i];
+        }
+
+        // labels: Set actual next tokens for ALL positions (masked cross-entropy needs real tokens)
+        for (int64_t i = 0; i < ne_datapoint - 1; ++i) {
+            // Always set the actual next token - masking is handled separately
+            labels[idata * ne_datapoint + i] = sample_tokens[i + 1];
+        }
+        labels[idata * ne_datapoint + (ne_datapoint - 1)] = sample_tokens[ne_datapoint - 1]; // last token predicts itself (will be masked)
+
+        // masks: indicate which preds should be trained on (shifted by 1 from sample_mask)
+        // Since we predict token[i+1] from token[i], we train when token[i+1] is assistant
+        for (int64_t i = 0; i < ne_datapoint - 1; ++i) {
+            masks[idata * ne_datapoint + i] = (i + 1 < ne_datapoint && sample_mask[i + 1] == 1) ? 1 : 0;
+        }
+        masks[idata * ne_datapoint + (ne_datapoint - 1)] = 0;
+    }
+
+    return result;
 }
