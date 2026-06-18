@@ -29,7 +29,9 @@ struct clip_graph_qwen2vl : clip_graph {
 };
 
 struct clip_graph_qwen3vl : clip_graph {
-    clip_graph_qwen3vl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    int batch_size;
+    clip_graph_qwen3vl(clip_ctx * ctx, const clip_image_f32 & img, int bs = 1)
+        : clip_graph(ctx, img), batch_size(bs) {}
     ggml_cgraph * build() override;
 };
 

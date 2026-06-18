@@ -1,7 +1,9 @@
 #include "mtmd-image.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 //
@@ -898,6 +900,111 @@ bool mtmd_image_preprocessor_dyn_size::preprocess(const clip_image_u8 & img, cli
     clip_image_f32_ptr img_f32(clip_image_f32_init());
     img_u8_to_f32(resized_image, *img_f32, hparams.image_mean, hparams.image_std);
     output.entries.push_back(std::move(img_f32));
+    return true;
+}
+
+//
+// mtmd_image_preprocessor_qwen3vl
+//
+
+bool mtmd_image_preprocessor_qwen3vl::preprocess(const clip_image_u8 & img, clip_image_f32_batch & output) {
+    // Tile size comes from the model's image_size (e.g. 768 for Qwen3VL-2B, patch_size=16).
+    const int tile_px = hparams.image_size;
+    GGML_ASSERT(tile_px > 0 && "image_size not set in model hparams");
+
+    // Determine tile grid: choose n_col × n_row (with n_col*n_row <= max_tiles) whose
+    // aspect ratio is closest to the image's aspect ratio (log-ratio distance).
+    // Minimising distortion means the stretched resize needed to fill the tile canvas is small.
+    int best_col = 1, best_row = 1;
+
+    // Small image: fits in one tile — fall back to dyn_size behaviour.
+    // qwen3vl always produces tile_px×tile_px (576 tokens) even for a 1×1 grid,
+    // whereas dyn_size scales to the image's natural size (~247 tokens for elephant).
+    // No tiling benefit exists here, so use the cheaper, undistorted path.
+    if (img.nx <= tile_px && img.ny <= tile_px) {
+        LOG_INF("%s: small image (%dx%d <= tile %d) — falling back to dyn_size\n", __func__, img.nx, img.ny, tile_px);
+        GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
+        const int cur_merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
+        const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
+            {img.nx, img.ny},
+            hparams.patch_size * cur_merge,
+            hparams.image_min_pixels,
+            hparams.image_max_pixels);
+        // Qwen3VL encoder asserts dimensions divisible by patch_size*2; calc_size_preserved_ratio
+        // aligns to patch_size*n_merge, which equals patch_size*2 only when n_merge==2.
+        GGML_ASSERT(target_size.width  % (hparams.patch_size * 2) == 0 &&
+                    target_size.height % (hparams.patch_size * 2) == 0 &&
+                    "dyn_size target must be aligned to patch_size*2 for Qwen3VL encoder");
+        clip_image_u8 resized_small;
+        img_tool::resize(img, resized_small, target_size,
+                         hparams.image_resize_algo,
+                         hparams.image_resize_pad,
+                         hparams.image_pad_color);
+        clip_image_f32_ptr img_f32(clip_image_f32_init());
+        img_u8_to_f32(resized_small, *img_f32, hparams.image_mean, hparams.image_std);
+        output.entries.push_back(std::move(img_f32));
+        // grid_x/grid_y left at 0 → single-tile path; tokenizer treats this as 1×1
+        return true;
+    }
+
+    // Pick the grid whose aspect ratio is closest to the image's aspect ratio.
+    // This minimises distortion when resizing the image to fill the tile canvas.
+    // Using log-ratio so that e.g. 2:1 and 1:2 are symmetric around 1:1.
+    const float img_log_ratio = std::log((float)img.nx / (float)img.ny);
+    float best_ratio_error = std::numeric_limits<float>::infinity();
+
+    for (int col = 1; col <= max_tiles; col++) {
+        for (int row = 1; col * row <= max_tiles; row++) {
+            if (col == 1 && row == 1) { continue; } // 1×1 handled by small-image early return
+            float error = std::abs(img_log_ratio - std::log((float)col / (float)row));
+            if (error < best_ratio_error) {
+                best_ratio_error = error;
+                best_col = col;
+                best_row = row;
+            }
+        }
+    }
+
+    const int target_w = best_col * tile_px;
+    const int target_h = best_row * tile_px;
+    GGML_ASSERT(hparams.patch_size > 0);
+    const int patches_per_tile = tile_px / hparams.patch_size;
+
+    // Resize to the tile canvas by stretching. With aspect-ratio-aware grid selection the chosen
+    // grid's ratio is close to the image's ratio, so the residual stretch is small.
+    // pad=false avoids black bars that confuse the model in tile inputs.
+    clip_image_u8 resized;
+    img_tool::resize(img, resized, {target_w, target_h},
+                     hparams.image_resize_algo,
+                     /* pad */ PAD_NONE,
+                     hparams.image_pad_color);
+
+    // Split into best_col × best_row tiles; each tile carries its patch-coord offset
+    clip_image_u8 tile_u8;
+    tile_u8.nx = tile_px;
+    tile_u8.ny = tile_px;
+    tile_u8.buf.resize((size_t)tile_px * (size_t)tile_px * 3);
+
+    for (int tr = 0; tr < best_row; tr++) {
+        for (int tc = 0; tc < best_col; tc++) {
+            const int src_x0 = tc * tile_px;
+            const int src_y0 = tr * tile_px;
+            for (int y = 0; y < tile_px; y++) {
+                const size_t src_row = (size_t)3 * ((size_t)(src_y0 + y) * (size_t)target_w + (size_t)src_x0);
+                const size_t dst_row = (size_t)3 * (size_t)y * (size_t)tile_px;
+                std::memcpy(tile_u8.buf.data() + dst_row, resized.buf.data() + src_row, (size_t)tile_px * 3);
+            }
+
+            clip_image_f32_ptr tile_f32(clip_image_f32_init());
+            img_u8_to_f32(tile_u8, *tile_f32, hparams.image_mean, hparams.image_std);
+            tile_f32->pos_x = tc * patches_per_tile;
+            tile_f32->pos_y = tr * patches_per_tile;
+            output.entries.push_back(std::move(tile_f32));
+        }
+    }
+
+    output.grid_x = best_col;
+    output.grid_y = best_row;
     return true;
 }
 

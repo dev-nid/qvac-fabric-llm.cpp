@@ -2257,6 +2257,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.image_max_tokens = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TOKENS"));
+    add_opt(common_arg(
+        {"--image-tile-mode"}, "MODE",
+        "tile encoding mode for multi-tile vision models (e.g. Qwen3VL):\n"
+        "  batched    - all tiles in one forward pass (default)\n"
+        "  sequential - tiles encoded one-by-one (benchmarking)\n"
+        "  disabled   - tiling disabled, single tile only",
+        [](common_params & params, const std::string & value) {
+            if (value == "batched")         { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_BATCHED; }
+            else if (value == "sequential") { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_SEQUENTIAL; }
+            else if (value == "disabled")   { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_DISABLED; }
+            else { throw std::invalid_argument("unknown --image-tile-mode: " + value + " (use batched, sequential, or disabled)"); }
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_TILE_MODE"));
     if (llama_supports_rpc()) {
         add_opt(common_arg(
             {"--rpc"}, "SERVERS",
