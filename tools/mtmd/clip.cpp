@@ -166,6 +166,7 @@ struct clip_ctx {
     bool is_allocated = false;
 
     bool debug_output_embeddings = false;
+    clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_BATCHED;
 
     // for measuring memory usage
     bool no_alloc = false;
@@ -244,6 +245,11 @@ struct clip_ctx {
         }
 
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
+        if (ctx_params.image_tile_mode < 0 || ctx_params.image_tile_mode > 2) {
+            GGML_ABORT("invalid image_tile_mode %d; valid: 0=batched, 1=sequential, 2=disabled",
+                       ctx_params.image_tile_mode);
+        }
+        tile_mode = static_cast<clip_image_tile_mode>(ctx_params.image_tile_mode);
     }
 
     ~clip_ctx() {
@@ -872,9 +878,13 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
 }
 
 static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32_batch & imgs) {
-    GGML_ASSERT(imgs.entries.size() == 1 && "n_batch > 1 is not supported");
+    // Qwen3VL supports batch_size > 1 (multi-tile batching); all others are single-image only.
+    if (ctx->proj_type() != PROJECTOR_TYPE_QWEN3VL) {
+        GGML_ASSERT(imgs.entries.size() == 1 && "n_batch > 1 is not supported");
+    }
 
     const clip_image_f32 & img = *imgs.entries[0];
+    const int batch_size = (int)imgs.entries.size();
     std::unique_ptr<clip_graph> builder;
 
     switch (ctx->proj_type()) {
@@ -914,7 +924,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             } break;
         case PROJECTOR_TYPE_QWEN3VL:
             {
-                builder = std::make_unique<clip_graph_qwen3vl>(ctx, img);
+                builder = std::make_unique<clip_graph_qwen3vl>(ctx, img, batch_size);
             } break;
         case PROJECTOR_TYPE_EXAONE4_5:
             {
@@ -1476,7 +1486,7 @@ struct clip_model_loader {
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
-                        hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                        hparams.warmup_image_size = hparams.image_size; // warmup at actual tile size to match inference graph shape
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
                         if (hparams.image_min_pixels < warn_min_pixels) {
                             LOG_WRN("%s: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks\n", __func__);
@@ -3501,10 +3511,48 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     const clip_image_f32_batch & imgs = *imgs_c_ptr;
     int batch_size = imgs.entries.size();
 
-    // TODO @ngxson : implement batch size > 1 as a loop
-    //                we don't need true batching support because the cgraph will gonna be big anyway
-    if (batch_size != 1) {
-        return false; // only support batch size of 1
+    if (batch_size == 0) {
+        return false;
+    }
+
+    if (batch_size != 1 && ctx->proj_type() != PROJECTOR_TYPE_QWEN3VL) {
+        // Only Qwen3VL supports multi-tile batching; all other models encode one image at a time
+        return false;
+    }
+
+    LOG_INF("%s: encoding %d tile(s), grid=%dx%d, tile_size=%dx%d\n", __func__,
+            batch_size,
+            imgs.grid_x, imgs.grid_y,
+            batch_size > 0 ? (int)imgs.entries[0]->nx : 0,
+            batch_size > 0 ? (int)imgs.entries[0]->ny : 0);
+
+    // Sequential mode (--image-tile-mode sequential): encode tiles one by one instead of batching.
+    // Useful for benchmarking batched vs sequential encoding on the same tiling layout.
+    if (batch_size > 1 && ctx->tile_mode == CLIP_IMAGE_TILE_MODE_SEQUENTIAL) {
+        const int tile_nx = imgs.entries[0]->nx;
+        const int tile_ny = imgs.entries[0]->ny;
+        for (int b = 1; b < batch_size; b++) {
+            if (imgs.entries[b]->nx != tile_nx || imgs.entries[b]->ny != tile_ny) {
+                LOG_ERR("%s: sequential mode tile %d size %dx%d != expected %dx%d; all tiles must be the same size\n",
+                        __func__, b, imgs.entries[b]->nx, imgs.entries[b]->ny, tile_nx, tile_ny);
+                return false;
+            }
+        }
+        const int n_tokens_per_tile = clip_n_output_tokens(ctx, imgs.entries[0].get());
+        const int out_embd           = clip_n_mmproj_embd(ctx);
+        float * out_ptr = vec;
+        for (int b = 0; b < batch_size; b++) {
+            clip_image_f32_batch single;
+            single.entries.emplace_back(new clip_image_f32(*imgs.entries[b]));
+            single.grid_x = 1;
+            single.grid_y = 1;
+            bool ok = clip_image_batch_encode(ctx, n_threads, &single, out_ptr);
+            if (!ok) return false;
+            if (out_ptr != nullptr) {
+                out_ptr += (size_t)n_tokens_per_tile * out_embd;
+            }
+        }
+        return true;
     }
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
@@ -3560,7 +3608,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     if (!imgs.is_audio) {
         size_t nelem = 0;
         for (const auto & img : imgs.entries) {
-            nelem += img->nx * img->ny * 3;
+            nelem += (size_t)img->nx * (size_t)img->ny * 3;
         }
         std::vector<float> inp_raw(nelem);
 
@@ -3575,21 +3623,30 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         // └─────┘ │
         //   ──────┘ x B
 
-        for (size_t i = 0; i < imgs.entries.size(); i++) {
-            const int nx = imgs.entries[i]->nx;
-            const int ny = imgs.entries[i]->ny;
-            const int n = nx * ny;
-
-            for (int b = 0; b < batch_size; b++) {
-                float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x); // idx of the first channel
-                        size_t base_dst =    y * nx + x;  // idx of the first channel
-                        batch_entry[      base_dst] = imgs.entries[b]->buf[base_src    ];
-                        batch_entry[1*n + base_dst] = imgs.entries[b]->buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = imgs.entries[b]->buf[base_src + 2];
-                    }
+        // Layout: [nx, ny, 3, batch_size] — channel-first per tile, tiles packed along last dim.
+        // All tiles must be the same size (ensured by the Qwen3VL tiling preprocessor).
+        GGML_ASSERT(batch_size > 0);
+        const int tile_nx = imgs.entries[0]->nx;
+        const int tile_ny = imgs.entries[0]->ny;
+        for (int b = 1; b < batch_size; b++) {
+            if (imgs.entries[b]->nx != tile_nx || imgs.entries[b]->ny != tile_ny) {
+                LOG_ERR("%s: tile %d size %dx%d != expected %dx%d; all tiles must be the same size\n",
+                        __func__, b, imgs.entries[b]->nx, imgs.entries[b]->ny, tile_nx, tile_ny);
+                return false;
+            }
+        }
+        for (int b = 0; b < batch_size; b++) {
+            const int    nx = imgs.entries[b]->nx;
+            const int    ny = imgs.entries[b]->ny;
+            const size_t n  = (size_t)nx * (size_t)ny;
+            float * tile_entry = inp_raw.data() + (size_t)b * 3 * n;
+            for (int y = 0; y < ny; y++) {
+                for (int x = 0; x < nx; x++) {
+                    size_t base_src = 3 * (y * nx + x);
+                    size_t base_dst =      y * nx + x;
+                    tile_entry[      base_dst] = imgs.entries[b]->buf[base_src    ];
+                    tile_entry[1*n + base_dst] = imgs.entries[b]->buf[base_src + 1];
+                    tile_entry[2*n + base_dst] = imgs.entries[b]->buf[base_src + 2];
                 }
             }
         }
@@ -3739,7 +3796,6 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 set_input_i32("merger_ds_idx_3", m_ds_3);
             } break;
         case PROJECTOR_TYPE_QWEN2VL:
-        case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_GLM4V:
             {
                 const int merge_ratio = hparams.n_merge;
@@ -3756,6 +3812,43 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                                 positions[2 * num_patches + ptr] = y + dy;
                                 positions[3 * num_patches + ptr] = x + dx;
                                 ptr++;
+                            }
+                        }
+                    }
+                }
+
+                set_input_i32("positions", positions);
+            } break;
+        case PROJECTOR_TYPE_QWEN3VL:
+            {
+                // Multi-tile batching: each tile carries its own (pos_x, pos_y) offset so that
+                // M-RoPE sees absolute patch coordinates across the full image.
+                const int merge_ratio  = hparams.n_merge;
+                GGML_ASSERT(merge_ratio > 0);
+                const int pw           = image_size_width  / patch_size; // per-tile width in patches
+                const int ph           = image_size_height / patch_size; // per-tile height in patches
+                GGML_ASSERT(pw % merge_ratio == 0 && ph % merge_ratio == 0 &&
+                            "tile dimensions must be divisible by n_merge");
+                const int n_pos_tile   = pw * ph; // raw patches per tile == n_patches (graph sequence length)
+                // positions layout: tile-major [tile0: y,x,y,x | tile1: y,x,y,x
+                // | ...] each tile's block starts at b * n_pos_tile * 4
+                // (matches ggml_view_1d in graph)
+                std::vector<int32_t> positions((size_t)n_pos_tile * (size_t)batch_size * 4);
+                for (int b = 0; b < batch_size; b++) {
+                    const int x_off = imgs.entries[b]->pos_x;
+                    const int y_off = imgs.entries[b]->pos_y;
+                    const size_t base  = (size_t)b * (size_t)n_pos_tile * 4;
+                    int ptr = 0;
+                    for (int y = 0; y < ph; y += merge_ratio) {
+                        for (int x = 0; x < pw; x += merge_ratio) {
+                            for (int dy = 0; dy < merge_ratio; dy++) {
+                                for (int dx = 0; dx < merge_ratio; dx++) {
+                                    positions[base + ptr]                            = y_off + y + dy;
+                                    positions[base + (size_t)n_pos_tile + ptr]     = x_off + x + dx;
+                                    positions[base + (size_t)2 * n_pos_tile + ptr] = y_off + y + dy;
+                                    positions[base + (size_t)3 * n_pos_tile + ptr] = x_off + x + dx;
+                                    ptr++;
+                                }
                             }
                         }
                     }
@@ -4336,11 +4429,11 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     // the last node is the embedding tensor
     ggml_tensor * embeddings = ggml_graph_node(gf, -1);
 
-    // sanity check (only support batch size of 1 for now)
+    // sanity check: ne[1] = tokens per tile, ne[2] = batch_size (1 for non-batched models)
     const int n_tokens_out = embeddings->ne[1];
     const int expected_n_tokens_out = clip_n_output_tokens(ctx, imgs.entries[0].get());
     if (n_tokens_out != expected_n_tokens_out) {
-        LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
+        LOG_ERR("%s: expected output %d tokens (per tile), got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
         GGML_ABORT("Invalid number of output tokens");
     }
 
@@ -4351,13 +4444,14 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
     // Debug: dump final embeddings if MTMD_DEBUG_EMBEDDINGS is set
     if (ctx->debug_output_embeddings) {
-        const int64_t n_embd = embeddings->ne[0];
-        const int64_t n_tokens = embeddings->ne[1];
-        std::vector<float> emb_data(n_embd * n_tokens);
+        const int64_t n_embd   = embeddings->ne[0];
+        const int64_t n_tokens = embeddings->ne[1]; // per tile
+        const int64_t n_tiles  = embeddings->ne[2]; // batch_size (1 for non-batched models)
+        std::vector<float> emb_data(n_embd * n_tokens * n_tiles);
         ggml_backend_tensor_get(embeddings, emb_data.data(), 0, ggml_nbytes(embeddings));
 
         LOG_INF("\n=== MTMD_DEBUG_EMBEDDINGS ===\n");
-        LOG_INF("Shape: [%lld, %lld]\n", (long long)n_embd, (long long)n_tokens);
+        LOG_INF("Shape: [%lld, %lld, %lld]\n", (long long)n_embd, (long long)n_tokens, (long long)n_tiles);
 
         // Print first few values of first token
         LOG_INF("Token 0 (first 16 values): ");
@@ -4530,6 +4624,10 @@ std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * 
         result[dev] += size;
     }
     return result;
+}
+
+clip_image_tile_mode clip_get_tile_mode(const struct clip_ctx * ctx) {
+    return ctx->tile_mode;
 }
 
 //

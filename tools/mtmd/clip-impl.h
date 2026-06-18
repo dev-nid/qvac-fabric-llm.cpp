@@ -434,6 +434,10 @@ struct clip_image_f32 {
     int nx;
     int ny;
 
+    // tile offset in patch coordinates (for M-RoPE position assignment in multi-tile encoding)
+    int pos_x = 0;
+    int pos_y = 0;
+
     std::vector<float> buf;
 
     // marks the global view in e.g., DeepSeek-OCR Models

@@ -102,6 +102,19 @@ struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
     bool preprocess(const clip_image_u8 & img, clip_image_f32_batch & output) override;
 };
 
+// Qwen3VL tiling preprocessor: splits image into an N×M grid of equal-size tiles
+// (tile size = hparams.image_size). Each tile carries pos_x/pos_y (patch-coord offset)
+// for M-RoPE position assignment. Falls back to dyn_size when image fits in one tile.
+struct mtmd_image_preprocessor_qwen3vl : mtmd_image_preprocessor {
+    static constexpr int max_tiles = 4;  // max tiles (2×2 grid); increase for larger images
+
+    mtmd_image_preprocessor_qwen3vl(const clip_ctx * ctx)
+        : mtmd_image_preprocessor(ctx) {
+        GGML_ASSERT(clip_get_tile_mode(ctx) != CLIP_IMAGE_TILE_MODE_DISABLED);
+    }
+    bool preprocess(const clip_image_u8 & img, clip_image_f32_batch & output) override;
+};
+
 // similar to mtmd_image_preprocessor_dyn_size, but resize the image to have longest edge equal to hparams.image_longest_edge, while preserving aspect ratio
 struct mtmd_image_preprocessor_longest_edge : mtmd_image_preprocessor {
     mtmd_image_preprocessor_longest_edge(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
