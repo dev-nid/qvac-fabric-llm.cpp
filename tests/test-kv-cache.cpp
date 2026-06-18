@@ -77,7 +77,9 @@ static llama_ubatch make_image_grid_ubatch() {
     data.seq_id.resize(TEST_N_TOKENS);
     data.seq_id_data.resize(TEST_N_TOKENS, TEST_SEQ_ID);
     data.seq_id_unq.push_back(TEST_SEQ_ID);
-    data.output.resize(TEST_N_TOKENS, 0);
+    // assign() fill-constructs the buffer; resize(n, 0) on this int8_t vector trips a
+    // -Wstringop-overflow false positive on GCC 16 (-O3) via _M_fill_append's move path.
+    data.output.assign(TEST_N_TOKENS, 0);
 
     for (uint32_t i = 0; i < TEST_N_TOKENS; ++i) {
         data.seq_id[i] = &data.seq_id_data[i];
