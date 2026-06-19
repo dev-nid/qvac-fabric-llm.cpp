@@ -4246,6 +4246,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     return GGML_STATUS_SUCCESS;
 }
 
+enum ggml_opencl_q8_0_layout {
+    GGML_OPENCL_Q8_0_LAYOUT_UNKNOWN,
+    GGML_OPENCL_Q8_0_LAYOUT_GENERIC,
+    GGML_OPENCL_Q8_0_LAYOUT_SOA,
+};
+
+static ggml_opencl_q8_0_layout ggml_cl_q8_0_layout(const ggml_tensor * tensor);
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -4310,13 +4318,22 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                         default:
                             return false;
                     }
-                case GGML_TYPE_Q8_0:
-                    return op->op == GGML_OP_CPY &&
+                case GGML_TYPE_Q8_0: {
+                    if (!(op->op == GGML_OP_CPY &&
                         op->type == GGML_TYPE_Q8_0 &&
                         op->src[1] != nullptr &&
                         op->src[1]->type == GGML_TYPE_Q8_0 &&
                         ggml_is_contiguous(op->src[0]) &&
-                        ggml_is_contiguous(op->src[1]);
+                        ggml_is_contiguous(op->src[1]))) {
+                        return false;
+                    }
+
+                    const ggml_opencl_q8_0_layout src0_layout = ggml_cl_q8_0_layout(op->src[0]);
+                    const ggml_opencl_q8_0_layout src1_layout = ggml_cl_q8_0_layout(op->src[1]);
+                    return src0_layout != GGML_OPENCL_Q8_0_LAYOUT_UNKNOWN &&
+                           src1_layout != GGML_OPENCL_Q8_0_LAYOUT_UNKNOWN &&
+                           src0_layout == src1_layout;
+                }
                 default:
                     return false;
             }
@@ -4934,6 +4951,24 @@ struct ggml_backend_opencl_buffer_context {
     std::vector<cl_mem> img;
     std::string name;
 };
+
+static ggml_opencl_q8_0_layout ggml_cl_q8_0_layout(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_Q8_0 || tensor->extra == nullptr) {
+        return GGML_OPENCL_Q8_0_LAYOUT_UNKNOWN;
+    }
+
+    const ggml_tensor * base = tensor->view_src != nullptr ? tensor->view_src : tensor;
+    if (base->buffer == nullptr ||
+        base->buffer->buft == nullptr ||
+        base->buffer->buft->iface.get_name != ggml_backend_opencl_buffer_type_get_name) {
+        return GGML_OPENCL_Q8_0_LAYOUT_UNKNOWN;
+    }
+
+    ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) base->buffer->context;
+    return ctx->is_soa_q8_0_extra(tensor->extra) ?
+        GGML_OPENCL_Q8_0_LAYOUT_SOA :
+        GGML_OPENCL_Q8_0_LAYOUT_GENERIC;
+}
 
 static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
@@ -13162,17 +13197,20 @@ static void ggml_cl_scale(ggml_backend_t backend, const ggml_tensor * src0, cons
 }
 
 static bool ggml_cl_has_soa_q8_0_extra(const ggml_tensor * tensor) {
-    if (tensor == nullptr || tensor->type != GGML_TYPE_Q8_0 || tensor->extra == nullptr) {
-        return false;
+    return ggml_cl_q8_0_layout(tensor) == GGML_OPENCL_Q8_0_LAYOUT_SOA;
+}
+
+static const char * ggml_cl_q8_0_layout_name(ggml_opencl_q8_0_layout layout) {
+    switch (layout) {
+        case GGML_OPENCL_Q8_0_LAYOUT_GENERIC:
+            return "generic";
+        case GGML_OPENCL_Q8_0_LAYOUT_SOA:
+            return "SOA";
+        case GGML_OPENCL_Q8_0_LAYOUT_UNKNOWN:
+            return "unknown";
     }
 
-    const ggml_tensor * base = tensor->view_src != nullptr ? tensor->view_src : tensor;
-    if (base->buffer == nullptr) {
-        return false;
-    }
-
-    ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) base->buffer->context;
-    return ctx->is_soa_q8_0_extra(tensor->extra);
+    return "invalid";
 }
 
 static void ggml_cl_copy_buffer_region(ggml_backend_opencl_context * backend_ctx, cl_mem src, size_t src_offset, cl_mem dst, size_t dst_offset, size_t size) {
@@ -13203,11 +13241,15 @@ static void ggml_cl_cpy_q8_0(ggml_backend_opencl_context * backend_ctx, const gg
     GGML_ASSERT(src0->view_offs % ggml_type_size(src0->type) == 0);
     GGML_ASSERT(src1->view_offs % ggml_type_size(src1->type) == 0);
 
-    const bool src0_soa = ggml_cl_has_soa_q8_0_extra(src0);
-    const bool src1_soa = ggml_cl_has_soa_q8_0_extra(src1);
-    GGML_ASSERT(src0_soa == src1_soa);
+    const ggml_opencl_q8_0_layout src0_layout = ggml_cl_q8_0_layout(src0);
+    const ggml_opencl_q8_0_layout src1_layout = ggml_cl_q8_0_layout(src1);
+    if (src0_layout != src1_layout || src0_layout == GGML_OPENCL_Q8_0_LAYOUT_UNKNOWN) {
+        GGML_LOG_ERROR("%s: unsupported Q8_0 OpenCL copy from %s layout to %s layout\n",
+            __func__, ggml_cl_q8_0_layout_name(src0_layout), ggml_cl_q8_0_layout_name(src1_layout));
+        GGML_ABORT("unsupported Q8_0 OpenCL copy layout");
+    }
 
-    if (src0_soa) {
+    if (src0_layout == GGML_OPENCL_Q8_0_LAYOUT_SOA) {
         ggml_tensor_extra_cl_q8_0 * extra0 = (ggml_tensor_extra_cl_q8_0 *) src0->extra;
         ggml_tensor_extra_cl_q8_0 * extra1 = (ggml_tensor_extra_cl_q8_0 *) src1->extra;
 
