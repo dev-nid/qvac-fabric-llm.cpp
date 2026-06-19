@@ -3894,6 +3894,7 @@ struct ggml_tensor_extra_cl_q8_0 {
 
     size_t size_q = 0;
     size_t size_d = 0;
+    bool adreno_transposed = false;
 
     ~ggml_tensor_extra_cl_q8_0() {
         reset();
@@ -3917,6 +3918,7 @@ struct ggml_tensor_extra_cl_q8_0 {
         d_img = nullptr;
         size_q = 0;
         size_d = 0;
+        adreno_transposed = false;
     }
 };
 
@@ -4253,6 +4255,7 @@ enum ggml_opencl_q8_0_layout {
 };
 
 static ggml_opencl_q8_0_layout ggml_cl_q8_0_layout(const ggml_tensor * tensor);
+static bool ggml_cl_q8_0_copy_supported(const ggml_tensor * src0, const ggml_tensor * src1);
 
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
@@ -4328,11 +4331,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                         return false;
                     }
 
-                    const ggml_opencl_q8_0_layout src0_layout = ggml_cl_q8_0_layout(op->src[0]);
-                    const ggml_opencl_q8_0_layout src1_layout = ggml_cl_q8_0_layout(op->src[1]);
-                    return src0_layout != GGML_OPENCL_Q8_0_LAYOUT_UNKNOWN &&
-                           src1_layout != GGML_OPENCL_Q8_0_LAYOUT_UNKNOWN &&
-                           src0_layout == src1_layout;
+                    return ggml_cl_q8_0_copy_supported(op->src[0], op->src[1]);
                 }
                 default:
                     return false;
@@ -4970,6 +4969,55 @@ static ggml_opencl_q8_0_layout ggml_cl_q8_0_layout(const ggml_tensor * tensor) {
         GGML_OPENCL_Q8_0_LAYOUT_GENERIC;
 }
 
+static bool ggml_cl_q8_0_is_adreno_transposed(const ggml_tensor * tensor) {
+    if (ggml_cl_q8_0_layout(tensor) != GGML_OPENCL_Q8_0_LAYOUT_SOA) {
+        return false;
+    }
+
+    ggml_tensor_extra_cl_q8_0 * extra = (ggml_tensor_extra_cl_q8_0 *) tensor->extra;
+    return extra->adreno_transposed;
+}
+
+static bool ggml_cl_q8_0_same_shape(const ggml_tensor * src0, const ggml_tensor * src1) {
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (src0->ne[i] != src1->ne[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool ggml_cl_q8_0_copy_supported(const ggml_tensor * src0, const ggml_tensor * src1) {
+    const ggml_opencl_q8_0_layout src0_layout = ggml_cl_q8_0_layout(src0);
+    const ggml_opencl_q8_0_layout src1_layout = ggml_cl_q8_0_layout(src1);
+    if (src0_layout == GGML_OPENCL_Q8_0_LAYOUT_UNKNOWN ||
+        src1_layout == GGML_OPENCL_Q8_0_LAYOUT_UNKNOWN ||
+        src0_layout != src1_layout) {
+        return false;
+    }
+
+    if (src0_layout == GGML_OPENCL_Q8_0_LAYOUT_GENERIC) {
+        return true;
+    }
+
+    const bool src0_transposed = ggml_cl_q8_0_is_adreno_transposed(src0);
+    const bool src1_transposed = ggml_cl_q8_0_is_adreno_transposed(src1);
+    if (src0_transposed != src1_transposed) {
+        return false;
+    }
+
+    if (!src0_transposed) {
+        return true;
+    }
+
+    return src0->view_src == nullptr &&
+           src1->view_src == nullptr &&
+           src0->view_offs == 0 &&
+           src1->view_offs == 0 &&
+           ggml_cl_q8_0_same_shape(src0, src1);
+}
+
 static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
     GGML_LOG_INFO("[DEBUG] opencl buf FREE  cl_mem=%p size=%.2f MiB\n",
@@ -5576,6 +5624,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
             transpose_2d_as_32b(backend_ctx, extra->q, extra->q, size_q, K/4,  M);
             transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, K/32, M);
+            extra->adreno_transposed = true;
         } // end transpose
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
@@ -13213,6 +13262,14 @@ static const char * ggml_cl_q8_0_layout_name(ggml_opencl_q8_0_layout layout) {
     return "invalid";
 }
 
+static const char * ggml_cl_q8_0_storage_name(const ggml_tensor * tensor) {
+    if (ggml_cl_q8_0_is_adreno_transposed(tensor)) {
+        return "SOA transposed";
+    }
+
+    return ggml_cl_q8_0_layout_name(ggml_cl_q8_0_layout(tensor));
+}
+
 static void ggml_cl_copy_buffer_region(ggml_backend_opencl_context * backend_ctx, cl_mem src, size_t src_offset, cl_mem dst, size_t dst_offset, size_t size) {
     if (size == 0) {
         return;
@@ -13241,14 +13298,13 @@ static void ggml_cl_cpy_q8_0(ggml_backend_opencl_context * backend_ctx, const gg
     GGML_ASSERT(src0->view_offs % ggml_type_size(src0->type) == 0);
     GGML_ASSERT(src1->view_offs % ggml_type_size(src1->type) == 0);
 
-    const ggml_opencl_q8_0_layout src0_layout = ggml_cl_q8_0_layout(src0);
-    const ggml_opencl_q8_0_layout src1_layout = ggml_cl_q8_0_layout(src1);
-    if (src0_layout != src1_layout || src0_layout == GGML_OPENCL_Q8_0_LAYOUT_UNKNOWN) {
+    if (!ggml_cl_q8_0_copy_supported(src0, src1)) {
         GGML_LOG_ERROR("%s: unsupported Q8_0 OpenCL copy from %s layout to %s layout\n",
-            __func__, ggml_cl_q8_0_layout_name(src0_layout), ggml_cl_q8_0_layout_name(src1_layout));
+            __func__, ggml_cl_q8_0_storage_name(src0), ggml_cl_q8_0_storage_name(src1));
         GGML_ABORT("unsupported Q8_0 OpenCL copy layout");
     }
 
+    const ggml_opencl_q8_0_layout src0_layout = ggml_cl_q8_0_layout(src0);
     if (src0_layout == GGML_OPENCL_Q8_0_LAYOUT_SOA) {
         ggml_tensor_extra_cl_q8_0 * extra0 = (ggml_tensor_extra_cl_q8_0 *) src0->extra;
         ggml_tensor_extra_cl_q8_0 * extra1 = (ggml_tensor_extra_cl_q8_0 *) src1->extra;
