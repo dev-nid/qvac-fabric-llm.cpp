@@ -4310,6 +4310,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                         default:
                             return false;
                     }
+                case GGML_TYPE_Q8_0:
+                    return op->op == GGML_OP_CPY &&
+                        op->type == GGML_TYPE_Q8_0 &&
+                        op->src[1] != nullptr &&
+                        op->src[1]->type == GGML_TYPE_Q8_0 &&
+                        ggml_is_contiguous(op->src[0]) &&
+                        ggml_is_contiguous(op->src[1]);
                 default:
                     return false;
             }
@@ -13154,6 +13161,79 @@ static void ggml_cl_scale(ggml_backend_t backend, const ggml_tensor * src0, cons
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size_ptr, dst);
 }
 
+static bool ggml_cl_has_soa_q8_0_extra(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_Q8_0 || tensor->extra == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * base = tensor->view_src != nullptr ? tensor->view_src : tensor;
+    if (base->buffer == nullptr) {
+        return false;
+    }
+
+    ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) base->buffer->context;
+    return ctx->is_soa_q8_0_extra(tensor->extra);
+}
+
+static void ggml_cl_copy_buffer_region(ggml_backend_opencl_context * backend_ctx, cl_mem src, size_t src_offset, cl_mem dst, size_t dst_offset, size_t size) {
+    if (size == 0) {
+        return;
+    }
+
+    const bool overlaps = src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size;
+    if (!overlaps) {
+        CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, src, dst, src_offset, dst_offset, size, 0, NULL, NULL));
+        return;
+    }
+
+    cl_int err;
+    cl_mem tmp = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
+    CL_CHECK(err);
+    CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, src, tmp, src_offset, 0, size, 0, NULL, NULL));
+    CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, tmp, dst, 0, dst_offset, size, 0, NULL, NULL));
+    CL_CHECK(clReleaseMemObject(tmp));
+}
+
+static void ggml_cl_cpy_q8_0(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
+    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(src1->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(src1));
+    GGML_ASSERT(src0->view_offs % ggml_type_size(src0->type) == 0);
+    GGML_ASSERT(src1->view_offs % ggml_type_size(src1->type) == 0);
+
+    const bool src0_soa = ggml_cl_has_soa_q8_0_extra(src0);
+    const bool src1_soa = ggml_cl_has_soa_q8_0_extra(src1);
+    GGML_ASSERT(src0_soa == src1_soa);
+
+    if (src0_soa) {
+        ggml_tensor_extra_cl_q8_0 * extra0 = (ggml_tensor_extra_cl_q8_0 *) src0->extra;
+        ggml_tensor_extra_cl_q8_0 * extra1 = (ggml_tensor_extra_cl_q8_0 *) src1->extra;
+
+        const size_t block_count = ggml_nelements(src0) / ggml_blck_size(src0->type);
+        const size_t src0_block_offset = src0->view_offs / ggml_type_size(src0->type);
+        const size_t src1_block_offset = src1->view_offs / ggml_type_size(src1->type);
+
+        ggml_cl_copy_buffer_region(
+            backend_ctx, extra0->d, src0_block_offset * sizeof(ggml_fp16_t),
+            extra1->d, src1_block_offset * sizeof(ggml_fp16_t),
+            block_count * sizeof(ggml_fp16_t));
+        ggml_cl_copy_buffer_region(
+            backend_ctx, extra0->q, src0_block_offset * ggml_blck_size(src0->type),
+            extra1->q, src1_block_offset * ggml_blck_size(src1->type),
+            block_count * ggml_blck_size(src0->type));
+        return;
+    }
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) src0->extra;
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *) src1->extra;
+    ggml_cl_copy_buffer_region(
+        backend_ctx, extra0->data_device, extra0->offset + src0->view_offs,
+        extra1->data_device, extra1->offset + src1->view_offs,
+        ggml_nbytes(src0));
+}
+
 static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -13173,6 +13253,11 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
     const enum ggml_type src1t = src1->type;
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    if (src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_Q8_0) {
+        ggml_cl_cpy_q8_0(backend_ctx, src0, src1);
+        return;
+    }
 
     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
