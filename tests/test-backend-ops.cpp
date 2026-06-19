@@ -5060,6 +5060,117 @@ struct test_conv_2d : public test_case {
     }
 };
 
+// CONV_2D -> ADD(per-channel bias) [-> UNARY(relu|hardswish)] fusion.
+// The CPU backend collapses this chain into a single fused pass
+// (ggml_compute_forward_conv_2d_fused); run_whole_graph() makes the framework
+// compare the fused result against the unfused use_ref reference.
+struct test_conv_2d_bias_act : public test_case {
+    const std::array<int64_t, 4> ne_input;
+    const std::array<int64_t, 4> ne_kernel;
+    const int                    act; // 0=none, 1=relu, 2=hardswish
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_2D_BIAS_ACT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne_input, ne_kernel, act);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_conv_2d_bias_act(std::array<int64_t, 4> ne_input  = { 19, 13, 8, 1 },
+                          std::array<int64_t, 4> ne_kernel = {  3,  3, 8, 6 },
+                          int act = 1) :
+        ne_input(ne_input), ne_kernel(ne_kernel), act(act) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_input.data());
+        ggml_set_param(input);
+        ggml_set_name(input, "input");
+
+        ggml_tensor * kernel = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_kernel.data());
+        ggml_set_param(kernel);
+        ggml_set_name(kernel, "kernel");
+
+        ggml_tensor * conv = ggml_conv_2d_direct(ctx, kernel, input, 1, 1, 1, 1, 1, 1);
+
+        // per-channel bias broadcast over the conv output: [1, 1, OC, 1]
+        const int64_t oc = ne_kernel[3];
+        ggml_tensor * bias = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, oc, 1);
+        ggml_set_param(bias);
+        ggml_set_name(bias, "bias");
+
+        ggml_tensor * out = ggml_add(ctx, conv, bias);
+        if (act == 1) {
+            out = ggml_relu(ctx, out);
+        } else if (act == 2) {
+            out = ggml_hardswish(ctx, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -2.0f, 2.0f);
+        }
+    }
+};
+
+// Standalone ADD(per-channel bias) -> UNARY(relu|hardswish) fusion (the path
+// taken after the explicit im2col + mul_mat conv lowering). The CPU backend
+// fuses it via ggml_compute_forward_add_unary_fused.
+struct test_add_bias_act : public test_case {
+    const std::array<int64_t, 4> ne; // full-tensor shape [W, H, C, N]
+    const int                    act; // 1=relu, 2=hardswish
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_BIAS_ACT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, act);
+    }
+
+    test_add_bias_act(std::array<int64_t, 4> ne = { 17, 11, 6, 2 }, int act = 1) :
+        ne(ne), act(act) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        // per-channel bias broadcast over a: [1, 1, C, 1]
+        ggml_tensor * bias = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, ne[2], 1);
+        ggml_set_param(bias);
+        ggml_set_name(bias, "bias");
+
+        ggml_tensor * out = ggml_add(ctx, a, bias);
+        if (act == 2) {
+            out = ggml_hardswish(ctx, out);
+        } else {
+            out = ggml_relu(ctx, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -2.0f, 2.0f);
+        }
+    }
+};
+
 // GGML_OP_CONV_2D_DW
 struct test_conv_2d_dw : public test_case {
     const std::array<int64_t, 4> ne_input;
@@ -7760,6 +7871,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // CPU CONV_2D -> ADD(bias) [-> UNARY] and standalone ADD(bias) -> UNARY
+    // fusion: verifies the fused pass matches the unfused reference (relu and
+    // hardswish, with and without the trailing activation).
+    test_cases.emplace_back(new test_conv_2d_bias_act({ 19, 13, 8, 1 }, { 3, 3, 8, 6 }, 0));
+    test_cases.emplace_back(new test_conv_2d_bias_act({ 19, 13, 8, 1 }, { 3, 3, 8, 6 }, 1));
+    test_cases.emplace_back(new test_conv_2d_bias_act({ 19, 13, 8, 1 }, { 3, 3, 8, 6 }, 2));
+    test_cases.emplace_back(new test_conv_2d_bias_act({ 28, 28, 16, 2 }, { 1, 1, 16, 24 }, 1));
+    test_cases.emplace_back(new test_add_bias_act({ 17, 11, 6, 2 }, 1));
+    test_cases.emplace_back(new test_add_bias_act({ 17, 11, 6, 2 }, 2));
 
     // sycl backend will limit task global_range < MAX_INT
     // test cases for 2D im2col with large input W and H (occurs in stable-diffusion)

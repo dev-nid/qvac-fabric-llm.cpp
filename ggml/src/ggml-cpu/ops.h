@@ -71,6 +71,14 @@ void ggml_compute_forward_im2col(const struct ggml_compute_params * params, stru
 void ggml_compute_forward_im2col_back_f32(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_im2col_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_conv_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+// CONV_2D with a fused epilogue: optional per-channel bias add (`fuse_bias`,
+// F32 [1,1,OC,1]) and optional unary activation (`fuse_act`, a ggml_unary_op
+// or -1), writing the result to `out` (same shape as `conv_dst`). Used by the
+// graph-compute loop to collapse CONV_2D -> ADD -> UNARY chains into a single
+// pass over the output tensor.
+void ggml_compute_forward_conv_2d_fused(const struct ggml_compute_params * params, struct ggml_tensor * conv_dst, const struct ggml_tensor * fuse_bias, int32_t fuse_act, struct ggml_tensor * out);
+// Fused ADD(per-channel bias) + UNARY(relu|hardswish) pass; see ops.cpp.
+void ggml_compute_forward_add_unary_fused(const struct ggml_compute_params * params, struct ggml_tensor * add_dst, int32_t fuse_act, struct ggml_tensor * out);
 void ggml_compute_forward_conv_3d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_conv_transpose_2d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_conv_2d_dw(const struct ggml_compute_params * params, struct ggml_tensor * dst);

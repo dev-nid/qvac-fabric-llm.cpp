@@ -3115,6 +3115,70 @@ static int ggml_cpu_try_fuse_ops(
         }
     }
 
+    if (node->op == GGML_OP_CONV_2D) {
+        // Collapse CONV_2D -> ADD(per-channel bias) [-> UNARY(relu|hardswish)]
+        // chains into one fused kernel call: the bias add and activation are
+        // applied while the GEMM result is still hot instead of as separate
+        // full-tensor passes. The skipped nodes' outputs are never read (single
+        // use, checked by ggml_can_fuse).
+        static const enum ggml_op fuse_ops3[3] = {GGML_OP_CONV_2D, GGML_OP_ADD, GGML_OP_UNARY};
+        static const enum ggml_op fuse_ops2[2] = {GGML_OP_CONV_2D, GGML_OP_ADD};
+        int fuse_extra = 0;
+        int32_t fuse_act = -1;
+        struct ggml_tensor * fuse_out = NULL;
+        if (ggml_can_fuse(cgraph, node_n, fuse_ops3, 3)) {
+            struct ggml_tensor * unary_node = cgraph->nodes[node_n + 2];
+            const enum ggml_unary_op uop = ggml_get_unary_op(unary_node);
+            if ((uop == GGML_UNARY_OP_RELU || uop == GGML_UNARY_OP_HARDSWISH) &&
+                unary_node->type == GGML_TYPE_F32) {
+                fuse_extra = 2;
+                fuse_act   = (int32_t) uop;
+                fuse_out   = unary_node;
+            }
+        }
+        if (fuse_extra == 0 && ggml_can_fuse(cgraph, node_n, fuse_ops2, 2)) {
+            fuse_extra = 1;
+            fuse_out   = cgraph->nodes[node_n + 1];
+        }
+        if (fuse_extra > 0) {
+            const struct ggml_tensor * add_node = cgraph->nodes[node_n + 1];
+            const struct ggml_tensor * bias =
+                add_node->src[0] == node ? add_node->src[1] : add_node->src[0];
+            // require ADD to broadcast a contiguous F32 [1,1,OC,1] row over the
+            // conv output (the conv must be the full-shape operand)
+            if (add_node->src[0] == node && add_node->type == GGML_TYPE_F32 &&
+                bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
+                bias->ne[0] == 1 && bias->ne[1] == 1 &&
+                bias->ne[2] == node->ne[2] && bias->ne[3] == 1) {
+                ggml_compute_forward_conv_2d_fused(params, node, bias, fuse_act, fuse_out);
+                return fuse_extra;
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_ADD) {
+        // Standalone ADD(per-channel bias) -> UNARY(relu|hardswish) pairs (e.g.
+        // after the explicit im2col + mul_mat conv lowering) fuse into one pass.
+        const enum ggml_op fuse_au[2] = {GGML_OP_ADD, GGML_OP_UNARY};
+        if (ggml_can_fuse(cgraph, node_n, fuse_au, 2)) {
+            struct ggml_tensor * unary_node = cgraph->nodes[node_n + 1];
+            const enum ggml_unary_op uop = ggml_get_unary_op(unary_node);
+            const struct ggml_tensor * a0 = node->src[0];
+            const struct ggml_tensor * a1 = node->src[1];
+            if ((uop == GGML_UNARY_OP_RELU || uop == GGML_UNARY_OP_HARDSWISH) &&
+                node->type == GGML_TYPE_F32 && unary_node->type == GGML_TYPE_F32 &&
+                a0->type == GGML_TYPE_F32 && a1->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(node, a0) &&
+                ggml_is_contiguous(a0) && ggml_is_contiguous(a1) &&
+                ggml_is_contiguous(unary_node) &&
+                a1->ne[0] == 1 && a1->ne[1] == 1 &&
+                a1->ne[2] == a0->ne[2] && a1->ne[3] == 1) {
+                ggml_compute_forward_add_unary_fused(params, node, (int32_t) uop, unary_node);
+                return 1;
+            }
+        }
+    }
+
     return 0;
 }
 
