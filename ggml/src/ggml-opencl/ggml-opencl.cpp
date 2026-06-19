@@ -4810,6 +4810,44 @@ struct ggml_backend_opencl_buffer_context {
         return extra;
     }
 
+    template <typename T>
+    static bool contains_extra(const std::vector<T *> & extras, const void * extra) {
+        for (const T * e : extras) {
+            if (e == extra) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool is_soa_q4_0_extra(const void * extra) const {
+        return contains_extra(temp_tensor_extras_q4_0_in_use, extra);
+    }
+
+    bool is_soa_q4_1_extra(const void * extra) const {
+        return contains_extra(temp_tensor_extras_q4_1_in_use, extra);
+    }
+
+    bool is_soa_mxfp4_extra(const void * extra) const {
+        return contains_extra(temp_tensor_extras_mxfp4_in_use, extra);
+    }
+
+    bool is_soa_q8_0_extra(const void * extra) const {
+        return contains_extra(temp_tensor_extras_q8_0_in_use, extra);
+    }
+
+    bool is_soa_q4_K_extra(const void * extra) const {
+        return contains_extra(temp_tensor_extras_q4_K_in_use, extra);
+    }
+
+    bool is_soa_q5_K_extra(const void * extra) const {
+        return contains_extra(temp_tensor_extras_q5_K_in_use, extra);
+    }
+
+    bool is_soa_q6_K_extra(const void * extra) const {
+        return contains_extra(temp_tensor_extras_q6_K_in_use, extra);
+    }
+
     void reset() {
         for (ggml_tensor_extra_cl * e : temp_tensor_extras_in_use) {
             temp_tensor_extras.push_back(e);
@@ -5846,6 +5884,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     GGML_ASSERT(tensor->extra);
 
     ggml_backend_opencl_context *backend_ctx = ggml_cl2_init(buffer->buft->device);
+    ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
 
     cl_context context = backend_ctx->context;
     cl_command_queue queue = backend_ctx->queue;
@@ -5860,7 +5899,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     // which requires reading back quantized weight tensors.
     // To properly support this, we need to restore block_q4_0 struct arrays
     // from the flattened buffers.
-    if (tensor->type == GGML_TYPE_Q4_0) {
+    if (tensor->type == GGML_TYPE_Q4_0 && ctx->is_soa_q4_0_extra(tensor->extra)) {
         ggml_tensor_extra_cl_q4_0 * extra = (ggml_tensor_extra_cl_q4_0 *)tensor->extra;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -5971,7 +6010,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
         return;
     }
-    if (tensor->type == GGML_TYPE_Q4_1) {
+    if (tensor->type == GGML_TYPE_Q4_1 && ctx->is_soa_q4_1_extra(tensor->extra)) {
         ggml_tensor_extra_cl_q4_1 * extra = (ggml_tensor_extra_cl_q4_1 *)tensor->extra;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -6045,7 +6084,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
         return;
     }
-    if (tensor->type == GGML_TYPE_MXFP4) {
+    if (tensor->type == GGML_TYPE_MXFP4 && ctx->is_soa_mxfp4_extra(tensor->extra)) {
         ggml_tensor_extra_cl_mxfp4 * extra = (ggml_tensor_extra_cl_mxfp4 *)tensor->extra;
 
         cl_int err;
@@ -6098,7 +6137,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
         return;
     }
-    if (tensor->type == GGML_TYPE_Q8_0) {
+    if (tensor->type == GGML_TYPE_Q8_0 && ctx->is_soa_q8_0_extra(tensor->extra)) {
         ggml_tensor_extra_cl_q8_0 * extra = (ggml_tensor_extra_cl_q8_0 *)tensor->extra;
 
         cl_int err;
@@ -6154,7 +6193,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
         return;
     }
-    if (tensor->type == GGML_TYPE_Q4_K) {
+    if (tensor->type == GGML_TYPE_Q4_K && ctx->is_soa_q4_K_extra(tensor->extra)) {
         ggml_tensor_extra_cl_q4_K * extra = (ggml_tensor_extra_cl_q4_K *)tensor->extra;
 
         cl_int err;
@@ -6230,7 +6269,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
         return;
     }
-    if (tensor->type == GGML_TYPE_Q5_K) {
+    if (tensor->type == GGML_TYPE_Q5_K && ctx->is_soa_q5_K_extra(tensor->extra)) {
         ggml_tensor_extra_cl_q5_K * extra = (ggml_tensor_extra_cl_q5_K *)tensor->extra;
 
         cl_int err;
@@ -6312,7 +6351,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
         return;
     }
-    if (tensor->type == GGML_TYPE_Q6_K) {
+    if (tensor->type == GGML_TYPE_Q6_K && ctx->is_soa_q6_K_extra(tensor->extra)) {
         ggml_tensor_extra_cl_q6_K * extra = (ggml_tensor_extra_cl_q6_K *)tensor->extra;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
