@@ -3526,9 +3526,8 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             batch_size > 0 ? (int)imgs.entries[0]->nx : 0,
             batch_size > 0 ? (int)imgs.entries[0]->ny : 0);
 
-    // Sequential mode (--image-tile-mode sequential): encode tiles one by one instead of batching.
-    // Useful for benchmarking batched vs sequential encoding on the same tiling layout.
-    if (batch_size > 1 && ctx->tile_mode == CLIP_IMAGE_TILE_MODE_SEQUENTIAL) {
+    // Encode tiles one by one. Used for SEQUENTIAL tile mode and as OOM fallback from BATCHED mode.
+    auto do_encode_sequential = [&]() -> bool {
         const int tile_nx = imgs.entries[0]->nx;
         const int tile_ny = imgs.entries[0]->ny;
         for (int b = 1; b < batch_size; b++) {
@@ -3553,6 +3552,11 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             }
         }
         return true;
+    };
+
+    // Explicit sequential mode.
+    if (batch_size > 1 && ctx->tile_mode == CLIP_IMAGE_TILE_MODE_SEQUENTIAL) {
+        return do_encode_sequential();
     }
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
@@ -3563,7 +3567,11 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_image_build_graph(ctx, imgs);
-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+        // Allocation failed (OOM) — fall back to sequential.
+        LOG_WRN("%s: batched graph alloc failed (OOM), retrying with sequential encoding\n", __func__);
+        return do_encode_sequential();
+    }
 
     // set inputs
     const auto & model   = ctx->model;
