@@ -865,42 +865,57 @@ struct mtmd_tokenizer {
                 }
 
             } else {
-                size_t n_tokens = 0;
-                for (const auto & entry : batch_f32.entries) {
-                    n_tokens += clip_n_output_tokens(ctx->ctx_v, entry.get());
-                }
+                // Build one image chunk from a batch with explicit grid dims, then append it.
+                auto emit_image_chunk = [&](clip_image_f32_batch && b, int gx, int gy) {
+                    size_t n_tokens = 0;
+                    for (const auto & entry : b.entries) {
+                        n_tokens += clip_n_output_tokens(ctx->ctx_v, entry.get());
+                    }
 
-                mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
-                if (mtmd_decode_use_mrope(ctx)) {
-                    // for Qwen2VL/Qwen3VL, set full-image grid dims for M-RoPE decoding
-                    const int tile_nx = clip_n_output_tokens_x(ctx->ctx_v, batch_f32.entries[0].get());
-                    const int tile_ny = clip_n_output_tokens_y(ctx->ctx_v, batch_f32.entries[0].get());
-                    const int gx = batch_f32.grid_x > 0 ? batch_f32.grid_x : 1;
-                    const int gy = batch_f32.grid_y > 0 ? batch_f32.grid_y : 1;
-                    image_tokens->nx     = tile_nx * gx;
-                    image_tokens->ny     = tile_ny * gy;
-                    image_tokens->grid_x = gx;
-                    image_tokens->grid_y = gy;
-                    image_tokens->use_mrope_pos = true;
-                } else {
-                    // other models, we only need the total number of tokens
-                    image_tokens->nx = n_tokens;
-                    image_tokens->ny = 1;
-                }
-                image_tokens->batch_f32 = std::move(batch_f32);
-                image_tokens->id = bitmap->id; // optional
+                    mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+                    if (mtmd_decode_use_mrope(ctx)) {
+                        // for Qwen2VL/Qwen3VL, set full-image grid dims for M-RoPE decoding
+                        const int tile_nx = clip_n_output_tokens_x(ctx->ctx_v, b.entries[0].get());
+                        const int tile_ny = clip_n_output_tokens_y(ctx->ctx_v, b.entries[0].get());
+                        image_tokens->nx     = tile_nx * gx;
+                        image_tokens->ny     = tile_ny * gy;
+                        image_tokens->grid_x = gx;
+                        image_tokens->grid_y = gy;
+                        image_tokens->use_mrope_pos = true;
+                    } else {
+                        // other models, we only need the total number of tokens
+                        image_tokens->nx = n_tokens;
+                        image_tokens->ny = 1;
+                    }
+                    image_tokens->batch_f32 = std::move(b);
+                    image_tokens->id = bitmap->id; // optional
 
-                LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
-                LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
-                LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
+                    LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
+                    LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
+                    LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
 
-                mtmd_input_chunk chunk{
-                    MTMD_INPUT_CHUNK_TYPE_IMAGE,
-                    {}, // text tokens
-                    std::move(image_tokens),
-                    nullptr, // audio tokens
+                    mtmd_input_chunk chunk{
+                        MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                        {}, // text tokens
+                        std::move(image_tokens),
+                        nullptr, // audio tokens
+                    };
+                    cur.entries.emplace_back(std::move(chunk));
                 };
-                cur.entries.emplace_back(std::move(chunk));
+
+                const int gx = batch_f32.grid_x > 0 ? batch_f32.grid_x : 1;
+                const int gy = batch_f32.grid_y > 0 ? batch_f32.grid_y : 1;
+                if (batch_f32.has_overview) {
+                    // Qwen3VL multi-tile with a global overview: emit the downscaled full image
+                    // (entries[0]) as its own 1×1 chunk first, then the tile grid as a second chunk.
+                    clip_image_f32_batch ov_batch;
+                    ov_batch.entries.push_back(std::move(batch_f32.entries.front()));
+                    batch_f32.entries.erase(batch_f32.entries.begin());
+                    emit_image_chunk(std::move(ov_batch), 1, 1);
+                    emit_image_chunk(std::move(batch_f32), gx, gy);
+                } else {
+                    emit_image_chunk(std::move(batch_f32), gx, gy);
+                }
             }
 
             if (!ctx->img_end.empty()) {

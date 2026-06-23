@@ -993,6 +993,22 @@ bool mtmd_image_preprocessor_qwen3vl::preprocess(const clip_image_u8 & img, clip
         }
     }
 
+    // LLaVA-style global overview (thumbnail): a downscaled full image (tile_px×tile_px) prepended
+    // as entries[0]. It carries the whole image uncut, so text split across a tile seam stays
+    // readable; on DocVQA this recovers seam-truncated text for a sizeable ANLS gain. Encoded as a
+    // separate 1×1 chunk in mtmd.cpp; the tiles are untouched (no resolution cost to them).
+    {
+        clip_image_u8 thumb_u8;
+        img_tool::resize(img, thumb_u8, {tile_px, tile_px},
+                         hparams.image_resize_algo,
+                         /* pad */ PAD_NONE,
+                         hparams.image_pad_color);
+        clip_image_f32_ptr thumb_f32(clip_image_f32_init());
+        img_u8_to_f32(thumb_u8, *thumb_f32, hparams.image_mean, hparams.image_std);
+        output.entries.insert(output.entries.begin(), std::move(thumb_f32));
+        output.has_overview = true;
+    }
+
     output.grid_x = best_col;
     output.grid_y = best_row;
     return true;
