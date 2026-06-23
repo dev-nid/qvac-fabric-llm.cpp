@@ -829,6 +829,23 @@ clip_image_size mtmd_image_preprocessor_llava_uhd::get_refine_size(const clip_im
     return refine_size;
 }
 
+// Pick the grid from `candidates` whose log(width/height) is closest to `target_log_ratio`.
+// Strict-less keeps the first candidate on ties, so callers control tie-breaking via ordering.
+// Shared by the log-ratio tilers (llava_uhd, qwen3vl); lfm2 deliberately uses a different
+// (linear ratio diff + area) metric and is not routed through here.
+static clip_image_size pick_grid_by_log_ratio(const std::vector<clip_image_size> & candidates, const float target_log_ratio) {
+    clip_image_size best_grid{1, 1};
+    float min_error = std::numeric_limits<float>::infinity();
+    for (const auto & grid : candidates) {
+        const float error = std::abs(target_log_ratio - std::log(1.0f * grid.width / grid.height));
+        if (error < min_error) {
+            min_error = error;
+            best_grid = grid;
+        }
+    }
+    return best_grid;
+}
+
 clip_image_size mtmd_image_preprocessor_llava_uhd::get_best_grid(const int max_slice_nums, const int multiple, const float log_ratio) {
     std::vector<int> candidate_split_grids_nums;
     for (int i : {multiple - 1, multiple, multiple + 1}) {
@@ -849,16 +866,7 @@ clip_image_size mtmd_image_preprocessor_llava_uhd::get_best_grid(const int max_s
         }
     }
 
-    clip_image_size best_grid{1, 1};
-    float min_error = std::numeric_limits<float>::infinity();
-    for (const auto& grid : candidate_grids) {
-        float error = std::abs(log_ratio - std::log(1.0 * grid.width / grid.height));
-        if (error < min_error) {
-            best_grid = grid;
-            min_error = error;
-        }
-    }
-    return best_grid;
+    return pick_grid_by_log_ratio(candidate_grids, log_ratio);
 }
 
 //
@@ -924,17 +932,13 @@ bool mtmd_image_preprocessor_qwen3vl::preprocess(const clip_image_u8 & img, clip
     if (img.nx <= tile_px && img.ny <= tile_px) {
         LOG_INF("%s: small image (%dx%d <= tile %d) — falling back to dyn_size\n", __func__, img.nx, img.ny, tile_px);
         GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
-        const int cur_merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
+        // Qwen3VL encoder requires dimensions divisible by patch_size*2 (2×2 spatial merge).
+        // Align to patch_size*2 regardless of n_merge (n_merge drives deepstack, not the conv merge).
         const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
             {img.nx, img.ny},
-            hparams.patch_size * cur_merge,
+            hparams.patch_size * 2,
             hparams.image_min_pixels,
             hparams.image_max_pixels);
-        // Qwen3VL encoder asserts dimensions divisible by patch_size*2; calc_size_preserved_ratio
-        // aligns to patch_size*n_merge, which equals patch_size*2 only when n_merge==2.
-        GGML_ASSERT(target_size.width  % (hparams.patch_size * 2) == 0 &&
-                    target_size.height % (hparams.patch_size * 2) == 0 &&
-                    "dyn_size target must be aligned to patch_size*2 for Qwen3VL encoder");
         clip_image_u8 resized_small;
         img_tool::resize(img, resized_small, target_size,
                          hparams.image_resize_algo,
@@ -950,25 +954,21 @@ bool mtmd_image_preprocessor_qwen3vl::preprocess(const clip_image_u8 & img, clip
     // Pick the grid whose aspect ratio is closest to the image's aspect ratio.
     // This minimises distortion when resizing the image to fill the tile canvas.
     // Using log-ratio so that e.g. 2:1 and 1:2 are symmetric around 1:1.
-    const float img_log_ratio = std::log((float)img.nx / (float)img.ny);
-    float best_ratio_error = std::numeric_limits<float>::infinity();
-
+    std::vector<clip_image_size> candidate_grids;
     for (int col = 1; col <= max_tiles; col++) {
         for (int row = 1; col * row <= max_tiles; row++) {
             if (col == 1 && row == 1) { continue; } // 1×1 handled by small-image early return
-            float error = std::abs(img_log_ratio - std::log((float)col / (float)row));
-            if (error < best_ratio_error) {
-                best_ratio_error = error;
-                best_col = col;
-                best_row = row;
-            }
+            candidate_grids.push_back({col, row});
         }
     }
+    const float img_log_ratio = std::log((float)img.nx / (float)img.ny);
+    const clip_image_size best_grid = pick_grid_by_log_ratio(candidate_grids, img_log_ratio);
+    best_col = best_grid.width;
+    best_row = best_grid.height;
 
     const int target_w = best_col * tile_px;
     const int target_h = best_row * tile_px;
     GGML_ASSERT(hparams.patch_size > 0);
-    const int patches_per_tile = tile_px / hparams.patch_size;
 
     // Resize to the tile canvas by stretching. With aspect-ratio-aware grid selection the chosen
     // grid's ratio is close to the image's ratio, so the residual stretch is small.
@@ -979,26 +979,17 @@ bool mtmd_image_preprocessor_qwen3vl::preprocess(const clip_image_u8 & img, clip
                      /* pad */ PAD_NONE,
                      hparams.image_pad_color);
 
-    // Split into best_col × best_row tiles; each tile carries its patch-coord offset
+    // Split into best_col × best_row tiles, packed row-major into the batch.
     clip_image_u8 tile_u8;
-    tile_u8.nx = tile_px;
-    tile_u8.ny = tile_px;
-    tile_u8.buf.resize((size_t)tile_px * (size_t)tile_px * 3);
 
     for (int tr = 0; tr < best_row; tr++) {
         for (int tc = 0; tc < best_col; tc++) {
             const int src_x0 = tc * tile_px;
             const int src_y0 = tr * tile_px;
-            for (int y = 0; y < tile_px; y++) {
-                const size_t src_row = (size_t)3 * ((size_t)(src_y0 + y) * (size_t)target_w + (size_t)src_x0);
-                const size_t dst_row = (size_t)3 * (size_t)y * (size_t)tile_px;
-                std::memcpy(tile_u8.buf.data() + dst_row, resized.buf.data() + src_row, (size_t)tile_px * 3);
-            }
+            img_tool::crop(resized, tile_u8, src_x0, src_y0, tile_px, tile_px);
 
             clip_image_f32_ptr tile_f32(clip_image_f32_init());
             img_u8_to_f32(tile_u8, *tile_f32, hparams.image_mean, hparams.image_std);
-            tile_f32->pos_x = tc * patches_per_tile;
-            tile_f32->pos_y = tr * patches_per_tile;
             output.entries.push_back(std::move(tile_f32));
         }
     }

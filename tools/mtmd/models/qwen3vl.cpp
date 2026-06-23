@@ -7,7 +7,8 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
 
     // batch_size > 1 encodes multiple same-size tiles in a single forward pass.
     // QKV/FFN run fully batched; attention is per-tile (each tile attends only to its own tokens).
-    // M-RoPE positions carry per-tile absolute offsets so the LM sees correct 2D coords.
+    // M-RoPE offsets are mathematically inert in the vision encoder: relative attention cancels
+    // any per-tile absolute offset. Tile arrangement reaches the LM via decoder positions in mtmd.cpp.
     const int n_pos            = n_patches;         // patches per tile
     const int n_pos_total      = n_pos * batch_size; // total sequence length (all tiles)
     const int num_position_ids = n_pos_total * 4;   // M-RoPE: 4 coords per patch
@@ -62,8 +63,7 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
     learned_pos_embd = ggml_cont_3d(
         ctx0, learned_pos_embd,
         n_embd, n_patches_x * n_patches_y, 1);
-    // repeat for each tile in the batch
-    learned_pos_embd = ggml_repeat(ctx0, learned_pos_embd, inp);
+    // broadcast-add: learned_pos_embd is [n_embd, n_pos, 1], inp is [n_embd, n_pos, batch_size]
     inp = ggml_add(ctx0, inp, learned_pos_embd);
     cb(inp, "inp_pos_emb", -1);
 
