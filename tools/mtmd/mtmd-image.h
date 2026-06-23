@@ -103,13 +103,14 @@ struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
 };
 
 // Qwen3VL tiling preprocessor: splits image into an N×M grid of equal-size tiles
-// (tile size = hparams.image_size). Each tile carries pos_x/pos_y (patch-coord offset)
-// for M-RoPE position assignment. Falls back to dyn_size when image fits in one tile.
+// (tile size = hparams.image_size), packed row-major into the batch. Falls back to
+// dyn_size when the image fits in one tile.
 struct mtmd_image_preprocessor_qwen3vl : mtmd_image_preprocessor {
-    static constexpr int max_tiles = 4;  // max tiles (2×2 grid); increase for larger images
+    int max_tiles;
 
     mtmd_image_preprocessor_qwen3vl(const clip_ctx * ctx)
-        : mtmd_image_preprocessor(ctx) {
+        : mtmd_image_preprocessor(ctx),
+          max_tiles(hparams.preproc_max_tiles > 0 ? hparams.preproc_max_tiles : 4) {
         GGML_ASSERT(clip_get_tile_mode(ctx) != CLIP_IMAGE_TILE_MODE_DISABLED);
     }
     bool preprocess(const clip_image_u8 & img, clip_image_f32_batch & output) override;

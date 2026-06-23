@@ -1416,6 +1416,8 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
+                        // optional multi-tile cap; absent in GGUF → stays 0 and the qwen3vl preprocessor falls back to 4
+                        get_u32(KEY_PREPROC_MAX_TILES, hparams.preproc_max_tiles, false);
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
                         hparams.warmup_image_size = hparams.image_size; // warmup at actual tile size to match inference graph shape
@@ -3157,17 +3159,23 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             batch_size > 0 ? (int)imgs.entries[0]->nx : 0,
             batch_size > 0 ? (int)imgs.entries[0]->ny : 0);
 
-    // Encode tiles one by one. Used for SEQUENTIAL tile mode and as OOM fallback from BATCHED mode.
-    auto do_encode_sequential = [&]() -> bool {
+    // Validate that all tiles share the same dimensions; logs an error and returns false if not.
+    auto validate_tile_sizes = [&](const char * tag) -> bool {
         const int tile_nx = imgs.entries[0]->nx;
         const int tile_ny = imgs.entries[0]->ny;
         for (int b = 1; b < batch_size; b++) {
             if (imgs.entries[b]->nx != tile_nx || imgs.entries[b]->ny != tile_ny) {
-                LOG_ERR("%s: sequential mode tile %d size %dx%d != expected %dx%d; all tiles must be the same size\n",
-                        __func__, b, imgs.entries[b]->nx, imgs.entries[b]->ny, tile_nx, tile_ny);
+                LOG_ERR("%s: %s tile %d size %dx%d != expected %dx%d; all tiles must be the same size\n",
+                        __func__, tag, b, imgs.entries[b]->nx, imgs.entries[b]->ny, tile_nx, tile_ny);
                 return false;
             }
         }
+        return true;
+    };
+
+    // Encode tiles one by one. Used for SEQUENTIAL tile mode and as OOM fallback from BATCHED mode.
+    auto do_encode_sequential = [&]() -> bool {
+        if (!validate_tile_sizes("sequential mode")) { return false; }
         const int n_tokens_per_tile = clip_n_output_tokens(ctx, imgs.entries[0].get());
         const int out_embd           = clip_n_mmproj_embd(ctx);
         float * out_ptr = vec;
@@ -3265,15 +3273,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         // Layout: [nx, ny, 3, batch_size] — channel-first per tile, tiles packed along last dim.
         // All tiles must be the same size (ensured by the Qwen3VL tiling preprocessor).
         GGML_ASSERT(batch_size > 0);
-        const int tile_nx = imgs.entries[0]->nx;
-        const int tile_ny = imgs.entries[0]->ny;
-        for (int b = 1; b < batch_size; b++) {
-            if (imgs.entries[b]->nx != tile_nx || imgs.entries[b]->ny != tile_ny) {
-                LOG_ERR("%s: tile %d size %dx%d != expected %dx%d; all tiles must be the same size\n",
-                        __func__, b, imgs.entries[b]->nx, imgs.entries[b]->ny, tile_nx, tile_ny);
-                return false;
-            }
-        }
+        if (!validate_tile_sizes("batched")) { return false; }
         for (int b = 0; b < batch_size; b++) {
             const int    nx = imgs.entries[b]->nx;
             const int    ny = imgs.entries[b]->ny;
@@ -3374,8 +3374,12 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             } break;
         case PROJECTOR_TYPE_QWEN3VL:
             {
-                // Multi-tile batching: each tile carries its own (pos_x, pos_y) offset so that
-                // M-RoPE sees absolute patch coordinates across the full image.
+                // Per-tile M-RoPE positions use *local* patch coordinates (origin at each tile's
+                // top-left). Attention is computed per-tile and RoPE scores depend only on the
+                // relative position pos_i - pos_j, so any per-tile absolute offset would cancel
+                // exactly and have no effect on the encoder. Every tile therefore gets the same
+                // local-coordinate block. Absolute tile placement reaches the LM via decoder
+                // positions (mtmd_image_tokens_get_decoder_pos in mtmd.cpp), not here.
                 const int merge_ratio  = hparams.n_merge;
                 GGML_ASSERT(merge_ratio > 0);
                 const int pw           = image_size_width  / patch_size; // per-tile width in patches
@@ -3388,18 +3392,16 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 // (matches ggml_view_1d in graph)
                 std::vector<int32_t> positions((size_t)n_pos_tile * (size_t)batch_size * 4);
                 for (int b = 0; b < batch_size; b++) {
-                    const int x_off = imgs.entries[b]->pos_x;
-                    const int y_off = imgs.entries[b]->pos_y;
                     const size_t base  = (size_t)b * (size_t)n_pos_tile * 4;
                     int ptr = 0;
                     for (int y = 0; y < ph; y += merge_ratio) {
                         for (int x = 0; x < pw; x += merge_ratio) {
                             for (int dy = 0; dy < merge_ratio; dy++) {
                                 for (int dx = 0; dx < merge_ratio; dx++) {
-                                    positions[base + ptr]                            = y_off + y + dy;
-                                    positions[base + (size_t)n_pos_tile + ptr]     = x_off + x + dx;
-                                    positions[base + (size_t)2 * n_pos_tile + ptr] = y_off + y + dy;
-                                    positions[base + (size_t)3 * n_pos_tile + ptr] = x_off + x + dx;
+                                    positions[base + ptr]                          = y + dy;
+                                    positions[base + (size_t)n_pos_tile + ptr]     = x + dx;
+                                    positions[base + (size_t)2 * n_pos_tile + ptr] = y + dy;
+                                    positions[base + (size_t)3 * n_pos_tile + ptr] = x + dx;
                                     ptr++;
                                 }
                             }
