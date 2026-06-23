@@ -886,29 +886,43 @@ bool mtmd_image_preprocessor_fixed_size::preprocess(const clip_image_u8 & img, c
     return true;
 }
 
+// Resize to [min_pixels, max_pixels] with aspect ratio preserved, aligned to `align_px`, single f32 output.
+static bool preprocess_dyn_size_aligned(
+        const clip_image_u8 & img,
+        clip_image_f32_batch & output,
+        const clip_hparams & hparams,
+        mtmd_image_preprocessor & preproc,
+        const int align_px) {
+    GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
+    GGML_ASSERT(align_px > 0);
+    clip_image_u8 resized_image;
+    const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
+        {img.nx, img.ny},
+        align_px,
+        hparams.image_min_pixels,
+        hparams.image_max_pixels);
+    img_tool::resize(img, resized_image, target_size,
+                     hparams.image_resize_algo,
+                     hparams.image_resize_pad,
+                     hparams.image_pad_color);
+    clip_image_f32_ptr img_f32(clip_image_f32_init());
+    preproc.img_u8_to_f32(resized_image, *img_f32, hparams.image_mean, hparams.image_std);
+    output.entries.push_back(std::move(img_f32));
+    return true;
+}
+
+static int dyn_size_align_px(const clip_hparams & hparams) {
+    // the original pixtral model doesn't have n_merge
+    const int cur_merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
+    return hparams.patch_size * cur_merge;
+}
+
 //
 // mtmd_image_preprocessor_dyn_size
 //
 
 bool mtmd_image_preprocessor_dyn_size::preprocess(const clip_image_u8 & img, clip_image_f32_batch & output) {
-    GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
-    clip_image_u8 resized_image;
-    const clip_image_size original_size{img.nx, img.ny};
-    // the original pixtral model doesn't have n_merge
-    const int cur_merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
-    const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
-        original_size,
-        hparams.patch_size * cur_merge,
-        hparams.image_min_pixels,
-        hparams.image_max_pixels);
-    img_tool::resize(img, resized_image, target_size,
-                        hparams.image_resize_algo,
-                        hparams.image_resize_pad,
-                        hparams.image_pad_color);
-    clip_image_f32_ptr img_f32(clip_image_f32_init());
-    img_u8_to_f32(resized_image, *img_f32, hparams.image_mean, hparams.image_std);
-    output.entries.push_back(std::move(img_f32));
-    return true;
+    return preprocess_dyn_size_aligned(img, output, hparams, *this, dyn_size_align_px(hparams));
 }
 
 //
@@ -931,22 +945,7 @@ bool mtmd_image_preprocessor_qwen3vl::preprocess(const clip_image_u8 & img, clip
     // No tiling benefit exists here, so use the cheaper, undistorted path.
     if (img.nx <= tile_px && img.ny <= tile_px) {
         LOG_INF("%s: small image (%dx%d <= tile %d) — falling back to dyn_size\n", __func__, img.nx, img.ny, tile_px);
-        GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
-        // Qwen3VL encoder requires dimensions divisible by patch_size*2 (2×2 spatial merge).
-        // Align to patch_size*2 regardless of n_merge (n_merge drives deepstack, not the conv merge).
-        const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
-            {img.nx, img.ny},
-            hparams.patch_size * 2,
-            hparams.image_min_pixels,
-            hparams.image_max_pixels);
-        clip_image_u8 resized_small;
-        img_tool::resize(img, resized_small, target_size,
-                         hparams.image_resize_algo,
-                         hparams.image_resize_pad,
-                         hparams.image_pad_color);
-        clip_image_f32_ptr img_f32(clip_image_f32_init());
-        img_u8_to_f32(resized_small, *img_f32, hparams.image_mean, hparams.image_std);
-        output.entries.push_back(std::move(img_f32));
+        preprocess_dyn_size_aligned(img, output, hparams, *this, dyn_size_align_px(hparams));
         // grid_x/grid_y left at 0 → single-tile path; tokenizer treats this as 1×1
         return true;
     }
