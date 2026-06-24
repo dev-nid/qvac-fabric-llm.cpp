@@ -522,12 +522,17 @@ struct clip_image_f32_batch {
     int grid_x = 0;
     int grid_y = 0;
 
+    // qwen3vl multi-tile: when true, entries[0] is a downscaled full-image overview
+    // (thumbnail) and entries[1..] are the grid_x*grid_y tiles.
+    bool has_overview = false;
+
     clip_image_f32_batch clone() const {
         clip_image_f32_batch new_batch{
             /* entries  */ {},
             /* is_audio */ is_audio,
             /* grid_x   */ grid_x,
             /* grid_y   */ grid_y,
+            /* has_overview */ has_overview,
         };
         new_batch.entries.reserve(entries.size());
         for (const auto & entry : entries) {
