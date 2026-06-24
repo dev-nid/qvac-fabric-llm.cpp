@@ -9853,7 +9853,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     max_bias      = params[1];
     logit_softcap = params[2];
 
-    const int is_causal = (mask == NULL && n_q > 1 && n_q == n_kv);
+    // A null mask means no masking, i.e. bidirectional attention (e.g. the
+    // SigLIP vision / embedding encoders). Causal attention always supplies an
+    // explicit causal mask in this codebase (llama-graph.cpp build_attn passes
+    // kq_mask filled with -INFINITY), so a null mask must NOT be inferred as
+    // causal. The previous `mask == NULL && n_q == n_kv` heuristic wrongly made
+    // the bidirectional Qwen3-VL vision tower attend causally, corrupting the
+    // image embedding (each patch only saw earlier patches).
+    const int is_causal = 0;
 
     const int n_head_log2_val = n_head > 0 ? 1u << (int)floorf(log2f((float)n_head)) : 0;
     const float n_head_log2_f = n_head_log2_val > 0 ? (float)n_head_log2_val : 1.0f;
