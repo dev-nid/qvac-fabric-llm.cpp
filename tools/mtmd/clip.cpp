@@ -23,6 +23,7 @@
 #include <cinttypes>
 #include <limits>
 #include <array>
+#include <chrono>
 #include <functional>
 #include <float.h>
 
@@ -32,6 +33,18 @@ struct clip_logger_state g_logger_state = {
     clip_log_callback_default,     // log_callback
     NULL                           // log_callback_user_data
 };
+
+// QVAC-21257 (Pixel/Mali diagnosis): emit a clip diagnostic via the GGML log
+// callback (set by the host's llama_log_set) so it reaches Android logcat — clip's
+// own logger is NOT wired to the host on Android, so clip_*/LOG_INF lines are lost.
+static void clip_emit_diag(const std::string & msg) {
+    ggml_log_callback cb = nullptr;
+    void * ud = nullptr;
+    ggml_log_get(&cb, &ud);
+    if (cb) {
+        cb(GGML_LOG_LEVEL_WARN, ("[CLIPDIAG] " + msg + "\n").c_str(), ud);
+    }
+}
 
 //#define CLIP_DEBUG_FUNCTIONS
 
@@ -3785,10 +3798,36 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         }
     }
 
+    const auto clip_t0 = std::chrono::steady_clock::now();
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
+    }
+    // QVAC-21257 (Pixel/Mali diagnosis): surface where the GPU vision-encode time goes.
+    // n_splits low + most nodes on GPU => compute/dispatch-bound (deep ggml-vulkan work);
+    // many splits / many CPU-placed nodes => CPU-fallback sync overhead.
+    {
+        const double clip_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - clip_t0).count();
+        const int n_splits = ggml_backend_sched_get_n_splits(ctx->sched.get());
+        const int n_nodes  = ggml_graph_n_nodes(gf);
+        int gpu_nodes = 0, cpu_nodes = 0;
+        for (int i = 0; i < n_nodes; i++) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(ctx->sched.get(), node);
+            const char * bn = b ? ggml_backend_name(b) : "";
+            if (bn && (strstr(bn, "Vulkan") || strstr(bn, "GPU") || strstr(bn, "Metal"))) {
+                gpu_nodes++;
+            } else {
+                cpu_nodes++;
+            }
+        }
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "encode: %.1f ms | splits=%d nodes=%d gpu_nodes=%d cpu_nodes=%d n_pos=%d",
+                 clip_ms, n_splits, n_nodes, gpu_nodes, cpu_nodes, n_pos);
+        clip_emit_diag(buf);
     }
 
     // the last node is the embedding tensor
