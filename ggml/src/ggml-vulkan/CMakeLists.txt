@@ -123,7 +123,10 @@ if (Vulkan_FOUND)
     endif()
 
     if (FORCE_GGML_VK_PERF_LOGGER)
-      add_compile_definitions(FORCE_GGML_VK_PERF_LOGGER)
+      # NOTE: target_compile_definitions (not add_compile_definitions) — the ggml-vulkan
+      # target is created above (ggml_add_backend_library), and add_compile_definitions only
+      # affects targets created AFTER it, so it was a silent no-op for this target.
+      target_compile_definitions(ggml-vulkan PRIVATE FORCE_GGML_VK_PERF_LOGGER)
     endif()
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
     # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
