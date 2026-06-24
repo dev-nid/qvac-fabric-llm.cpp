@@ -2137,12 +2137,30 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 {192, 192, 16, 16}, {256, 256, 16, 16},
             };
 
+            // Flash attention relies on +/-INFINITY (initial m_i = -INFINITY and
+            // masked scores), so it must NOT be built with the Inf-assuming
+            // fast-math flags used for the other kernels. Under
+            // -cl-finite-math-only / -cl-fast-relaxed-math the compiler assumes
+            // no Inf/NaN, which makes the online-softmax init and masking
+            // produce deterministically wrong results (e.g. the Qwen3-VL vision
+            // encoder loses semantics). Strip those flags for the FA programs;
+            // -cl-mad-enable and the rest are kept for speed.
+            std::string fa_compile_opts = compile_opts;
+            for (const char* unsafe_flag : { " -cl-fast-relaxed-math",
+                                             " -cl-finite-math-only",
+                                             " -cl-unsafe-math-optimizations" }) {
+                const size_t pos = fa_compile_opts.find(unsafe_flag);
+                if (pos != std::string::npos) {
+                    fa_compile_opts.erase(pos, std::string(unsafe_flag).size());
+                }
+            }
+
             for (size_t i = 0; i < sizeof(fa_dims)/sizeof(fa_dims[0]); ++i) {
                 const int dk = fa_dims[i].dk;
                 const int dv = fa_dims[i].dv;
                 const int bm = fa_dims[i].bm;
                 const int bn = fa_dims[i].bn;
-                std::string OPTS = compile_opts +
+                std::string OPTS = fa_compile_opts +
                     " -D DK=" + std::to_string(dk) +
                     " -D DV=" + std::to_string(dv) +
                     " -D BLOCK_M=" + std::to_string(bm) +
