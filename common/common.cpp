@@ -1741,6 +1741,17 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    // [EXPERIMENTAL] qvac A1 hybrid prefill dispatch (WS1) — prototype CLI hook.
+    // Enabled via env vars so the validation harness can toggle it without new
+    // CLI args. QVAC_PREFILL_CPU=1 routes prefill batches to the CPU backend;
+    // QVAC_PREFILL_THRESHOLD overrides the batch-size threshold (default 32).
+    if (const char * env = std::getenv("QVAC_PREFILL_CPU")) {
+        cparams.prefill_cpu = (std::atoi(env) != 0);
+    }
+    if (const char * env = std::getenv("QVAC_PREFILL_THRESHOLD")) {
+        cparams.prefill_batch_threshold = std::atoi(env);
+    }
+
     return cparams;
 }
 

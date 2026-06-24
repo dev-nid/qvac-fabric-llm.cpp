@@ -348,6 +348,7 @@ private:
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_t backend_blas = nullptr; // [qvac A1] ACCEL backend (Accelerate BLAS), if present
     std::vector<ggml_backend_ptr> backends;
 
     // training

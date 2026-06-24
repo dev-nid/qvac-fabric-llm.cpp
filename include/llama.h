@@ -389,6 +389,17 @@ extern "C" {
         size_t                            n_samplers;
 
         bool training;    // if true, we're in training mode (affects LoRA K/V gradient flow)
+
+        // [EXPERIMENTAL] qvac A1 — model-aware hybrid prefill dispatch (WS1)
+        // When prefill_cpu is true, per-layer compute for batches with
+        // >= prefill_batch_threshold tokens (i.e. prefill) is routed to the CPU
+        // backend even though the weights live in a GPU buffer. Intended for
+        // unified/shared-memory GPUs (Metal, iGPU) where this is zero-copy.
+        // Decode batches (small) are untouched and stay on the GPU.
+        // No-op when prefill_cpu is false (the default). The UMA-vs-discrete
+        // device-class policy is decided by the caller (addon dispatch table).
+        bool    prefill_cpu;
+        int32_t prefill_batch_threshold; // 0 disables; default 32
     };
 
     struct llama_model_tensor_override {

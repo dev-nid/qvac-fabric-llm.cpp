@@ -11,6 +11,8 @@
 #include "mtmd-helper.h"
 
 #include <vector>
+#include <chrono>
+#include <cstdio>
 #include <limits.h>
 #include <cinttypes>
 #include <clocale>
@@ -177,6 +179,7 @@ struct mtmd_cli_context {
 
 static int generate_response(mtmd_cli_context & ctx, int n_predict) {
     llama_tokens generated_tokens;
+    const auto t_decode_0 = std::chrono::steady_clock::now();
     for (int i = 0; i < n_predict; i++) {
         if (i > n_predict || !g_is_generating || g_is_interrupted) {
             LOG("\n");
@@ -208,6 +211,13 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
             return 1;
         }
     }
+
+    const auto t_decode_1 = std::chrono::steady_clock::now();
+    const double decode_ms = std::chrono::duration<double, std::milli>(t_decode_1 - t_decode_0).count();
+    const int n_dec = (int) generated_tokens.size();
+    // [qvac A1] decode loop (always GPU-pinned). t/s excludes the first sample.
+    fprintf(stderr, "QVAC_TIMING decode_ms=%.2f decode_tokens=%d decode_tps=%.2f\n",
+            decode_ms, n_dec, n_dec > 1 ? (n_dec - 1) * 1000.0 / decode_ms : 0.0);
 
     std::string generated_text = common_detokenize(ctx.lctx, generated_tokens);
     common_chat_msg msg;
@@ -255,6 +265,7 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     ctx.bitmaps.entries.clear();
 
     llama_pos new_n_past;
+    const auto t_prefill_0 = std::chrono::steady_clock::now();
     if (mtmd_helper_eval_chunks(ctx.ctx_vision.get(),
                 ctx.lctx, // lctx
                 chunks.ptr.get(), // chunks
@@ -266,6 +277,11 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
         LOG_ERR("Unable to eval prompt\n");
         return 1;
     }
+    const auto t_prefill_1 = std::chrono::steady_clock::now();
+    const double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill_1 - t_prefill_0).count();
+    // [qvac A1] TTFT-relevant section (vision encode + prompt prefill).
+    fprintf(stderr, "QVAC_TIMING prefill_ttft_ms=%.2f prompt_tokens=%d\n",
+            prefill_ms, (int) new_n_past);
 
     ctx.n_past = new_n_past;
 

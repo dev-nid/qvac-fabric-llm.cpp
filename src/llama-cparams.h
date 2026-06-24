@@ -44,6 +44,10 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool training;
 
+    // [EXPERIMENTAL] qvac A1 hybrid prefill dispatch (WS1)
+    bool    prefill_cpu;             // route prefill-batch compute to CPU backend (GPU-resident weights, UMA only)
+    int32_t prefill_batch_threshold; // batch with >= this many tokens is treated as prefill (0 disables)
+
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 

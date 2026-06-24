@@ -181,6 +181,10 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    // [EXPERIMENTAL] qvac A1 hybrid prefill dispatch (WS1)
+    cparams.prefill_cpu             = params.prefill_cpu;
+    cparams.prefill_batch_threshold = params.prefill_batch_threshold;
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -254,6 +258,9 @@ llama_context::llama_context(
                 ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
                 if (backend == nullptr) {
                     throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+                }
+                if (backend_blas == nullptr) {
+                    backend_blas = backend; // [qvac A1] remember the ACCEL/BLAS backend for hybrid prefill
                 }
                 backends.emplace_back(backend);
             }
@@ -2328,6 +2335,32 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
+        // [EXPERIMENTAL] qvac A1 — model-aware hybrid prefill dispatch (WS1).
+        // For prefill-sized batches, run the per-layer compute on the CPU backend
+        // even though the weights live in a GPU buffer (zero-copy on UMA/Metal).
+        // Decode batches stay below the threshold and keep running on the GPU.
+        // Opt-in: no-op unless the caller set prefill_cpu (UMA device-class policy
+        // is enforced by the caller / addon dispatch table).
+        if (cparams.prefill_cpu &&
+                cparams.prefill_batch_threshold > 0 &&
+                (int32_t) ubatch.n_tokens >= cparams.prefill_batch_threshold &&
+                il >= 0) {
+            // Prefer the ACCEL/BLAS backend (Accelerate) for the heavy matmuls —
+            // that is the path the all-CPU (ngl=0) run uses for its prefill win.
+            // Everything BLAS can't handle (norm/rope/softmax/add) goes to the
+            // plain CPU backend so the whole layer stays off the GPU.
+            ggml_backend_t target = nullptr;
+            if (backend_blas != nullptr && ggml_backend_supports_op(backend_blas, cur)) {
+                target = backend_blas;
+            } else if (backend_cpu != nullptr && ggml_backend_supports_op(backend_cpu, cur)) {
+                target = backend_cpu;
+            }
+            if (target != nullptr) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), cur, target);
+                return;
+            }
+        }
+
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
@@ -3212,6 +3245,8 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.training                    =*/ false,
+        /*.prefill_cpu                 =*/ false,
+        /*.prefill_batch_threshold     =*/ 32,
     };
 
     return result;

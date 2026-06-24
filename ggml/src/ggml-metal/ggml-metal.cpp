@@ -281,7 +281,12 @@ static size_t ggml_backend_metal_buffer_type_shared_get_alloc_size(ggml_backend_
 }
 
 static bool ggml_backend_metal_buffer_type_shared_is_host(ggml_backend_buffer_type_t buft) {
-    return false;
+    // [qvac A1 probe] The shared buffer type is only used on UMA (use_shared_buffers),
+    // where the buffer is backed by a CPU-accessible host pointer. Reporting it as a
+    // host buffer lets the backend scheduler read these (read-only weight) tensors
+    // from the CPU/BLAS backend WITHOUT a per-graph copy — the prerequisite for
+    // single-load hybrid CPU prefill on Metal.
+    return true;
 
     GGML_UNUSED(buft);
 }
