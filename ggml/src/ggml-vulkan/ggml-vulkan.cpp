@@ -1819,7 +1819,7 @@ class vk_perf_logger {
             return;
         }
         print_count = 0;
-        GGML_LOG_DEBUG("================\nVulkan Profiling Results:\n================\n\n");
+        GGML_LOG_WARN("================\nVulkan Profiling Results:\n================\n\n");
         print_legacy_timings();
         print_triplet_timings();
         timings.clear();
@@ -2061,7 +2061,7 @@ class vk_perf_logger {
             ss << "Total time: " << total_all_op_times / 1000.0 << " us." << std::endl;
         }
         ss << std::endl;
-        GGML_LOG_DEBUG("%s", ss.str().c_str());
+        GGML_LOG_WARN("%s", ss.str().c_str());
     }
 
     void print_triplet_timings() {
@@ -2111,9 +2111,9 @@ class vk_perf_logger {
             ss << "Total operation types: " << operation_groups.size() << std::endl;
             ss << "Total variations: " << triplet_timings.size() << std::endl;
             ss << std::endl;
-            GGML_LOG_DEBUG("%s", ss.str().c_str());
+            GGML_LOG_WARN("%s", ss.str().c_str());
         } catch (...) {
-            GGML_LOG_DEBUG("Error in triplet timing analysis - analysis skipped.\n");
+            GGML_LOG_WARN("Error in triplet timing analysis - analysis skipped.\n");
         }
     }
 };
@@ -16505,33 +16505,47 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // Get the results and pass them to the logger
         std::vector<uint64_t> timestamps(cgraph->n_nodes + 1);
         VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->query_pool, 0, ctx->query_idx, (cgraph->n_nodes + 1)*sizeof(uint64_t), timestamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "get timestamp results");
-        if (!vk_perf_logger_concurrent) {
-            // Log each op separately
-            for (int i = 1; i < ctx->query_idx; i++) {
-                auto node = ctx->query_nodes[i];
-                auto name = ctx->query_fusion_names[i];
-                ctx->perf_logger->log_timing(node, name, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
-            }
-        } else {
-            // Log each group of nodes
-            int prev_node_idx = 0;
-            for (int i = 1; i < ctx->query_idx; i++) {
-                auto cur_node_idx = ctx->query_node_idx[i];
-                std::vector<ggml_tensor *> nodes;
-                std::vector<const char *> names;
-                for (int node_idx = prev_node_idx; node_idx < cur_node_idx; ++node_idx) {
-                    if (ggml_op_is_empty(cgraph->nodes[node_idx]->op)) {
-                        continue;
-                    }
-                    nodes.push_back(cgraph->nodes[node_idx]);
-                    names.push_back(ctx->query_fusion_names[node_idx]);
-                    node_idx += ctx->query_fusion_node_count[node_idx];
-                }
-                prev_node_idx = cur_node_idx;
-                ctx->perf_logger->log_timing(nodes, names, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
+        // QVAC-21257 (diagnostic): only log+dump per-graph timings for the CLIP vision-encoder
+        // graph — it is the only graph with conv ops. This keeps the profiler's accumulated
+        // timings clip-only (it clears on print) and avoids flooding Android logcat with a full
+        // timing table per LLM decode token.
+        bool clip_graph = false;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_op op = cgraph->nodes[i]->op;
+            if (op == GGML_OP_CONV_2D || op == GGML_OP_IM2COL || op == GGML_OP_CONV_2D_DW) {
+                clip_graph = true;
+                break;
             }
         }
-        ctx->perf_logger->print_timings();
+        if (clip_graph) {
+            if (!vk_perf_logger_concurrent) {
+                // Log each op separately
+                for (int i = 1; i < ctx->query_idx; i++) {
+                    auto node = ctx->query_nodes[i];
+                    auto name = ctx->query_fusion_names[i];
+                    ctx->perf_logger->log_timing(node, name, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
+                }
+            } else {
+                // Log each group of nodes
+                int prev_node_idx = 0;
+                for (int i = 1; i < ctx->query_idx; i++) {
+                    auto cur_node_idx = ctx->query_node_idx[i];
+                    std::vector<ggml_tensor *> nodes;
+                    std::vector<const char *> names;
+                    for (int node_idx = prev_node_idx; node_idx < cur_node_idx; ++node_idx) {
+                        if (ggml_op_is_empty(cgraph->nodes[node_idx]->op)) {
+                            continue;
+                        }
+                        nodes.push_back(cgraph->nodes[node_idx]);
+                        names.push_back(ctx->query_fusion_names[node_idx]);
+                        node_idx += ctx->query_fusion_node_count[node_idx];
+                    }
+                    prev_node_idx = cur_node_idx;
+                    ctx->perf_logger->log_timing(nodes, names, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
+                }
+            }
+            ctx->perf_logger->print_timings();
+        }
     }
 
     if (!ctx->device->support_async) {
