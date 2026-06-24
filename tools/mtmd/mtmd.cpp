@@ -953,9 +953,13 @@ struct mtmd_tokenizer {
                 if (batch_f32.has_overview) {
                     // Qwen3VL multi-tile with a global overview: emit the downscaled full image
                     // (entries[0]) as its own 1×1 chunk first, then the tile grid as a second chunk.
+                    GGML_ASSERT(!batch_f32.entries.empty());
                     clip_image_f32_batch ov_batch;
                     ov_batch.entries.push_back(std::move(batch_f32.entries.front()));
                     batch_f32.entries.erase(batch_f32.entries.begin());
+                    batch_f32.has_overview = false; // overview consumed; entries[0] is now a tile
+                    GGML_ASSERT((int) batch_f32.entries.size() == gx * gy &&
+                                "overview split left an unexpected tile count");
                     emit_image_chunk(std::move(ov_batch), 1, 1);
                     emit_image_chunk(std::move(batch_f32), gx, gy);
                 } else {
