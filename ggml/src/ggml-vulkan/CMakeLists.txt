@@ -120,6 +120,8 @@ if (Vulkan_FOUND)
     )
     if (ANDROID)
         target_include_directories(ggml-vulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include")
+        # QVAC-21257 (diagnostic): VK perf logger routes to logcat via __android_log_print (liblog).
+        target_link_libraries(ggml-vulkan PRIVATE log)
     endif()
 
     if (FORCE_GGML_VK_PERF_LOGGER)
