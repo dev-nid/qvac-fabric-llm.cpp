@@ -73,6 +73,14 @@ struct mtmd_cli_context {
 
     llama_model       * model;
     llama_context     * lctx;
+    // [QVAC-21372 item 2 — EXPERIMENTAL] two-context mode: a 2nd model loaded with
+    // n_gpu_layers=0 (native CPU weights) does the prefill, then the KV cache is handed to
+    // the GPU `lctx` for decode. Avoids item 1's broken CPU-reads-GPU-buffer path. Opt-in
+    // via env QVAC_TWO_CTX=1. Costs 2x weight memory (two model loads).
+    common_init_result_ptr llama_init_cpu;
+    llama_context     * lctx_cpu   = nullptr;
+    bool                two_ctx    = false;
+    llama_token         first_token = -1; // first token sampled from the CPU prefill ctx
     const llama_vocab * vocab;
     common_sampler    * smpl;
     llama_batch         batch;
@@ -121,6 +129,20 @@ struct mtmd_cli_context {
         LOG_INF("%s: chat template example:\n%s\n", __func__, common_chat_format_example(tmpls.get(), params.use_jinja, params.default_template_kwargs).c_str());
 
         init_vision_context(params);
+
+        // [QVAC-21372 item 2 — EXPERIMENTAL] optional two-context (CPU-prefill + GPU-decode).
+        if (const char * e = std::getenv("QVAC_TWO_CTX"); e && std::atoi(e) != 0) {
+            two_ctx = true;
+            common_params params_cpu = params;       // copy
+            params_cpu.n_gpu_layers = 0;             // native CPU weights -> fast, correct prefill
+            llama_init_cpu = common_init_from_params(params_cpu);
+            if (!llama_init_cpu || !llama_init_cpu->context()) {
+                LOG_ERR("[QVAC_TWO_CTX] failed to load CPU prefill model\n");
+                exit(1);
+            }
+            lctx_cpu = llama_init_cpu->context();
+            LOG_INF("[QVAC_TWO_CTX] two-context mode ON: prefill on CPU (ngl=0), decode on GPU\n");
+        }
 
         // load antiprompt tokens for legacy templates
         if (params.chat_template == "vicuna") {
@@ -186,7 +208,12 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
             break;
         }
 
-        llama_token token_id = common_sampler_sample(ctx.smpl, ctx.lctx, -1);
+        llama_token token_id;
+        if (i == 0 && ctx.first_token >= 0) {
+            token_id = ctx.first_token; // [QVAC-21372 item 2] pre-sampled from the CPU prefill ctx
+        } else {
+            token_id = common_sampler_sample(ctx.smpl, ctx.lctx, -1);
+        }
         generated_tokens.push_back(token_id);
         common_sampler_accept(ctx.smpl, token_id, true);
 
@@ -265,9 +292,12 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     ctx.bitmaps.entries.clear();
 
     llama_pos new_n_past;
+    // [QVAC-21372 item 2] in two-ctx mode the prefill (vision-encode injects into the LLM
+    // KV cache + prompt eval) runs on the CPU instance; otherwise on the single GPU ctx.
+    llama_context * prefill_ctx = ctx.two_ctx ? ctx.lctx_cpu : ctx.lctx;
     const auto t_prefill_0 = std::chrono::steady_clock::now();
     if (mtmd_helper_eval_chunks(ctx.ctx_vision.get(),
-                ctx.lctx, // lctx
+                prefill_ctx, // lctx (CPU instance when two_ctx)
                 chunks.ptr.get(), // chunks
                 ctx.n_past, // n_past
                 0, // seq_id
@@ -284,6 +314,33 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
             prefill_ms, (int) new_n_past);
 
     ctx.n_past = new_n_past;
+
+    // [QVAC-21372 item 2] hand the KV cache from the CPU prefill ctx to the GPU decode ctx.
+    // The seq-state blob is backend-agnostic; only the KV cache transfers (not the last-token
+    // logits), so we also sample the first token here from the CPU ctx's prefill logits.
+    if (ctx.two_ctx) {
+        const auto t_x0 = std::chrono::steady_clock::now();
+        size_t sz  = llama_state_seq_get_size(ctx.lctx_cpu, 0);
+        std::vector<uint8_t> buf(sz);
+        size_t got = llama_state_seq_get_data(ctx.lctx_cpu, buf.data(), buf.size(), 0);
+        size_t set = llama_state_seq_set_data(ctx.lctx, buf.data(), got, 0);
+        if (set == 0) {
+            // SWA / partial KV cache (e.g. Gemma4 sliding-window): retry partial-only.
+            sz  = llama_state_seq_get_size_ext(ctx.lctx_cpu, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            buf.assign(sz, 0);
+            got = llama_state_seq_get_data_ext(ctx.lctx_cpu, buf.data(), buf.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            set = llama_state_seq_set_data_ext(ctx.lctx, buf.data(), got, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+        const auto t_x1 = std::chrono::steady_clock::now();
+        const double transfer_ms = std::chrono::duration<double, std::milli>(t_x1 - t_x0).count();
+        if (set == 0) {
+            LOG_ERR("[QVAC_TWO_CTX] KV state transfer failed (set_data returned 0)\n");
+            return 1;
+        }
+        // first decode token: sample from the CPU prefill logits (GPU ctx has none post-transfer)
+        ctx.first_token = common_sampler_sample(ctx.smpl, ctx.lctx_cpu, -1);
+        fprintf(stderr, "QVAC_TIMING transfer_ms=%.2f kv_bytes=%zu\n", transfer_ms, got);
+    }
 
     LOG("\n");
 
