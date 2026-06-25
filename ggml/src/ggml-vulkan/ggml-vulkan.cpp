@@ -36,6 +36,17 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #endif
 #include "vma/VmaUsage.h"
 
+// QVAC-21257 (diagnostic): in the GGML_BACKEND_DL build the ggml-vulkan module has its own
+// ggml logger state, disconnected from the consumer's ggml_log_set callback (e.g. the addon's
+// Android logcat bridge), so GGML_LOG_* emitted from this module is lost on Android. Route the
+// VK perf logger output straight to logcat so the per-op timing survives.
+#ifdef __ANDROID__
+#include <android/log.h>
+#define VK_PROF_LOG(...) ((void) __android_log_print(ANDROID_LOG_WARN, "ggml-vk-prof", __VA_ARGS__))
+#else
+#define VK_PROF_LOG(...) GGML_LOG_WARN(__VA_ARGS__)
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -1820,7 +1831,7 @@ class vk_perf_logger {
             return;
         }
         print_count = 0;
-        GGML_LOG_WARN("================\nVulkan Profiling Results:\n================\n\n");
+        VK_PROF_LOG("================\nVulkan Profiling Results:\n================\n\n");
         print_legacy_timings();
         print_triplet_timings();
         timings.clear();
@@ -2062,7 +2073,7 @@ class vk_perf_logger {
             ss << "Total time: " << total_all_op_times / 1000.0 << " us." << std::endl;
         }
         ss << std::endl;
-        GGML_LOG_WARN("%s", ss.str().c_str());
+        VK_PROF_LOG("%s", ss.str().c_str());
     }
 
     void print_triplet_timings() {
@@ -2112,9 +2123,9 @@ class vk_perf_logger {
             ss << "Total operation types: " << operation_groups.size() << std::endl;
             ss << "Total variations: " << triplet_timings.size() << std::endl;
             ss << std::endl;
-            GGML_LOG_WARN("%s", ss.str().c_str());
+            VK_PROF_LOG("%s", ss.str().c_str());
         } catch (...) {
-            GGML_LOG_WARN("Error in triplet timing analysis - analysis skipped.\n");
+            VK_PROF_LOG("Error in triplet timing analysis - analysis skipped.\n");
         }
     }
 };
@@ -16628,6 +16639,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 break;
             }
         }
+        VK_PROF_LOG("[VKPROF] graph_compute: n_nodes=%d query_idx=%d clip_graph=%d", cgraph->n_nodes, ctx->query_idx, clip_graph ? 1 : 0);
         if (clip_graph) {
             if (!vk_perf_logger_concurrent) {
                 // Log each op separately
