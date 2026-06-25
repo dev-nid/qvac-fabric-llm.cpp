@@ -368,6 +368,18 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+uint32_t llama_memory_recurrent::seq_token_count(llama_seq_id seq_id) const {
+    uint32_t result = 0;
+
+    for (uint32_t i = 0; i < size; ++i) {
+        if (seq_id < 0 ? !cells[i].is_empty() : cells[i].has_seq_id(seq_id)) {
+            ++result;
+        }
+    }
+
+    return result;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {
