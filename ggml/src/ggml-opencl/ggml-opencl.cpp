@@ -2149,11 +2149,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             for (const char* unsafe_flag : { " -cl-fast-relaxed-math",
                                              " -cl-finite-math-only",
                                              " -cl-unsafe-math-optimizations" }) {
-                const size_t pos = fa_compile_opts.find(unsafe_flag);
-                if (pos != std::string::npos) {
+                // Erase every occurrence: the strip must not depend on the flag
+                // appearing exactly once or in a particular position. A surviving
+                // copy would silently rebuild FA with finite-math and reintroduce
+                // the -INFINITY miscompile this strip exists to prevent.
+                for (size_t pos = fa_compile_opts.find(unsafe_flag);
+                     pos != std::string::npos;
+                     pos = fa_compile_opts.find(unsafe_flag)) {
                     fa_compile_opts.erase(pos, std::string(unsafe_flag).size());
                 }
             }
+            // Fail loudly if any Inf-assuming flag survived (e.g. a future change
+            // to compile_opts spelling/spacing that the strip above misses),
+            // rather than shipping a silently miscompiled flash-attention kernel.
+            GGML_ASSERT(fa_compile_opts.find("finite-math")  == std::string::npos &&
+                        fa_compile_opts.find("fast-relaxed") == std::string::npos &&
+                        fa_compile_opts.find("unsafe-math")  == std::string::npos &&
+                        "flash-attn kernels must not be built with finite-math/fast-math flags");
 
             for (size_t i = 0; i < sizeof(fa_dims)/sizeof(fa_dims[0]); ++i) {
                 const int dk = fa_dims[i].dk;
@@ -9860,6 +9872,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     // causal. The previous `mask == NULL && n_q == n_kv` heuristic wrongly made
     // the bidirectional Qwen3-VL vision tower attend causally, corrupting the
     // image embedding (each patch only saw earlier patches).
+    //
+    // INVARIANT: this backend treats a null mask as bidirectional. Any caller
+    // that needs causal masking MUST supply an explicit causal mask; relying on
+    // shape inference here will silently produce bidirectional (wrong) output.
     const int is_causal = 0;
 
     const int n_head_log2_val = n_head > 0 ? 1u << (int)floorf(log2f((float)n_head)) : 0;
