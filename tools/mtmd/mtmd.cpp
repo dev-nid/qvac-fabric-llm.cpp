@@ -1478,6 +1478,24 @@ void mtmd_log_set(ggml_log_callback log_callback, void * user_data) {
 // Debugging API (NOT intended for public use)
 //
 
+// Portable env set/unset for the debug FA sweep below. POSIX setenv/unsetenv are
+// unavailable on MSVC, which provides _putenv_s instead (empty value removes it).
+static void mtmd_debug_setenv(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+static void mtmd_debug_unsetenv(const char * name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
 static void mtmd_debug_encode_impl(mtmd_context * ctx, clip_ctx * ctx_clip, clip_image_f32 & image) {
     // Dumping the final embeddings (and the per-op cb_eval in mtmd-debug) makes the
     // measured wall-clock dominated by formatting/printing rather than the encoder.
@@ -1590,7 +1608,7 @@ static void mtmd_debug_encode_impl(mtmd_context * ctx, clip_ctx * ctx_clip, clip
 
         // Reset all overrides so each config starts from the computed defaults.
         for (const auto & n : fa_env_names) {
-            unsetenv(n.c_str());
+            mtmd_debug_unsetenv(n.c_str());
         }
 
         if (cfg != "default") {
@@ -1604,7 +1622,7 @@ static void mtmd_debug_encode_impl(mtmd_context * ctx, clip_ctx * ctx_clip, clip
                 if (eq == std::string::npos) { continue; }
                 const char * env_name = key_to_env(kv.substr(0, eq));
                 if (env_name) {
-                    setenv(env_name, kv.substr(eq + 1).c_str(), 1);
+                    mtmd_debug_setenv(env_name, kv.substr(eq + 1).c_str());
                 }
             }
         }
