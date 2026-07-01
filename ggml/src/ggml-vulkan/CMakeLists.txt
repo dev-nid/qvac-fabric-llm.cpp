@@ -20,9 +20,11 @@ if (NOT TARGET SPIRV-Headers::SPIRV-Headers)
     if (EXISTS "${CMAKE_BINARY_DIR}/_deps/spirv_headers-src/CMakeLists.txt")
         FetchContent_Declare(spirv_headers SOURCE_DIR "${CMAKE_BINARY_DIR}/_deps/spirv_headers-src")
     else()
+        # Pin the exact commit (integrity) rather than the mutable tag; the
+        # trailing comment records the corresponding SDK tag.
         FetchContent_Declare(spirv_headers
             GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
-            GIT_TAG        vulkan-sdk-1.3.290.0)
+            GIT_TAG        2acb319af38d43be3ea76bfabf3998e5281d8d12) # vulkan-sdk-1.3.290.0
     endif()
     FetchContent_MakeAvailable(spirv_headers)
 endif()
@@ -37,10 +39,18 @@ if (ANDROID)
         set(GGML_VK_CPP_HEADERS_DIR "${CMAKE_BINARY_DIR}/_deps/vulkan_headers-src/include")
     else()
         include(FetchContent)
+        # Pinned to the exact commit (integrity) for the SDK tag in the comment.
+        # SOURCE_SUBDIR points at a path with no CMakeLists.txt so
+        # FetchContent_MakeAvailable only downloads the headers and skips
+        # add_subdirectory() — we just need the include dir, and adding
+        # Vulkan-Headers' own targets would clash with the NDK's Vulkan::Headers.
+        # This also avoids the deprecated FetchContent_Populate(), which errors
+        # under CMake 4.x (policy CMP0169).
         FetchContent_Declare(vulkan_headers
             GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
-            GIT_TAG        vulkan-sdk-1.3.290.0)
-        FetchContent_Populate(vulkan_headers)
+            GIT_TAG        b379292b2ab6df5771ba9870d53cf8b2c9295daf # vulkan-sdk-1.3.290.0
+            SOURCE_SUBDIR  ggml-vk-headers-only)
+        FetchContent_MakeAvailable(vulkan_headers)
         set(GGML_VK_CPP_HEADERS_DIR "${vulkan_headers_SOURCE_DIR}/include")
     endif()
 endif()
