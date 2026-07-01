@@ -127,3 +127,35 @@ set_target_properties(llama-mtmd-debug PROPERTIES OUTPUT_NAME llama-mtmd-debug)
 target_link_libraries(llama-mtmd-debug PRIVATE llama-common mtmd Threads::Threads)
 target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)
 endif()
+
+# qvac: standalone Qwen3-VL vision encoder benchmark.
+# Compiles the clip encoder sources DIRECTLY (bypassing the mtmd lib, which
+# links llama) so the resulting binary depends only on ggml + backends. This
+# is the fast desktop/on-device iteration loop for optimizing the shared
+# Vulkan/OpenCL kernels. Enabled by default; toggle with LLAMA_QWEN3VL_ENCODER.
+option(LLAMA_QWEN3VL_ENCODER "build the standalone qwen3vl vision encoder benchmark" ON)
+if (LLAMA_QWEN3VL_ENCODER)
+    file(GLOB MTMD_MODEL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/models/*.cpp)
+    add_executable(qwen3vl-encoder
+        qwen3vl-encoder/main.cpp
+        clip.cpp
+        mtmd-image.cpp
+        ${MTMD_MODEL_SOURCES}
+    )
+    target_include_directories(qwen3vl-encoder PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../..            # repo root (ggml headers, etc.)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include     # llama.h (header-only, pulled via mtmd.h)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../vendor       # vendored third-party
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/stb   # stb_image.h
+    )
+    target_link_libraries(qwen3vl-encoder PRIVATE ggml Threads::Threads)
+    target_compile_features(qwen3vl-encoder PRIVATE cxx_std_17)
+    if (NOT MSVC)
+        # stb_image.h + clip.cpp cast-qual warnings, same as the mtmd lib
+        target_compile_options(qwen3vl-encoder PRIVATE -Wno-cast-qual)
+    endif()
+    if (ANDROID)
+        target_compile_options(qwen3vl-encoder PRIVATE -Wno-missing-prototypes)
+    endif()
+endif()
