@@ -51,7 +51,8 @@ struct clip_context_params {
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
     const char * backend_device; // optional, if null will use env var or default GPU backend
-    int image_tile_mode; // 0=batched (default), 1=sequential, 2=disabled
+    int image_tile_mode;   // 0=batched (default), 1=sequential, 2=disabled
+    int image_max_tiles;   // override preproc_max_tiles; -1 = use GGUF/model default
 };
 
 struct clip_init_result {

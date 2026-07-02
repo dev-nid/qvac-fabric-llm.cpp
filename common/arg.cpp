@@ -2270,6 +2270,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else { throw std::invalid_argument("unknown --image-tile-mode: " + value + " (use batched, sequential, or disabled)"); }
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_TILE_MODE"));
+    add_opt(common_arg(
+        {"--image-max-tiles"}, "N",
+        "maximum number of tiles for multi-tile vision models (e.g. Qwen3VL), overrides the\n"
+        "value from the GGUF; use when the GGUF lacks the key or the model default is wrong\n"
+        "for your model size (Qwen3VL defaults to 4, too low for 8B+ variants)",
+        [](common_params & params, int value) {
+            if (value < 1)   { throw std::invalid_argument("--image-max-tiles must be >= 1"); }
+            if (value > 256) { throw std::invalid_argument("--image-max-tiles must be <= 256"); }
+            params.image_max_tiles = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TILES"));
     if (llama_supports_rpc()) {
         add_opt(common_arg(
             {"--rpc"}, "SERVERS",
