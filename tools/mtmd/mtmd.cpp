@@ -615,6 +615,8 @@ struct mtmd_caps mtmd_get_cap_from_file(const char * fname) {
         cp.cb_eval          = nullptr;
         cp.cb_eval_user_data= nullptr;
         cp.backend_device   = nullptr;
+        cp.image_tile_mode  = CLIP_IMAGE_TILE_MODE_SEQUENTIAL;
+        cp.image_max_tiles  = -1; // -1 = use model default
         clip_init_result init = clip_init(fname, cp);
         if (init.ctx_v != nullptr) {
             cap.inp_vision = clip_has_vision_encoder(init.ctx_v);
@@ -649,6 +651,8 @@ std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(
         cp.cb_eval          = nullptr;
         cp.cb_eval_user_data= nullptr;
         cp.backend_device   = nullptr;
+        cp.image_tile_mode  = ctx_params.image_tile_mode;
+        cp.image_max_tiles  = ctx_params.image_max_tiles;
         clip_init_result init = clip_init(mmproj_fname, cp);
         auto merge = [&](struct clip_ctx * c) {
             if (c == nullptr) return;
