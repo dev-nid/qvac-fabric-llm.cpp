@@ -11,60 +11,7 @@ find_package(Vulkan COMPONENTS glslc REQUIRED)
 if (DEFINED ENV{VULKAN_SDK})
     list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
 endif()
-find_package(SPIRV-Headers CONFIG QUIET)
-if (NOT TARGET SPIRV-Headers::SPIRV-Headers)
-    # The Android NDK ships no SPIRV-Headers package. Reuse the pinned headers
-    # already fetched under the build tree's _deps (offline) for the on-device
-    # Vulkan build; fall back to the upstream repo if they are not present.
-    include(FetchContent)
-    if (EXISTS "${CMAKE_BINARY_DIR}/_deps/spirv_headers-src/CMakeLists.txt")
-        FetchContent_Declare(spirv_headers SOURCE_DIR "${CMAKE_BINARY_DIR}/_deps/spirv_headers-src")
-    else()
-        # Pin the exact commit (integrity) rather than the mutable tag; the
-        # trailing comment records the corresponding SDK tag.
-        FetchContent_Declare(spirv_headers
-            GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
-            GIT_TAG        2acb319af38d43be3ea76bfabf3998e5281d8d12) # vulkan-sdk-1.3.290.0
-    endif()
-    FetchContent_MakeAvailable(spirv_headers)
-endif()
-
-# The NDK's find_package(Vulkan) yields C-only headers, so <vulkan/vulkan.hpp>
-# must be supplied separately on Android. Order of preference:
-#   1. the vcpkg qvac-fabric port stages Vulkan-Headers into vulkan_cpp_wrapper/
-#      (added to the include path unconditionally in the ANDROID block below) —
-#      use it as-is and do NOT fetch, or we would clone a second, differently
-#      pinned copy at configure time and shadow the port's headers (the exact
-#      regression that reverting the earlier FetchContent approach fixed);
-#   2. a copy already fetched under the build tree's _deps (standalone rebuild);
-#   3. a fresh FetchContent clone (first-time standalone NDK build).
-# We only add an include dir (the Vulkan::Headers target already exists from the
-# NDK, so we must not redefine it).
-set(GGML_VK_CPP_HEADERS_DIR "")
-if (ANDROID)
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include/vulkan/vulkan.hpp")
-        # vcpkg-port build: headers already staged in vulkan_cpp_wrapper/ and
-        # consumed by the ANDROID include block below. Nothing to fetch, and
-        # leaving GGML_VK_CPP_HEADERS_DIR empty avoids prepending a second copy.
-    elseif (EXISTS "${CMAKE_BINARY_DIR}/_deps/vulkan_headers-src/include/vulkan/vulkan.hpp")
-        set(GGML_VK_CPP_HEADERS_DIR "${CMAKE_BINARY_DIR}/_deps/vulkan_headers-src/include")
-    else()
-        include(FetchContent)
-        # Pinned to the exact commit (integrity) for the SDK tag in the comment.
-        # SOURCE_SUBDIR points at a path with no CMakeLists.txt so
-        # FetchContent_MakeAvailable only downloads the headers and skips
-        # add_subdirectory() — we just need the include dir, and adding
-        # Vulkan-Headers' own targets would clash with the NDK's Vulkan::Headers.
-        # This also avoids the deprecated FetchContent_Populate(), which errors
-        # under CMake 4.x (policy CMP0169).
-        FetchContent_Declare(vulkan_headers
-            GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
-            GIT_TAG        b379292b2ab6df5771ba9870d53cf8b2c9295daf # vulkan-sdk-1.3.290.0
-            SOURCE_SUBDIR  ggml-vk-headers-only)
-        FetchContent_MakeAvailable(vulkan_headers)
-        set(GGML_VK_CPP_HEADERS_DIR "${vulkan_headers_SOURCE_DIR}/include")
-    endif()
-endif()
+find_package(SPIRV-Headers CONFIG REQUIRED)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     # Parallel build object files
@@ -165,20 +112,6 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
-    if (TARGET SPIRV-Headers::SPIRV-Headers)
-        # Provides <spirv/unified1/spirv.hpp> on platforms (e.g. Android NDK)
-        # whose Vulkan package does not bundle the SPIRV headers. It is a
-        # header-only dependency needed only to compile ggml-vulkan.cpp, so wrap
-        # it in BUILD_INTERFACE: as a static lib the PRIVATE link would otherwise
-        # leak into the installed ggml-targets export and break downstream
-        # find_package(ggml) on platforms whose Vulkan SDK ships the config
-        # target (e.g. Windows), which never call find_package(SPIRV-Headers).
-        target_link_libraries(ggml-vulkan PRIVATE $<BUILD_INTERFACE:SPIRV-Headers::SPIRV-Headers>)
-    endif()
-    if (ANDROID AND GGML_VK_CPP_HEADERS_DIR)
-        # NDK has no <vulkan/vulkan.hpp>; prepend the fetched C++ headers.
-        target_include_directories(ggml-vulkan BEFORE PRIVATE "${GGML_VK_CPP_HEADERS_DIR}")
-    endif()
     target_include_directories(ggml-vulkan
         PRIVATE
             ${CMAKE_CURRENT_BINARY_DIR}
