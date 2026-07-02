@@ -30,12 +30,23 @@ if (NOT TARGET SPIRV-Headers::SPIRV-Headers)
 endif()
 
 # The NDK's find_package(Vulkan) yields C-only headers, so <vulkan/vulkan.hpp>
-# must be supplied separately on Android. Reuse the pinned headers already in
-# the build tree's _deps; only add the include dir (the Vulkan::Headers target
-# already exists from the NDK, so we must not redefine it).
+# must be supplied separately on Android. Order of preference:
+#   1. the vcpkg qvac-fabric port stages Vulkan-Headers into vulkan_cpp_wrapper/
+#      (added to the include path unconditionally in the ANDROID block below) —
+#      use it as-is and do NOT fetch, or we would clone a second, differently
+#      pinned copy at configure time and shadow the port's headers (the exact
+#      regression that reverting the earlier FetchContent approach fixed);
+#   2. a copy already fetched under the build tree's _deps (standalone rebuild);
+#   3. a fresh FetchContent clone (first-time standalone NDK build).
+# We only add an include dir (the Vulkan::Headers target already exists from the
+# NDK, so we must not redefine it).
 set(GGML_VK_CPP_HEADERS_DIR "")
 if (ANDROID)
-    if (EXISTS "${CMAKE_BINARY_DIR}/_deps/vulkan_headers-src/include/vulkan/vulkan.hpp")
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include/vulkan/vulkan.hpp")
+        # vcpkg-port build: headers already staged in vulkan_cpp_wrapper/ and
+        # consumed by the ANDROID include block below. Nothing to fetch, and
+        # leaving GGML_VK_CPP_HEADERS_DIR empty avoids prepending a second copy.
+    elseif (EXISTS "${CMAKE_BINARY_DIR}/_deps/vulkan_headers-src/include/vulkan/vulkan.hpp")
         set(GGML_VK_CPP_HEADERS_DIR "${CMAKE_BINARY_DIR}/_deps/vulkan_headers-src/include")
     else()
         include(FetchContent)
