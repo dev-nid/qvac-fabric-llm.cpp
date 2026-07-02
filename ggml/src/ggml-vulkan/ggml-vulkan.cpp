@@ -38,10 +38,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cmath>
-#include <cstdint>
-#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <tuple>
@@ -3162,112 +3159,17 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         }
     }
 
-    // ---- qvac: Arm Mali scalar flash-attn tuning ----
-    // The scalar path is the only FA path on GPUs without cooperative-matrix
-    // (e.g. Arm Mali), and the generic config (D_split=8, Br=8) is not tuned for
-    // Mali's subgroup size of 16. An on-device sweep (Pixel 9 Pro, Mali-G715,
-    // Gemma 4 E2B vision encoder, head_dim 64) found D_split=4 + Br=4 fastest:
-    // clean encode -6% at 196 tokens, -11% at 784. D_split=2 and larger tiles
-    // regress sharply, so this is gated tightly to the measured shape (head
-    // size <= 64, multi-row attention; the n_rows==1 decode path is untouched).
+    // qvac: Arm Mali scalar flash-attn tuning. The scalar path is the only FA
+    // path on GPUs without cooperative-matrix (e.g. Arm Mali), and the generic
+    // config (D_split=8, Br=8) is not tuned for Mali's subgroup size of 16. An
+    // on-device sweep (Pixel 9 Pro, Mali-G715, Gemma 4 E2B vision encoder,
+    // head_dim 64) found D_split=4 + Br=4 fastest (clean encode -6% at 196
+    // tokens, -11% at 784; smaller splits / larger tiles regress sharply). Gated
+    // tightly to the measured shape: head size <= 64 and multi-row attention
+    // (the n_rows == 1 decode path is untouched).
     if (device->vendor_id == VK_VENDOR_ID_ARM && n_rows > 1 && hsk <= 64 && hsv <= 64) {
         result.d_split    = std::min(result.d_split, 4u);
         result.block_rows = std::min(result.block_rows, 4u);
-    }
-
-    // ---- qvac: scalar flash-attn tuning overrides (build-once, sweep-many) ----
-    // These env vars let us sweep configs on-device without recompiling and take
-    // precedence over the Mali defaults above. An override that would overflow
-    // shared memory is rejected and the computed (safe) defaults are kept.
-    //
-    // The environment is read ONCE per process and cached: this function runs on
-    // the flash-attn dispatch hot path (per attention layer, per token), so the
-    // getenv() calls must not repeat there. Tile/split dims are clamped to a sane
-    // maximum — they feed the shared-memory size math (e.g. Bc*(Br+1)*..., summed
-    // as uint32) and become CEIL_DIV divisors / Vulkan workgroup sizes, so an
-    // absurd value could wrap that math and slip past the shmem guard below.
-    {
-        // static storage duration so the no-capture parse lambda below can use it
-        // without a capture (MSVC C3493 otherwise); also a compile-time constant.
-        static constexpr uint32_t FA_OVERRIDE_MAX = 1024u;  // well below any wrap threshold
-
-        struct fa_overrides {
-            bool     has_br=false, has_bc=false, has_wg=false, has_sgs=false,
-                     has_dsplit=false, has_rsplit=false, has_staging=false, has_nosg=false;
-            uint32_t br=0, bc=0, wg=0, sgs=0, dsplit=0, rsplit=0;
-            bool     staging=false, nosg=false;
-            bool     any=false, debug=false;
-        };
-
-        // Parsed once; C++11 guarantees thread-safe init of the function-local static.
-        static const fa_overrides ov = []() -> fa_overrides {
-            fa_overrides o;
-            // Tile/split dims: 1..FA_OVERRIDE_MAX. 0 would div-by-zero at dispatch;
-            // > max is rejected so it cannot overflow the shmem-size accumulation.
-            auto tile = [](const char * name, uint32_t & out) -> bool {
-                const char * v = std::getenv(name);
-                if (!v || !v[0]) { return false; }
-                errno = 0;
-                char * end = nullptr;
-                unsigned long ul = std::strtoul(v, &end, 10);
-                if (end == v || *end != '\0' || errno == ERANGE || ul == 0 || ul > FA_OVERRIDE_MAX) {
-                    fprintf(stderr, "[FA-OVERRIDE] ignoring out-of-range %s=%s (want 1..%u)\n",
-                            name, v, FA_OVERRIDE_MAX);
-                    return false;
-                }
-                out = (uint32_t) ul;
-                return true;
-            };
-            // Booleans: any valid non-zero integer is true, 0 is false.
-            auto boolean = [](const char * name, bool & out) -> bool {
-                const char * v = std::getenv(name);
-                if (!v || !v[0]) { return false; }
-                errno = 0;
-                char * end = nullptr;
-                unsigned long ul = std::strtoul(v, &end, 10);
-                if (end == v || *end != '\0' || errno == ERANGE) { return false; }
-                out = (ul != 0);
-                return true;
-            };
-            o.has_br     = tile("GGML_VK_FA_BR",         o.br);
-            o.has_bc     = tile("GGML_VK_FA_BC",         o.bc);
-            o.has_wg     = tile("GGML_VK_FA_WG",         o.wg);
-            o.has_sgs    = tile("GGML_VK_FA_SGS",        o.sgs);
-            o.has_dsplit = tile("GGML_VK_FA_DSPLIT",     o.dsplit);
-            o.has_rsplit = tile("GGML_VK_FA_RSPLIT",     o.rsplit);
-            o.has_staging= boolean("GGML_VK_FA_STAGING",   o.staging);
-            o.has_nosg   = boolean("GGML_VK_FA_NOSUBGROUP",o.nosg);
-            o.debug      = std::getenv("GGML_VK_FA_DEBUG") != nullptr;
-            o.any = o.has_br || o.has_bc || o.has_wg || o.has_sgs ||
-                    o.has_dsplit || o.has_rsplit || o.has_staging || o.has_nosg;
-            return o;
-        }();
-
-        if (ov.any) {
-            const vk_fa_tuning_params before = result;
-            if (ov.has_br)      { result.block_rows       = ov.br;      }
-            if (ov.has_bc)      { result.block_cols       = ov.bc;      }
-            if (ov.has_wg)      { result.workgroup_size   = ov.wg;      }
-            if (ov.has_sgs)     { result.subgroup_size    = ov.sgs;     }
-            if (ov.has_dsplit)  { result.d_split          = ov.dsplit;  }
-            if (ov.has_rsplit)  { result.row_split        = ov.rsplit;  }
-            if (ov.has_staging) { result.shmem_staging    = ov.staging; }
-            if (ov.has_nosg)    { result.disable_subgroups= ov.nosg;    }
-
-            if (!ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, kv_type)) {
-                fprintf(stderr, "[FA-OVERRIDE] rejected (shmem overflow), keeping defaults: ");
-                result.print();
-                result = before;
-            }
-        }
-
-        static bool logged = false;
-        if (ov.debug && n_rows != 512 && !logged) {
-            logged = true;
-            fprintf(stderr, "[FA-TUNE] hsk=%u hsv=%u n_rows=%u n_kv=%u kv_type=%d f32acc=%d -> ",
-                    hsk, hsv, n_rows, n_kv, (int) kv_type, (int) f32acc);
-            result.print();
-        }
     }
 
     return result;
@@ -10587,27 +10489,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     uint32_t workgroups_y = (uint32_t)neq2;
     uint32_t workgroups_z = (uint32_t)neq3;
 
-    bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32;
-
-    // qvac: allow forcing f16 accumulation for FA tuning experiments. Halves
-    // accumulator register/bandwidth pressure (often a Mali win) at the cost of
-    // precision; gated by env so it can be A/B'd against the accuracy check.
-    if (const char * e = std::getenv("GGML_VK_FA_F16ACC")) {
-        if (e[0] == '1' && ctx->device->fp16) {
-            f32acc = false;
-        }
-    }
-
-    {
-        static bool caps_logged = false;
-        if (std::getenv("GGML_VK_FA_DEBUG") && !caps_logged) {
-            caps_logged = true;
-            fprintf(stderr, "[FA-CAPS] vendor=0x%x arch=%d fp16=%d subgroup_size=%u maxSharedMem=%u f32acc=%d\n",
-                    ctx->device->vendor_id, (int) ctx->device->architecture, (int) ctx->device->fp16,
-                    ctx->device->subgroup_size,
-                    ctx->device->properties.limits.maxComputeSharedMemorySize, (int) f32acc);
-        }
-    }
+    const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32;
 
     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).

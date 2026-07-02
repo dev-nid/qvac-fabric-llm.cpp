@@ -18,11 +18,9 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 #include <vector>
 
 // represents raw image data, layout is RGBRGBRGB...
@@ -1478,181 +1476,18 @@ void mtmd_log_set(ggml_log_callback log_callback, void * user_data) {
 // Debugging API (NOT intended for public use)
 //
 
-// Portable env set/unset for the debug FA sweep below. POSIX setenv/unsetenv are
-// unavailable on MSVC, which provides _putenv_s instead (empty value removes it).
-static void mtmd_debug_setenv(const char * name, const char * value) {
-#ifdef _WIN32
-    _putenv_s(name, value);
-#else
-    setenv(name, value, 1);
-#endif
-}
-
-static void mtmd_debug_unsetenv(const char * name) {
-#ifdef _WIN32
-    _putenv_s(name, "");
-#else
-    unsetenv(name);
-#endif
-}
-
 static void mtmd_debug_encode_impl(mtmd_context * ctx, clip_ctx * ctx_clip, clip_image_f32 & image) {
-    // Dumping the final embeddings (and the per-op cb_eval in mtmd-debug) makes the
-    // measured wall-clock dominated by formatting/printing rather than the encoder.
-    // For a clean Vulkan encoder baseline keep dumps off by default; opt in via env.
-    const char * dump_env = std::getenv("MTMD_DEBUG_DUMP_EMBEDDINGS");
-    clip_set_debug_output_embeddings(ctx_clip, dump_env && dump_env[0] == '1');
-
+    clip_set_debug_output_embeddings(ctx_clip, true);
     int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
     int n_tokens = clip_n_output_tokens(ctx_clip, &image);
     std::vector<float> embd_output(n_tokens * n_mmproj_embd, 0.0f);
-
-    // Repeat/warmup let us report a stable steady-state encoder latency. The first
-    // clip_image_encode also allocates the graph buffers, so it must not be timed.
-    int repeat = 1;
-    if (const char * r = std::getenv("MTMD_DEBUG_ENCODE_REPEAT")) {
-        repeat = atoi(r);
-        if (repeat < 1) { repeat = 1; }
-    }
-    int warmup = 1;
-    if (const char * w = std::getenv("MTMD_DEBUG_ENCODE_WARMUP")) {
-        warmup = atoi(w);
-        if (warmup < 0) { warmup = 0; }
-    }
-
-    // A single measured bench pass: warmup (untimed; the first encode for a new
-    // flash-attn config also triggers lazy Vulkan pipeline compilation) followed
-    // by timed repeats. Emits a cfg-tagged ENCODE_BENCH line so an external
-    // sweep can attribute timings to the config that produced them.
-    // Use stdout directly: the clip logger callback does not reliably reach the
-    // process stdout captured by the on-device benchmark harness.
-    auto run_bench = [&](const char * cfg) {
-        for (int i = 0; i < warmup; i++) {
-            if (!clip_image_encode(ctx_clip, ctx->n_threads, &image, embd_output.data())) {
-                LOG_ERR("%s: failed to encode image (warmup %d, cfg=%s)\n", __func__, i, cfg);
-                return;
-            }
-        }
-
-        std::vector<int64_t> times_us;
-        times_us.reserve(repeat);
-        for (int i = 0; i < repeat; i++) {
-            const int64_t t0 = ggml_time_us();
-            const bool ok = clip_image_encode(ctx_clip, ctx->n_threads, &image, embd_output.data());
-            const int64_t t1 = ggml_time_us();
-            if (!ok) {
-                LOG_ERR("%s: failed to encode image (cfg=%s)\n", __func__, cfg);
-                return;
-            }
-            times_us.push_back(t1 - t0);
-            printf("ENCODE_RUN tokens=%d run=%d ms=%.3f cfg=%s\n", n_tokens, i, (t1 - t0) / 1000.0, cfg);
-            fflush(stdout);
-        }
-
-        std::vector<int64_t> sorted = times_us;
-        std::sort(sorted.begin(), sorted.end());
-        const int64_t min_us = sorted.front();
-        const int64_t med_us = sorted[sorted.size() / 2];
-        printf("ENCODE_BENCH tokens=%d runs=%d min_ms=%.3f median_ms=%.3f cfg=%s\n",
-               n_tokens, repeat, min_us / 1000.0, med_us / 1000.0, cfg);
-        fflush(stdout);
-    };
-
-    // Optional in-process flash-attn config sweep. MTMD_DEBUG_FA_SWEEP is a
-    // ';'-separated list of configs; each config is a ','-separated list of
-    // key=value pairs (keys: br,bc,wg,sgs,dsplit,rsplit,staging,nosg,f16acc) that
-    // map onto the GGML_VK_FA_* env vars the Vulkan backend reads on every FA
-    // dispatch. The literal "default" clears all overrides. Sweeping in one
-    // process avoids reloading the (multi-GB) model per config.
-    const char * sweep_env = std::getenv("MTMD_DEBUG_FA_SWEEP");
-    if (!sweep_env || !sweep_env[0]) {
-        run_bench("default");
-        return;
-    }
-
-    static const std::vector<std::string> fa_env_names = {
-        "GGML_VK_FA_BR", "GGML_VK_FA_BC", "GGML_VK_FA_WG", "GGML_VK_FA_SGS",
-        "GGML_VK_FA_DSPLIT", "GGML_VK_FA_RSPLIT", "GGML_VK_FA_STAGING",
-        "GGML_VK_FA_NOSUBGROUP", "GGML_VK_FA_F16ACC",
-    };
-    auto key_to_env = [](const std::string & k) -> const char * {
-        if (k == "br")      { return "GGML_VK_FA_BR"; }
-        if (k == "bc")      { return "GGML_VK_FA_BC"; }
-        if (k == "wg")      { return "GGML_VK_FA_WG"; }
-        if (k == "sgs")     { return "GGML_VK_FA_SGS"; }
-        if (k == "dsplit")  { return "GGML_VK_FA_DSPLIT"; }
-        if (k == "rsplit")  { return "GGML_VK_FA_RSPLIT"; }
-        if (k == "staging") { return "GGML_VK_FA_STAGING"; }
-        if (k == "nosg")    { return "GGML_VK_FA_NOSUBGROUP"; }
-        if (k == "f16acc")  { return "GGML_VK_FA_F16ACC"; }
-        return nullptr;
-    };
-
-    // Optional accuracy gate: with MTMD_DEBUG_FA_ACC=1, the first swept config is
-    // taken as the numerical reference and every later config's embeddings are
-    // compared to it (cosine similarity + max abs error). Tiling knobs like
-    // D_split/Br are mathematically identical attention, so cosine should be ~1.0
-    // (only fp reduction-order noise); this verifies that on real hardware.
-    const bool acc_check = std::getenv("MTMD_DEBUG_FA_ACC") != nullptr;
-    std::vector<float> ref_embd;
-    bool have_ref = false;
-
-    const std::string sweep = sweep_env;
-    size_t cfg_start = 0;
-    while (cfg_start <= sweep.size()) {
-        size_t cfg_end = sweep.find(';', cfg_start);
-        if (cfg_end == std::string::npos) { cfg_end = sweep.size(); }
-        const std::string cfg = sweep.substr(cfg_start, cfg_end - cfg_start);
-        cfg_start = cfg_end + 1;
-        if (cfg.empty()) { continue; }
-
-        // Reset all overrides so each config starts from the computed defaults.
-        for (const auto & n : fa_env_names) {
-            mtmd_debug_unsetenv(n.c_str());
-        }
-
-        if (cfg != "default") {
-            size_t kv_start = 0;
-            while (kv_start <= cfg.size()) {
-                size_t kv_end = cfg.find(',', kv_start);
-                if (kv_end == std::string::npos) { kv_end = cfg.size(); }
-                const std::string kv = cfg.substr(kv_start, kv_end - kv_start);
-                kv_start = kv_end + 1;
-                const size_t eq = kv.find('=');
-                if (eq == std::string::npos) { continue; }
-                const char * env_name = key_to_env(kv.substr(0, eq));
-                if (env_name) {
-                    mtmd_debug_setenv(env_name, kv.substr(eq + 1).c_str());
-                }
-            }
-        }
-
-        run_bench(cfg.c_str());
-
-        if (acc_check) {
-            // embd_output holds this config's last encode result.
-            if (!have_ref) {
-                ref_embd  = embd_output;
-                have_ref  = true;
-                printf("ENCODE_ACC cfg=%s (reference)\n", cfg.c_str());
-                fflush(stdout);
-            } else {
-                double dot = 0.0, na = 0.0, nb = 0.0, maxabs = 0.0;
-                const size_t n = std::min(ref_embd.size(), embd_output.size());
-                for (size_t k = 0; k < n; k++) {
-                    const double a = ref_embd[k];
-                    const double b = embd_output[k];
-                    dot += a * b;
-                    na  += a * a;
-                    nb  += b * b;
-                    const double d = std::fabs(a - b);
-                    if (d > maxabs) { maxabs = d; }
-                }
-                const double cos = (na > 0.0 && nb > 0.0) ? dot / (std::sqrt(na) * std::sqrt(nb)) : 0.0;
-                printf("ENCODE_ACC cfg=%s cosine=%.8f maxabs=%.6e\n", cfg.c_str(), cos, maxabs);
-                fflush(stdout);
-            }
-        }
+    bool ok = clip_image_encode(
+        ctx_clip,
+        ctx->n_threads,
+        &image,
+        embd_output.data());
+    if (!ok) {
+        LOG_ERR("%s: failed to encode image\n", __func__);
     }
 }
 
