@@ -3159,6 +3159,19 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         }
     }
 
+    // qvac: Arm Mali scalar flash-attn tuning. The scalar path is the only FA
+    // path on GPUs without cooperative-matrix (e.g. Arm Mali), and the generic
+    // config (D_split=8, Br=8) is not tuned for Mali's subgroup size of 16. An
+    // on-device sweep (Pixel 9 Pro, Mali-G715, Gemma 4 E2B vision encoder,
+    // head_dim 64) found D_split=4 + Br=4 fastest (clean encode -6% at 196
+    // tokens, -11% at 784; smaller splits / larger tiles regress sharply). Gated
+    // tightly to the measured shape: head size <= 64 and multi-row attention
+    // (the n_rows == 1 decode path is untouched).
+    if (device->vendor_id == VK_VENDOR_ID_ARM && n_rows > 1 && hsk <= 64 && hsv <= 64) {
+        result.d_split    = std::min(result.d_split, 4u);
+        result.block_rows = std::min(result.block_rows, 4u);
+    }
+
     return result;
 }
 
