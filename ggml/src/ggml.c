@@ -3364,6 +3364,21 @@ void ggml_mul_mat_set_prec(
     ggml_set_op_params_i32(a, 0, prec_i32);
 }
 
+// qvac: hint slot lives in op_params[1] (slot 0 is the precision above).
+// The backends already read it via ggml_get_op_params_i32(a, 1) — see
+// ggml-cuda.cu (GGML_HINT_SRC0_IS_HADAMARD branch) and ggml-cpu.c. The function
+// itself was declared in ggml.h but its definition was dropped during the
+// upstream b9341 rebase.
+void ggml_mul_mat_set_hint(
+        struct ggml_tensor * a,
+        enum ggml_op_hint    hint) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
+
+    const int32_t hint_i32 = (int32_t) hint;
+
+    ggml_set_op_params_i32(a, 1, hint_i32);
+}
+
 // ggml_mul_mat_id
 
 /*

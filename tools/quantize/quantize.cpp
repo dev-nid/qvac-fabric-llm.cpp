@@ -1,5 +1,8 @@
-#include "common.h"
 #include "llama.h"
+
+#include "build-info.h"
+#include "common.h"
+
 #include "gguf.h"
 
 #include <algorithm>
@@ -487,7 +490,10 @@ static bool parse_layer_prune(const char * data, std::vector<int> & prune_layers
     return true;
 }
 
-int main(int argc, char ** argv) {
+// satisfies -Wmissing-declarations
+int llama_quantize(int argc, char ** argv);
+
+int llama_quantize(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     if (argc < 3) {
         usage(argv[0]);
@@ -709,7 +715,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    print_build_info();
+    llama_print_build_info();
 
     if (params.dry_run) {
         fprintf(stderr, "%s: calculating quantization size for '%s' as %s", __func__, fname_inp.c_str(), ftype_str.c_str());

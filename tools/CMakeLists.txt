@@ -22,6 +22,9 @@ else()
     add_subdirectory(perplexity)
     add_subdirectory(quantize)
     if (LLAMA_BUILD_SERVER AND LLAMA_MTMD)
+        # qvac: ui subdir generates ui.h consumed by server/server-http.cpp; was
+        # missing from this list after the rebase. Must precede `server`.
+        add_subdirectory(ui)
         add_subdirectory(cli)
         add_subdirectory(server)
     endif()

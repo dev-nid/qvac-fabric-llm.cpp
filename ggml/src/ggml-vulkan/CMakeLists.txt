@@ -8,6 +8,11 @@ endif()
 
 find_package(Vulkan COMPONENTS glslc REQUIRED)
 
+if (DEFINED ENV{VULKAN_SDK})
+    list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
+endif()
+find_package(SPIRV-Headers CONFIG REQUIRED)
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     # Parallel build object files
     add_definitions(/MP)
@@ -86,6 +91,14 @@ if (Vulkan_FOUND)
         message(STATUS "VK_NV_cooperative_matrix2 support disabled by GGML_VULKAN_DISABLE_COOPMAT2")
     endif()
 
+    # qvac: only the FlashAttn MMQ shaders reference FaTypeK / FA_TYPE_* spec
+    # constants that weren't ported from upstream b9341 into the qvac fork's
+    # macro-based dispatch. Those specific FA MMQ variants are gated off at the
+    # shader-gen and pipeline-registration sites (search for "qvac: FlashAttn
+    # MMQ"); the rest of the integer-dot family (mul_mat_mat_q8_1,
+    # mul_mat_vec_q8_1, etc.) compiles cleanly and is essential for fast TQ /
+    # quant matmul on Mali. So feature-test integer-dot unconditionally — no
+    # global -DGGML_VULKAN_DISABLE_INTEGER_DOT opt-out needed any more.
     test_shader_extension_support(
         "GL_EXT_integer_dot_product"
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot.comp"

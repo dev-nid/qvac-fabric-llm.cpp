@@ -19,8 +19,10 @@
 #include <vector>
 #include <unordered_set>
 
+#include "build-info.h"
 #include "common.h"
 #include "download.h"
+#include "fit.h"
 #include "ggml.h"
 #include "llama.h"
 
@@ -1636,8 +1638,8 @@ struct test {
     }
 };
 
-const std::string test::build_commit = LLAMA_COMMIT;
-const int         test::build_number = LLAMA_BUILD_NUMBER;
+const std::string test::build_commit = llama_commit();
+const int         test::build_number = llama_build_number();
 
 struct printer {
     virtual ~printer() {}
@@ -2146,7 +2148,10 @@ static std::unique_ptr<printer> create_printer(output_formats format) {
     GGML_ABORT("fatal error");
 }
 
-int main(int argc, char ** argv) {
+// satisfies -Wmissing-declarations
+int llama_bench(int argc, char ** argv);
+
+int llama_bench(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     // try to set locale for unicode characters in markdown
     std::setlocale(LC_CTYPE, ".UTF-8");
@@ -2236,7 +2241,7 @@ int main(int argc, char ** argv) {
                 prev_inst = nullptr;
             }
 
-            // use default n_gpu_layers and n_ctx so llama_params_fit can adjust them
+            // use default n_gpu_layers and n_ctx so common_fit_params can adjust them
             mparams.n_gpu_layers          = llama_model_default_params().n_gpu_layers;
             mparams.tensor_split          = fit_tensor_split.data();
             mparams.tensor_buft_overrides = fit_overrides.data();
@@ -2247,7 +2252,7 @@ int main(int argc, char ** argv) {
             uint32_t n_ctx_needed = inst.n_prompt + inst.n_gen + inst.n_depth;
             cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
 
-            llama_params_fit(inst.model.c_str(), &mparams, &cparams,
+            common_fit_params(inst.model.c_str(), &mparams, &cparams,
                 fit_tensor_split.data(),
                 fit_overrides.data(),
                 margins.data(),

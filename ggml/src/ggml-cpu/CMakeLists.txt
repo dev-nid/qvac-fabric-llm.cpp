@@ -54,6 +54,25 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ops.cpp
         )
 
+    # clang-22's -O3 optimizer blows up (>6h on a single TU; reproduced locally
+    # as one clang++ pegged at 100% CPU, ~0.8 GB RSS) compiling the AMX
+    # quantized-matmul kernel (ggml-cpu/amx/mmq.cpp) for the sapphirerapids
+    # variant under GGML_CPU_ALL_VARIANTS. AMX throughput comes from the tile
+    # intrinsics, not the high-level optimizer, so building that one TU at -O1
+    # avoids the compile-time explosion at negligible runtime cost (-O1: ~5s vs
+    # -O3: >40m). Skip MSVC: it maps -O1 to /O1, incompatible with the debug
+    # /RTC1 flag (D8016), and doesn't hit the clang blow-up anyway.
+    #
+    # NOTE: source-file COMPILE_OPTIONS are *directory*-scoped — they apply to
+    # mmq.cpp in every variant library built here, not just the one whose
+    # function call sets them. So gate on the consuming target via a generator
+    # expression: only the ggml-cpu-sapphirerapids target gets -O1; every other
+    # variant keeps -O3.
+    if(NOT MSVC AND GGML_BACKEND_DL AND GGML_CPU_ALL_VARIANTS)
+      set_source_files_properties(ggml-cpu/amx/mmq.cpp PROPERTIES COMPILE_OPTIONS
+        "$<$<STREQUAL:$<TARGET_PROPERTY:NAME>,ggml-cpu-sapphirerapids>:-O1>")
+    endif()
+
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
 
@@ -72,17 +91,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         endif()
     endif()
 
-    if (GGML_OPENMP)
-        find_package(OpenMP)
-        if (OpenMP_FOUND)
-            set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
-            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
-
-            target_link_libraries(${GGML_CPU_NAME} PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
-        else()
-            set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
-            message(WARNING "OpenMP not found")
-        endif()
+    if (GGML_OPENMP_ENABLED)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
+        target_link_libraries(${GGML_CPU_NAME} PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
     endif()
 
     if (GGML_LLAMAFILE)
@@ -450,12 +461,22 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ggml-cpu/arch/riscv/repack.cpp
             )
         if (GGML_CPU_RISCV64_SPACEMIT)
+            include(ggml-cpu/cmake/FindSMTIME.cmake)
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_RISCV64_SPACEMIT ${RISCV64_SPACEMIT_IME_SPEC})
             list(APPEND GGML_CPU_SOURCES
                 ggml-cpu/spacemit/ime.cpp
                 ggml-cpu/spacemit/ime.h
+                ggml-cpu/spacemit/spine_mem_pool.cpp
+                ggml-cpu/spacemit/spine_mem_pool.h
+                ggml-cpu/spacemit/repack.cpp
+                ggml-cpu/spacemit/repack.h
+                ggml-cpu/spacemit/ime_env.cpp
+                ggml-cpu/spacemit/ime_env.h
                 ggml-cpu/spacemit/ime1_kernels.cpp
+                ggml-cpu/spacemit/ime2_kernels.cpp
                 ggml-cpu/spacemit/ime_kernels.h
+                ggml-cpu/spacemit/rvv_kernels.cpp
+                ggml-cpu/spacemit/rvv_kernels.h
             )
         endif()
         if(NOT GGML_CPU_ALL_VARIANTS)
@@ -484,6 +505,16 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             endif()
             if (GGML_RV_ZIHINTPAUSE)
                 string(APPEND MARCH_STR "_zihintpause")
+            endif()
+            if (GGML_RV_ZBA)
+                string(APPEND MARCH_STR "_zba")
+            endif()
+            if (GGML_CPU_RISCV64_SPACEMIT)
+                # `xsmtvdotii' is only required for GCC >= 15.
+                if (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND
+                    CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
+                    string(APPEND MARCH_STR "_xsmtvdotii")
+                endif()
             endif()
 
             list(APPEND ARCH_FLAGS "-march=${MARCH_STR}" -mabi=lp64d)
@@ -571,13 +602,13 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
         # Fetch KleidiAI sources:
         include(FetchContent)
-        set(KLEIDIAI_COMMIT_TAG "v1.22.0")
-        set(KLEIDIAI_DOWNLOAD_URL "https://github.com/ARM-software/kleidiai/archive/refs/tags/${KLEIDIAI_COMMIT_TAG}.tar.gz")
-        set(KLEIDIAI_ARCHIVE_MD5  "54049037570ab0ee0a0d126b2ba5ece1")
+        set(KLEIDIAI_COMMIT_TAG "v1.24.0")
+        set(KLEIDIAI_DOWNLOAD_URL "https://github.com/ARM-software/kleidiai/releases/download/${KLEIDIAI_COMMIT_TAG}/kleidiai-${KLEIDIAI_COMMIT_TAG}-src.tar.gz")
+        set(KLEIDIAI_RELEASE_ARCHIVE_MD5  "2f02ebe29573d45813e671eb304f2a00")
 
         set(KLEIDIAI_FETCH_ARGS
             URL ${KLEIDIAI_DOWNLOAD_URL}
-            URL_HASH MD5=${KLEIDIAI_ARCHIVE_MD5}
+            URL_HASH MD5=${KLEIDIAI_RELEASE_ARCHIVE_MD5}
         )
         if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
             list(APPEND KLEIDIAI_FETCH_ARGS DOWNLOAD_EXTRACT_TIMESTAMP NEW)

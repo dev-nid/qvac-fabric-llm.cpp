@@ -1,6 +1,7 @@
 #include "llama-model.h"
 
 #include "llama-arch.h"
+#include "llama-ext.h"   // qvac: declarations for the ext-API helpers (n_expert/n_devices/get_device, etc.)
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
@@ -667,6 +668,247 @@ struct llama_model::impl {
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+}
+
+// qvac: real polymorphic implementations for llama_model_base and the
+// llama_model_create factory, ported from upstream commit 994118a18
+// ("model: move load_hparams and load_tensors to per-model definition").
+// Each per-architecture subclass lives under src/models/<arch>.cpp and
+// implements load_arch_hparams / load_arch_tensors / build_arch_graph; the
+// base-class methods below do the architecture-independent work and dispatch
+// virtually into those overrides.
+
+llama_model_base::llama_model_base(const struct llama_model_params & params)
+    : llama_model(params), model(this), tn(model->arch),
+      TENSOR_DUPLICATED     (llama_model_loader::TENSOR_DUPLICATED),
+      TENSOR_NOT_REQUIRED   (llama_model_loader::TENSOR_NOT_REQUIRED),
+      TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
+      TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL) {}
+
+ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    GGML_ASSERT(ml != nullptr);
+    return create_tensor(*ml, tn, ne, flags);
+}
+
+void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
+    layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
+    if (layer.ffn_gate_up_exps == nullptr) {
+        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
+    }
+}
+
+void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
+        int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
+        int flags) {
+    const int64_t n_embd_qkv = n_embd_q_ + n_embd_k_ + n_embd_v_;
+    layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+    if (layer.wqkv) {
+        layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+    } else {
+        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", bid), {n_embd_, n_embd_q_}, flags);
+        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", bid), {n_embd_, n_embd_k_}, flags);
+        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", bid), {n_embd_, n_embd_v_}, flags);
+        layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED);
+        layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
+        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
+    }
+}
+
+ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    // qvac: the qvac fork extended ml.create_tensor with two extra args
+    // (split_idx + get_ctx_for_split_buft) used by the incremental sharded
+    // loader. The polymorphic per-arch loaders go through this simple path,
+    // which does not yet participate in incremental loading.
+    return ml.create_tensor(
+        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+        tn, ne, flags, /*split_idx=*/ std::nullopt, /*get_ctx_for_split_buft=*/ nullptr);
+}
+
+void llama_model_base::load_stats(llama_model_loader & ml) {
+    llama_model::load_stats(ml);
+}
+
+void llama_model_base::load_hparams(llama_model_loader & ml) {
+    // delegate to the qvac monolithic impl, which performs the generic kv
+    // reading and (for archs that still use the legacy switch) the per-arch
+    // hparams parsing. Subclasses additionally override load_arch_hparams to
+    // augment this with arch-specific reads.
+    llama_model::load_hparams(ml);
+    load_arch_hparams(ml);
+}
+
+void llama_model_base::load_vocab(llama_model_loader & ml) {
+    llama_model::load_vocab(ml);
+}
+
+bool llama_model_base::load_tensors(llama_model_loader & ml) {
+    return llama_model::load_tensors(ml);
+}
+
+// qvac: factory mapping arch enum → concrete subclass. Mirrors upstream
+// llama_model_mapping. Architectures without a polymorphic subclass yet fall
+// through to nullptr; llama_model_create reports a clear error in that case.
+static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
+    switch (arch) {
+        case LLM_ARCH_LLAMA:           return new llama_model_llama(params);
+        case LLM_ARCH_LLAMA4:          return new llama_model_llama4(params);
+        case LLM_ARCH_LLAMA_EMBED:     return new llama_model_llama_embed(params);
+        case LLM_ARCH_MAINCODER:       return new llama_model_maincoder(params);
+        case LLM_ARCH_DECI:            return new llama_model_deci(params);
+        case LLM_ARCH_BAICHUAN:        return new llama_model_baichuan(params);
+        case LLM_ARCH_FALCON:          return new llama_model_falcon(params);
+        case LLM_ARCH_GROK:            return new llama_model_grok(params);
+        case LLM_ARCH_STARCODER:       return new llama_model_starcoder(params);
+        case LLM_ARCH_REFACT:          return new llama_model_refact(params);
+        case LLM_ARCH_BERT:            return new llama_model_bert(params);
+        case LLM_ARCH_JINA_BERT_V2:    return new llama_model_jina_bert_v2(params);
+        case LLM_ARCH_JINA_BERT_V3:    return new llama_model_jina_bert_v3(params);
+        case LLM_ARCH_NOMIC_BERT:      return new llama_model_nomic_bert(params);
+        case LLM_ARCH_NOMIC_BERT_MOE:  return new llama_model_nomic_bert_moe(params);
+        case LLM_ARCH_MODERN_BERT:     return new llama_model_modern_bert(params);
+        case LLM_ARCH_NEO_BERT:        return new llama_model_neo_bert(params);
+        case LLM_ARCH_EUROBERT:        return new llama_model_eurobert(params);
+        case LLM_ARCH_BLOOM:           return new llama_model_bloom(params);
+        case LLM_ARCH_MPT:             return new llama_model_mpt(params);
+        case LLM_ARCH_STABLELM:        return new llama_model_stablelm(params);
+        case LLM_ARCH_QWEN:            return new llama_model_qwen(params);
+        case LLM_ARCH_QWEN2:           return new llama_model_qwen2(params);
+        case LLM_ARCH_DREAM:           return new llama_model_dream(params);
+        case LLM_ARCH_LLADA:           return new llama_model_llada(params);
+        case LLM_ARCH_LLADA_MOE:       return new llama_model_llada_moe(params);
+        case LLM_ARCH_RND1:            return new llama_model_rnd1(params);
+        case LLM_ARCH_QWEN2VL:         return new llama_model_qwen2vl(params);
+        case LLM_ARCH_QWEN2MOE:        return new llama_model_qwen2moe(params);
+        case LLM_ARCH_QWEN3:           return new llama_model_qwen3(params);
+        case LLM_ARCH_QWEN3MOE:        return new llama_model_qwen3moe(params);
+        case LLM_ARCH_QWEN3VL:         return new llama_model_qwen3vl(params);
+        case LLM_ARCH_QWEN3VLMOE:      return new llama_model_qwen3vlmoe(params);
+        case LLM_ARCH_PHI2:            return new llama_model_phi2(params);
+        case LLM_ARCH_PHI3:            return new llama_model_phi3(params);
+        case LLM_ARCH_PHIMOE:          return new llama_model_phimoe(params);
+        case LLM_ARCH_PLAMO:           return new llama_model_plamo(params);
+        case LLM_ARCH_PLAMO2:          return new llama_model_plamo2(params);
+        case LLM_ARCH_PLAMO3:          return new llama_model_plamo3(params);
+        case LLM_ARCH_GPT2:            return new llama_model_gpt2(params);
+        case LLM_ARCH_CODESHELL:       return new llama_model_codeshell(params);
+        case LLM_ARCH_ORION:           return new llama_model_orion(params);
+        case LLM_ARCH_INTERNLM2:       return new llama_model_internlm2(params);
+        case LLM_ARCH_MINICPM3:        return new llama_model_minicpm3(params);
+        case LLM_ARCH_GEMMA:           return new llama_model_gemma(params);
+        case LLM_ARCH_GEMMA2:          return new llama_model_gemma2(params);
+        case LLM_ARCH_GEMMA3:          return new llama_model_gemma3(params);
+        case LLM_ARCH_GEMMA3N:         return new llama_model_gemma3n(params);
+        case LLM_ARCH_GEMMA4:          return new llama_model_gemma4(params);
+        case LLM_ARCH_GEMMA_EMBEDDING: return new llama_model_gemma_embedding(params);
+        case LLM_ARCH_STARCODER2:      return new llama_model_starcoder2(params);
+        case LLM_ARCH_MAMBA:           return new llama_model_mamba(params);
+        case LLM_ARCH_MAMBA2:          return new llama_model_mamba2(params);
+        case LLM_ARCH_JAMBA:           return new llama_model_jamba(params);
+        case LLM_ARCH_XVERSE:          return new llama_model_xverse(params);
+        case LLM_ARCH_COMMAND_R:       return new llama_model_command_r(params);
+        case LLM_ARCH_COHERE2:         return new llama_model_cohere2(params);
+        case LLM_ARCH_DBRX:            return new llama_model_dbrx(params);
+        case LLM_ARCH_OLMO:            return new llama_model_olmo(params);
+        case LLM_ARCH_OLMO2:           return new llama_model_olmo2(params);
+        case LLM_ARCH_OLMOE:           return new llama_model_olmoe(params);
+        case LLM_ARCH_OPENELM:         return new llama_model_openelm(params);
+        case LLM_ARCH_GPTNEOX:         return new llama_model_gptneox(params);
+        case LLM_ARCH_ARCTIC:          return new llama_model_arctic(params);
+        case LLM_ARCH_DEEPSEEK:        return new llama_model_deepseek(params);
+        case LLM_ARCH_DEEPSEEK2:       return new llama_model_deepseek2(params);
+        case LLM_ARCH_CHATGLM:         return new llama_model_chatglm(params);
+        case LLM_ARCH_GLM4:            return new llama_model_glm4(params);
+        case LLM_ARCH_GLM4_MOE:        return new llama_model_glm4_moe(params);
+        case LLM_ARCH_BITNET:          return new llama_model_bitnet(params);
+        case LLM_ARCH_T5:              return new llama_model_t5(params);
+        case LLM_ARCH_T5ENCODER:       return new llama_model_t5encoder(params);
+        case LLM_ARCH_JAIS:            return new llama_model_jais(params);
+        case LLM_ARCH_JAIS2:           return new llama_model_jais2(params);
+        case LLM_ARCH_NEMOTRON:        return new llama_model_nemotron(params);
+        case LLM_ARCH_NEMOTRON_H:      return new llama_model_nemotron_h(params);
+        case LLM_ARCH_EXAONE:          return new llama_model_exaone(params);
+        case LLM_ARCH_EXAONE4:         return new llama_model_exaone4(params);
+        case LLM_ARCH_EXAONE_MOE:      return new llama_model_exaone_moe(params);
+        // qvac: these per-arch polymorphic subclasses (src/models/*.cpp) were
+        // ported during the b9341 rebase but never wired into this factory, so
+        // llama_model_create() returned nullptr → "failed to create model for
+        // arch '<x>'" and every one of these model families failed to load
+        // (e.g. PaddleOCR-VL, Qwen3.5, Granite, Mistral3/4, SmolLM3, ...).
+        // Register them so the factory dispatches to the already-implemented
+        // subclass. (CLIP and GPTJ intentionally have no subclass.)
+        case LLM_ARCH_QWEN3NEXT:          return new llama_model_qwen3next(params);
+        case LLM_ARCH_QWEN35:             return new llama_model_qwen35(params);
+        case LLM_ARCH_QWEN35MOE:          return new llama_model_qwen35moe(params);
+        case LLM_ARCH_MINICPM:            return new llama_model_minicpm(params);
+        case LLM_ARCH_FALCON_H1:          return new llama_model_falcon_h1(params);
+        case LLM_ARCH_DEEPSEEK2OCR:       return new llama_model_deepseek2ocr(params);
+        case LLM_ARCH_GLM_DSA:            return new llama_model_glm_dsa(params);
+        case LLM_ARCH_NEMOTRON_H_MOE:     return new llama_model_nemotron_h_moe(params);
+        case LLM_ARCH_GRANITE:            return new llama_model_granite(params);
+        case LLM_ARCH_GRANITE_MOE:        return new llama_model_granite_moe(params);
+        case LLM_ARCH_GRANITE_HYBRID:     return new llama_model_granite_hybrid(params);
+        case LLM_ARCH_CHAMELEON:          return new llama_model_chameleon(params);
+        case LLM_ARCH_WAVTOKENIZER_DEC:   return new llama_model_wavtokenizer_dec(params);
+        case LLM_ARCH_PLM:                return new llama_model_plm(params);
+        case LLM_ARCH_BAILINGMOE:         return new llama_model_bailingmoe(params);
+        case LLM_ARCH_BAILINGMOE2:        return new llama_model_bailingmoe2(params);
+        case LLM_ARCH_DOTS1:              return new llama_model_dots1(params);
+        case LLM_ARCH_ARCEE:              return new llama_model_arcee(params);
+        case LLM_ARCH_AFMOE:              return new llama_model_afmoe(params);
+        case LLM_ARCH_ERNIE4_5:           return new llama_model_ernie4_5(params);
+        case LLM_ARCH_ERNIE4_5_MOE:       return new llama_model_ernie4_5_moe(params);
+        case LLM_ARCH_HUNYUAN_MOE:        return new llama_model_hunyuan_moe(params);
+        case LLM_ARCH_HUNYUAN_DENSE:      return new llama_model_hunyuan_dense(params);
+        case LLM_ARCH_HUNYUAN_VL:         return new llama_model_hunyuan_vl(params);
+        case LLM_ARCH_SMOLLM3:            return new llama_model_smollm3(params);
+        case LLM_ARCH_OPENAI_MOE:         return new llama_model_openai_moe(params);
+        case LLM_ARCH_LFM2:               return new llama_model_lfm2(params);
+        case LLM_ARCH_LFM2MOE:            return new llama_model_lfm2moe(params);
+        case LLM_ARCH_SMALLTHINKER:       return new llama_model_smallthinker(params);
+        case LLM_ARCH_SEED_OSS:           return new llama_model_seed_oss(params);
+        case LLM_ARCH_GROVEMOE:           return new llama_model_grovemoe(params);
+        case LLM_ARCH_APERTUS:            return new llama_model_apertus(params);
+        case LLM_ARCH_MINIMAX_M2:         return new llama_model_minimax_m2(params);
+        case LLM_ARCH_COGVLM:             return new llama_model_cogvlm(params);
+        case LLM_ARCH_PANGU_EMBED:        return new llama_model_pangu_embed(params);
+        case LLM_ARCH_MISTRAL3:           return new llama_model_mistral3(params);
+        case LLM_ARCH_MISTRAL4:           return new llama_model_mistral4(params);
+        case LLM_ARCH_PADDLEOCR:          return new llama_model_paddleocr(params);
+        case LLM_ARCH_MIMO2:              return new llama_model_mimo2(params);
+        case LLM_ARCH_STEP35:             return new llama_model_step35(params);
+        case LLM_ARCH_KIMI_LINEAR:        return new llama_model_kimi_linear(params);
+        case LLM_ARCH_TALKIE:             return new llama_model_talkie(params);
+        case LLM_ARCH_RWKV6:           return new llama_model_rwkv6(params);
+        case LLM_ARCH_RWKV6QWEN2:      return new llama_model_rwkv6qwen2(params);
+        case LLM_ARCH_RWKV7:           return new llama_model_rwkv7(params);
+        case LLM_ARCH_ARWKV7:          return new llama_model_arwkv7(params);
+        default:                       return nullptr;
+    }
+}
+
+llama_model * llama_model_create(llm_arch arch, const llama_model_params & params) {
+    llama_model * model = llama_model_mapping(arch, params);
+
+    if (model != nullptr) {
+        model->arch = arch;
+        auto & devices = model->devices;
+        if (!devices.empty() && devices[0].is_meta && !llm_arch_supports_sm_tensor(arch)) {
+            throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
+        }
+    }
+
+    return model;
+}
+
+llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params) {
+    llm_arch arch = ml.get_arch();
+    if (arch == LLM_ARCH_UNKNOWN) {
+        throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
+    }
+
+    return llama_model_create(arch, params);
 }
 
 llama_model::~llama_model() {
@@ -2605,6 +2847,24 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     case 2048: type = LLM_TYPE_1_8B; break;
                     case 3072: type = LLM_TYPE_4B; break;
                     case 4096: type = LLM_TYPE_7B; break;
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_HUNYUAN_VL:
+            {
+                // All HUNYUAN_VL hparams (norm eps, M-RoPE sections, XDRoPE
+                // scaling, n_embd → type) are loaded by
+                // llama_model_hunyuan_vl::load_arch_hparams in
+                // src/models/hunyuan-vl.cpp. An empty case here is just to
+                // keep llama_model::load_hparams' default-throw from firing.
+            } break;
+        case LLM_ARCH_TALKIE:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_LOGIT_SCALE,                 hparams.f_logit_scale);
+
+                switch (hparams.n_layer) {
+                    case 40: type = LLM_TYPE_13B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
@@ -7004,6 +7264,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     }
                 } break;
             case LLM_ARCH_HUNYUAN_DENSE:
+            case LLM_ARCH_HUNYUAN_VL:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -7032,6 +7293,27 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
 
+                    }
+                } break;
+            case LLM_ARCH_TALKIE:
+                {
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+                    output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), {n_embd, n_vocab}, 0);
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_gqa, n_embd_gqa, 0);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+                        // talkie has no k gain norm; only attn_q_norm
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {1, n_head}, 0);
+
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+
+                        layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), {1}, 0);
                     }
                 } break;
             case LLM_ARCH_SMOLLM3:
@@ -8567,6 +8849,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.offload_kqv,
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
+                            /* n_rs_seq = */ 0,  // qvac: upstream b9341 added this for MTP recurrent state sequences
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch)) {
                     // The main difference between hybrid architectures is the
@@ -8600,6 +8883,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_type_s  */ GGML_TYPE_F32,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
+                            /* n_rs_seq          */ 0,  // qvac: upstream b9341 added for MTP recurrent state
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -8618,6 +8902,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_type_v  */ GGML_TYPE_F32,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
+                            /* n_rs_seq          */ 0,  // qvac: upstream b9341 added for MTP recurrent state
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -8679,506 +8964,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 }
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
-    std::unique_ptr<llm_graph_context> llm;
+    // qvac: dispatch via the polymorphic build_arch_graph defined per arch in
+    // src/models/<arch>.cpp. The post-processing (pooling/sampling/dense-out)
+    // is independent of the arch and stays here.
+    std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
-    switch (arch) {
-        case LLM_ARCH_LLAMA:
-            {
-                llm = std::make_unique<llm_build_llama<false>>(*this, params);
-            } break;
-        case LLM_ARCH_LLAMA4:
-            {
-                if (hparams.swa_type == LLAMA_SWA_TYPE_NONE) {
-                    llm = std::make_unique<llm_build_llama4<false>>(*this, params);
-                } else {
-                    llm = std::make_unique<llm_build_llama4<true>>(*this, params);
-                }
-            } break;
-        case LLM_ARCH_LLAMA_EMBED:
-            {
-                llm = std::make_unique<llm_build_llama<true>>(*this, params);
-            } break;
-        case LLM_ARCH_MAINCODER:
-            {
-                llm = std::make_unique<llm_build_maincoder>(*this, params);
-            } break;
-        case LLM_ARCH_DECI:
-            {
-                llm = std::make_unique<llm_build_deci>(*this, params);
-            } break;
-        case LLM_ARCH_BAICHUAN:
-            {
-                llm = std::make_unique<llm_build_baichuan>(*this, params);
-            } break;
-        case LLM_ARCH_FALCON:
-            {
-                llm = std::make_unique<llm_build_falcon>(*this, params);
-            } break;
-        case LLM_ARCH_GROK:
-            {
-                llm = std::make_unique<llm_build_grok>(*this, params);
-            } break;
-        case LLM_ARCH_STARCODER:
-            {
-                llm = std::make_unique<llm_build_starcoder>(*this, params);
-            } break;
-        case LLM_ARCH_REFACT:
-            {
-                llm = std::make_unique<llm_build_refact>(*this, params);
-            } break;
-        case LLM_ARCH_BERT:
-        case LLM_ARCH_JINA_BERT_V2:
-        case LLM_ARCH_JINA_BERT_V3:
-        case LLM_ARCH_NOMIC_BERT:
-        case LLM_ARCH_NOMIC_BERT_MOE:
-            {
-                llm = std::make_unique<llm_build_bert>(*this, params);
-            } break;
-        case LLM_ARCH_MODERN_BERT:
-            {
-                llm = std::make_unique<llm_build_modern_bert>(*this, params);
-            } break;
-        case LLM_ARCH_NEO_BERT:
-            {
-                llm = std::make_unique<llm_build_neo_bert>(*this, params);
-            } break;
-        case LLM_ARCH_EUROBERT:
-            {
-                llm = std::make_unique<llm_build_eurobert>(*this, params);
-            } break;
-        case LLM_ARCH_BLOOM:
-            {
-                llm = std::make_unique<llm_build_bloom>(*this, params);
-            } break;
-        case LLM_ARCH_MPT:
-            {
-                llm = std::make_unique<llm_build_mpt>(*this, params);
-            } break;
-        case LLM_ARCH_STABLELM:
-            {
-                llm = std::make_unique<llm_build_stablelm>(*this, params);
-            } break;
-        case LLM_ARCH_QWEN:
-            {
-                llm = std::make_unique<llm_build_qwen>(*this, params);
-            } break;
-        case LLM_ARCH_QWEN2:
-            {
-                llm = std::make_unique<llm_build_qwen2>(*this, params);
-            } break;
-        case LLM_ARCH_DREAM:
-            {
-                llm = std::make_unique<llm_build_dream>(*this, params);
-            } break;
-        case LLM_ARCH_LLADA:
-            {
-                llm = std::make_unique<llm_build_llada>(*this, params);
-            } break;
-        case LLM_ARCH_LLADA_MOE:
-            {
-                llm = std::make_unique<llm_build_llada_moe>(*this, params);
-            } break;
-        case LLM_ARCH_RND1:
-            {
-                llm = std::make_unique<llm_build_rnd1>(*this, params);
-            } break;
-        case LLM_ARCH_QWEN2VL:
-            {
-                llm = std::make_unique<llm_build_qwen2vl>(*this, params);
-            } break;
-        case LLM_ARCH_QWEN2MOE:
-            {
-                llm = std::make_unique<llm_build_qwen2moe>(*this, params);
-            } break;
-        case LLM_ARCH_QWEN3:
-            {
-                llm = std::make_unique<llm_build_qwen3>(*this, params);
-            } break;
-        case LLM_ARCH_QWEN3MOE:
-            {
-                llm = std::make_unique<llm_build_qwen3moe>(*this, params);
-            } break;
-        case LLM_ARCH_QWEN3VL:
-            {
-                llm = std::make_unique<llm_build_qwen3vl>(*this, params);
-            } break;
-        case LLM_ARCH_QWEN3VLMOE:
-            {
-                llm = std::make_unique<llm_build_qwen3vlmoe>(*this, params);
-            } break;
-        case LLM_ARCH_PHI2:
-            {
-                llm = std::make_unique<llm_build_phi2>(*this, params);
-            } break;
-        case LLM_ARCH_PHI3:
-        case LLM_ARCH_PHIMOE:
-            {
-                if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-                    llm = std::make_unique<llm_build_phi3<true>> (*this, params);
-                } else {
-                    llm = std::make_unique<llm_build_phi3<false>>(*this, params);
-                }
-            } break;
-        case LLM_ARCH_PLAMO:
-            {
-                llm = std::make_unique<llm_build_plamo>(*this, params);
-            } break;
-        case LLM_ARCH_PLAMO2:
-            {
-                llm = std::make_unique<llm_build_plamo2>(*this, params);
-            } break;
-        case LLM_ARCH_PLAMO3:
-            {
-                if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-                    llm = std::make_unique<llm_build_plamo3<true>> (*this, params);
-                } else {
-                    llm = std::make_unique<llm_build_plamo3<false>>(*this, params);
-                }
-            } break;
-        case LLM_ARCH_GPT2:
-            {
-                llm = std::make_unique<llm_build_gpt2>(*this, params);
-            } break;
-        case LLM_ARCH_CODESHELL:
-            {
-                llm = std::make_unique<llm_build_codeshell>(*this, params);
-            } break;
-        case LLM_ARCH_ORION:
-            {
-                llm = std::make_unique<llm_build_orion>(*this, params);
-            } break;
-        case LLM_ARCH_INTERNLM2:
-            {
-                llm = std::make_unique<llm_build_internlm2>(*this, params);
-            } break;
-        case LLM_ARCH_MINICPM3:
-            {
-                llm = std::make_unique<llm_build_minicpm3>(*this, params);
-            } break;
-        case LLM_ARCH_GEMMA:
-            {
-                llm = std::make_unique<llm_build_gemma>(*this, params);
-            } break;
-        case LLM_ARCH_GEMMA2:
-            {
-                llm = std::make_unique<llm_build_gemma2_iswa>(*this, params);
-            } break;
-        case LLM_ARCH_GEMMA3:
-            {
-                if (hparams.swa_type == LLAMA_SWA_TYPE_STANDARD) {
-                    llm = std::make_unique<llm_build_gemma3<true>>(*this, params);
-                } else {
-                    llm = std::make_unique<llm_build_gemma3<false>>(*this, params);
-                }
-            } break;
-        case LLM_ARCH_GEMMA3N:
-            {
-                llm = std::make_unique<llm_build_gemma3n_iswa>(*this, params);
-            } break;
-        case LLM_ARCH_GEMMA4:
-            {
-                llm = std::make_unique<llm_build_gemma4_iswa>(*this, params);
-            } break;
-        case LLM_ARCH_GEMMA_EMBEDDING:
-            {
-                llm = std::make_unique<llm_build_gemma_embedding>(*this, params);
-            } break;
-        case LLM_ARCH_STARCODER2:
-            {
-                llm = std::make_unique<llm_build_starcoder2>(*this, params);
-            } break;
-        case LLM_ARCH_MAMBA:
-        case LLM_ARCH_MAMBA2:
-            {
-                llm = std::make_unique<llm_build_mamba>(*this, params);
-            } break;
-        case LLM_ARCH_JAMBA:
-            {
-                llm = std::make_unique<llm_build_jamba>(*this, params);
-            } break;
-        case LLM_ARCH_XVERSE:
-            {
-                llm = std::make_unique<llm_build_xverse>(*this, params);
-            } break;
-        case LLM_ARCH_COMMAND_R:
-            {
-                llm = std::make_unique<llm_build_command_r>(*this, params);
-            } break;
-        case LLM_ARCH_COHERE2:
-            {
-                llm = std::make_unique<llm_build_cohere2_iswa>(*this, params);
-            } break;
-        case LLM_ARCH_DBRX:
-            {
-                llm = std::make_unique<llm_build_dbrx>(*this, params);
-            } break;
-        case LLM_ARCH_OLMO:
-            {
-                llm = std::make_unique<llm_build_olmo>(*this, params);
-            } break;
-        case LLM_ARCH_OLMO2:
-            {
-                if (hparams.swa_type == LLAMA_SWA_TYPE_STANDARD) {
-                    llm = std::make_unique<llm_build_olmo2<true>>(*this, params);
-                } else {
-                    llm = std::make_unique<llm_build_olmo2<false>>(*this, params);
-                }
-            } break;
-        case LLM_ARCH_OLMOE:
-            {
-                llm = std::make_unique<llm_build_olmoe>(*this, params);
-            } break;
-        case LLM_ARCH_OPENELM:
-            {
-                llm = std::make_unique<llm_build_openelm>(*this, params);
-            } break;
-        case LLM_ARCH_GPTNEOX:
-            {
-                llm = std::make_unique<llm_build_gptneox>(*this, params);
-            } break;
-        case LLM_ARCH_ARCTIC:
-            {
-                llm = std::make_unique<llm_build_arctic>(*this, params);
-            } break;
-        case LLM_ARCH_DEEPSEEK:
-            {
-                llm = std::make_unique<llm_build_deepseek>(*this, params);
-            } break;
-        case LLM_ARCH_DEEPSEEK2:
-        case LLM_ARCH_DEEPSEEK2OCR:
-        case LLM_ARCH_GLM_DSA:
-        case LLM_ARCH_MISTRAL4:
-            {
-                llm = std::make_unique<llm_build_deepseek2>(*this, params);
-            } break;
-        case LLM_ARCH_CHATGLM:
-            {
-                llm = std::make_unique<llm_build_chatglm>(*this, params);
-            } break;
-        case LLM_ARCH_GLM4:
-            {
-                llm = std::make_unique<llm_build_glm4>(*this, params);
-            } break;
-        case LLM_ARCH_GLM4_MOE:
-            {
-                llm = std::make_unique<llm_build_glm4_moe>(*this, params);
-            } break;
-        case LLM_ARCH_BITNET:
-            {
-                llm = std::make_unique<llm_build_bitnet>(*this, params);
-            } break;
-        case LLM_ARCH_T5:
-            {
-                switch (params.gtype) {
-                    case LLM_GRAPH_TYPE_ENCODER:
-                        llm = std::make_unique<llm_build_t5<true>>(*this, params);
-                        break;
-                    case LLM_GRAPH_TYPE_DEFAULT:
-                    case LLM_GRAPH_TYPE_DECODER:
-                        llm = std::make_unique<llm_build_t5<false>>(*this, params);
-                        break;
-                    default:
-                        GGML_ABORT("invalid graph type");
-                };
-            } break;
-        case LLM_ARCH_T5ENCODER:
-            {
-                llm = std::make_unique<llm_build_t5encoder>(*this, params);
-            } break;
-        case LLM_ARCH_JAIS:
-            {
-                llm = std::make_unique<llm_build_jais>(*this, params);
-            } break;
-        case LLM_ARCH_JAIS2:
-            {
-                llm = std::make_unique<llm_build_jais2>(*this, params);
-            } break;
-        case LLM_ARCH_NEMOTRON:
-            {
-                llm = std::make_unique<llm_build_nemotron>(*this, params);
-            } break;
-        case LLM_ARCH_NEMOTRON_H:
-        case LLM_ARCH_NEMOTRON_H_MOE:
-            {
-                llm = std::make_unique<llm_build_nemotron_h>(*this, params);
-            } break;
-        case LLM_ARCH_EXAONE:
-            {
-                llm = std::make_unique<llm_build_exaone>(*this, params);
-            } break;
-        case LLM_ARCH_EXAONE4:
-            {
-                if (hparams.swa_type == LLAMA_SWA_TYPE_STANDARD) {
-                    llm = std::make_unique<llm_build_exaone4<true>>(*this, params);
-                } else {
-                    llm = std::make_unique<llm_build_exaone4<false>>(*this, params);
-                }
-            } break;
-        case LLM_ARCH_EXAONE_MOE:
-            {
-                llm = std::make_unique<llm_build_exaone_moe>(*this, params);
-            } break;
-        case LLM_ARCH_RWKV6:
-            {
-                llm = std::make_unique<llm_build_rwkv6>(*this, params);
-            } break;
-        case LLM_ARCH_RWKV6QWEN2:
-            {
-                llm = std::make_unique<llm_build_rwkv6qwen2>(*this, params);
-            } break;
-        case LLM_ARCH_RWKV7:
-            {
-                llm = std::make_unique<llm_build_rwkv7>(*this, params);
-            } break;
-        case LLM_ARCH_ARWKV7:
-            {
-                llm = std::make_unique<llm_build_arwkv7>(*this, params);
-            } break;
-        case LLM_ARCH_GRANITE:
-        case LLM_ARCH_GRANITE_MOE:
-        case LLM_ARCH_MINICPM:
-            {
-                llm = std::make_unique<llm_build_granite>(*this, params);
-            } break;
-        case LLM_ARCH_GRANITE_HYBRID:
-            {
-                llm = std::make_unique<llm_build_granite_hybrid>(*this, params);
-            } break;
-        case LLM_ARCH_CHAMELEON:
-            {
-                llm = std::make_unique<llm_build_chameleon>(*this, params);
-            } break;
-        case LLM_ARCH_WAVTOKENIZER_DEC:
-            {
-                llm = std::make_unique<llm_build_wavtokenizer_dec>(*this, params);
-            } break;
-        case LLM_ARCH_PLM:
-            {
-                llm = std::make_unique<llm_build_plm>(*this, params);
-            } break;
-        case LLM_ARCH_BAILINGMOE:
-            {
-                llm = std::make_unique<llm_build_bailingmoe>(*this, params);
-            } break;
-        case LLM_ARCH_BAILINGMOE2:
-            {
-                llm = std::make_unique<llm_build_bailingmoe2>(*this, params);
-            } break;
-        case LLM_ARCH_SEED_OSS:
-            {
-                llm = std::make_unique<llm_build_seed_oss>(*this, params);
-            } break;
-        case LLM_ARCH_DOTS1:
-            {
-                llm = std::make_unique<llm_build_dots1>(*this, params);
-            } break;
-        case LLM_ARCH_ARCEE:
-            {
-                llm = std::make_unique<llm_build_arcee>(*this, params);
-            } break;
-        case LLM_ARCH_AFMOE:
-            {
-                llm = std::make_unique<llm_build_afmoe>(*this, params);
-            } break;
-        case LLM_ARCH_ERNIE4_5:
-            {
-                llm = std::make_unique<llm_build_ernie4_5>(*this, params);
-            } break;
-        case LLM_ARCH_ERNIE4_5_MOE:
-            {
-                llm = std::make_unique<llm_build_ernie4_5_moe>(*this, params);
-            } break;
-        case LLM_ARCH_PADDLEOCR:
-            {
-                llm = std::make_unique<llm_build_paddleocr>(*this, params);
-            } break;
-        case LLM_ARCH_HUNYUAN_MOE:
-            {
-                llm = std::make_unique<llm_build_hunyuan_moe>(*this, params);
-            } break;
-        case LLM_ARCH_HUNYUAN_DENSE:
-            {
-                llm = std::make_unique<llm_build_hunyuan_dense>(*this, params);
-            } break;
-        case LLM_ARCH_SMOLLM3:
-            {
-                llm = std::make_unique<llm_build_smollm3>(*this, params);
-            } break;
-        case LLM_ARCH_OPENAI_MOE:
-            {
-                llm = std::make_unique<llm_build_openai_moe_iswa>(*this, params);
-            } break;
-        case LLM_ARCH_FALCON_H1:
-            {
-                llm = std::make_unique<llm_build_falcon_h1>(*this, params);
-            } break;
-        case LLM_ARCH_LFM2:
-        case LLM_ARCH_LFM2MOE:
-            {
-                if (hparams.swa_type == LLAMA_SWA_TYPE_STANDARD) {
-                    llm = std::make_unique<llm_build_lfm2<true>>(*this, params);
-                } else {
-                    llm = std::make_unique<llm_build_lfm2<false>>(*this, params);
-                }
-            } break;
-        case LLM_ARCH_SMALLTHINKER:
-            {
-                if (hparams.swa_type == LLAMA_SWA_TYPE_STANDARD) {
-                    llm = std::make_unique<llm_build_smallthinker<true>> (*this, params);
-                } else {
-                    llm = std::make_unique<llm_build_smallthinker<false>>(*this, params);
-                }
-            } break;
-        case LLM_ARCH_GROVEMOE:
-            {
-                llm = std::make_unique<llm_build_grovemoe>(*this, params);
-            } break;
-        case LLM_ARCH_APERTUS:
-            {
-                llm = std::make_unique<llm_build_apertus>(*this, params);
-            } break;
-        case LLM_ARCH_MINIMAX_M2:
-            {
-                llm = std::make_unique<llm_build_minimax_m2>(*this, params);
-            } break;
-        case LLM_ARCH_COGVLM:
-            {
-                llm = std::make_unique<llm_build_cogvlm>(*this, params);
-            } break;
-        case LLM_ARCH_PANGU_EMBED:
-            {
-                llm = std::make_unique<llm_build_pangu_embedded>(*this, params);
-            } break;
-        case LLM_ARCH_QWEN3NEXT:
-            {
-                llm = std::make_unique<llm_build_qwen3next>(*this, params);
-            } break;
-        case LLM_ARCH_QWEN35:
-            {
-                llm = std::make_unique<llm_build_qwen35>(*this, params);
-            } break;
-        case LLM_ARCH_QWEN35MOE:
-            {
-                llm = std::make_unique<llm_build_qwen35moe>(*this, params);
-            } break;
-        case LLM_ARCH_MISTRAL3:
-            {
-                llm = std::make_unique<llm_build_mistral3>(*this, params);
-            } break;
-        case LLM_ARCH_MIMO2:
-            {
-                llm = std::make_unique<llm_build_mimo2_iswa>(*this, params);
-            } break;
-        case LLM_ARCH_KIMI_LINEAR:
-            {
-                llm = std::make_unique<llm_build_kimi_linear>(*this, params);
-            } break;
-        case LLM_ARCH_STEP35:
-            {
-                llm = std::make_unique<llm_build_step35_iswa>(*this, params);
-            } break;
-        default:
-            GGML_ABORT("fatal error");
+    if (!llm) {
+        GGML_ABORT("qvac: arch '%s' has no polymorphic build_arch_graph implementation (src/models/<arch>.cpp not migrated yet)",
+                   llm_arch_name(arch));
     }
 
     // add on pooling layer
@@ -9187,10 +8980,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // add backend sampling layers (if any)
     llm->build_sampling();
 
-    // if the gguf model was converted with --sentence-transformers-dense-modules
-    // there will be two additional dense projection layers
-    // dense linear projections are applied after pooling
-    // TODO: move reranking logic here and generalize
+    // dense projection layers (sentence-transformers --sentence-transformers-dense-modules)
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
     llm->res->set_outputs();
@@ -9269,6 +9059,22 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 
 int32_t llama_model_n_swa(const llama_model * model) {
     return model->hparams.n_swa;
+}
+
+// qvac: ext-API model introspection helpers declared in llama-ext.h but whose
+// implementations were lost in the rebase. Reading directly from the model's
+// hparams / devices vector.
+int32_t llama_model_n_expert(const struct llama_model * model) {
+    return static_cast<int32_t>(model->hparams.n_expert);
+}
+
+int32_t llama_model_n_devices(const struct llama_model * model) {
+    return static_cast<int32_t>(model->devices.size());
+}
+
+ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i) {
+    if (i < 0 || static_cast<size_t>(i) >= model->devices.size()) return nullptr;
+    return model->devices[static_cast<size_t>(i)].dev;
 }
 
 uint32_t llama_model_n_cls_out(const struct llama_model * model) {
@@ -9429,6 +9235,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_TALKIE:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
@@ -9443,6 +9250,9 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GLM4:
             return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_MROPE : LLAMA_ROPE_TYPE_NORM;
         case LLM_ARCH_GLM4_MOE:
+            return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_MROPE : LLAMA_ROPE_TYPE_NEOX;
+
+        case LLM_ARCH_HUNYUAN_VL:
             return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_MROPE : LLAMA_ROPE_TYPE_NEOX;
 
         // all model arches should be listed explicitly here

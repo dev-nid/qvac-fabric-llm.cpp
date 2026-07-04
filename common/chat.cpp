@@ -822,6 +822,137 @@ std::string common_chat_template_direct_apply(
     return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
 }
 
+// qvac: server-side helpers ported from upstream b9341 (their bodies were
+// dropped in the rebase). The previous stubs returned safe defaults; these are
+// the real implementations.
+
+// upstream b9341: common/chat.cpp
+common_chat_continuation common_chat_continuation_parse(const nlohmann::ordered_json & value) {
+    if (value.is_boolean() && value.get<bool>()) {
+        return COMMON_CHAT_CONTINUATION_AUTO;
+    }
+    if (value.is_string()) {
+        auto value_str = value.get<std::string>();
+        if (value_str == "reasoning_content") {
+            return COMMON_CHAT_CONTINUATION_REASONING;
+        }
+        if (value_str == "content") {
+            return COMMON_CHAT_CONTINUATION_CONTENT;
+        }
+    }
+    return COMMON_CHAT_CONTINUATION_NONE;
+}
+
+// upstream b9341: detects LFM2-family chat templates by their tool-list
+// delimiters. Used by the ASR preset selection just below.
+static bool is_lfm2_template(const std::string & src) {
+    return src.find("<|tool_list_start|>") != std::string::npos &&
+           src.find("<|tool_list_end|>")   != std::string::npos;
+}
+
+// upstream b9341: returns the system/user pair used to prime a model for
+// automatic speech recognition. Defaults to a generic "Transcribe audio to
+// text" prompt; LFM2-family templates use a custom system prompt instead.
+common_chat_prompt_preset common_chat_get_asr_prompt(const common_chat_templates * chat_templates) {
+    common_chat_prompt_preset asr_preset;
+    asr_preset.system = "";
+    asr_preset.user   = "Transcribe audio to text";
+
+    if (chat_templates && chat_templates->template_default && is_lfm2_template(chat_templates->template_default->source())) {
+        asr_preset.system = "Perform ASR.";
+        asr_preset.user   = "";
+    }
+    return asr_preset;
+}
+
+// upstream b9341: extracts just the "generation prefix" produced by applying a
+// chat template — i.e. the trailing assistant-prompt marker(s) the model is
+// supposed to see (for Qwen3 that's `<|im_start|>assistant\n<think>\n`, etc.).
+// We render the template twice (with and without add_generation_prompt) and
+// return the suffix that the second pass adds on top of the first.
+std::string common_chat_template_generation_prompt(
+    const common_chat_template & tmpl,
+    const autoparser::generation_params & inputs) {
+    autoparser::generation_params params = inputs;
+
+    params.add_generation_prompt  = false;
+    params.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+    std::string no_gen_prompt = common_chat_template_direct_apply(tmpl, params);
+
+    params.add_generation_prompt = true;
+    std::string gen_prompt = common_chat_template_direct_apply(tmpl, params);
+
+    size_t prefix_len = 0;
+    const size_t min_size = std::min(no_gen_prompt.size(), gen_prompt.size());
+    while (prefix_len < min_size && no_gen_prompt[prefix_len] == gen_prompt[prefix_len]) {
+        ++prefix_len;
+    }
+    return gen_prompt.substr(prefix_len);
+}
+
+std::string common_chat_msg::render_content(const std::string & delimiter) const {
+    if (!content.empty()) {
+        return content;
+    }
+    std::string out;
+    for (const auto & part : content_parts) {
+        if (!out.empty()) out += delimiter;
+        out += part.text;
+    }
+    return out;
+}
+
+// qvac: split a rendered prompt into role-tagged spans by scanning for the
+// provided per-role delimiter strings. The first delimiter that matches at a
+// given position opens a new span (closing the previous one). Used by
+// chat-diff-analyzer / test-chat to recover message boundaries from a fully
+// rendered template output.
+std::vector<common_chat_msg_span> common_chat_split_by_role(
+        const std::string & prompt,
+        const std::vector<common_chat_msg_delimiter> & delims) {
+    std::vector<common_chat_msg_span> spans;
+    if (delims.empty() || prompt.empty()) {
+        return spans;
+    }
+
+    std::size_t i = 0;
+    common_chat_msg_span cur;
+    cur.pos = 0;
+    bool open = false;
+
+    while (i < prompt.size()) {
+        const common_chat_msg_delimiter * hit = nullptr;
+        for (const auto & d : delims) {
+            if (d.delimiter.empty()) continue;
+            if (prompt.compare(i, d.delimiter.size(), d.delimiter) == 0) {
+                hit = &d;
+                break;
+            }
+        }
+        if (hit != nullptr) {
+            if (open) {
+                cur.len = i - cur.pos;
+                spans.push_back(cur);
+            }
+            cur.role = hit->role;
+            // Span starts at the delimiter, not after it — so that
+            // prompt.substr(span.pos, span.len) reconstructs the original
+            // role chunk including the delimiter that introduced it.
+            cur.pos  = i;
+            cur.len  = 0;
+            open     = true;
+            i       += hit->delimiter.size();
+            continue;
+        }
+        ++i;
+    }
+    if (open) {
+        cur.len = prompt.size() - cur.pos;
+        spans.push_back(cur);
+    }
+    return spans;
+}
+
 static common_chat_params common_chat_params_init_ministral_3(const common_chat_template &    tmpl,
                                                               const autoparser::generation_params & inputs) {
     common_chat_params data;
@@ -881,6 +1012,17 @@ static common_chat_params common_chat_params_init_ministral_3(const common_chat_
         "[TOOL_CALLS]",
         "[ARGS]",
     };
+
+    // Assistant-prefill continuation: when continue_final_message is set, the
+    // last assistant message was popped into continue_msg by the caller.
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.continue_msg.empty()) {
+        const auto & msg = inputs.continue_msg;
+        data.generation_prompt = "[THINK]" + msg.reasoning_content;
+        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            data.generation_prompt += "[/THINK]" + msg.render_content();
+        }
+        data.prompt += data.generation_prompt;
+    }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.prefix(inputs.generation_prompt, "[THINK]");
@@ -982,6 +1124,19 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
     data.preserved_tokens = {
         "<|channel|>", "<|constrain|>", "<|message|>", "<|start|>", "<|end|>",
     };
+
+    // Assistant-prefill continuation: when continue_final_message is set, the
+    // last assistant message was popped into continue_msg by the caller. Build
+    // the continuation prompt manually since gpt-oss uses the channel format
+    // (no inline <think> markers the generic autoparser path can detect).
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.continue_msg.empty()) {
+        const auto & msg = inputs.continue_msg;
+        data.generation_prompt = "<|start|>assistant<|channel|>analysis<|message|>" + msg.reasoning_content;
+        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            data.generation_prompt += "<|end|><|start|>assistant<|channel|>final<|message|>" + msg.render_content();
+        }
+        data.prompt += data.generation_prompt;
+    }
 
     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
     auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
@@ -1111,6 +1266,20 @@ static common_chat_params common_chat_params_init_gemma4(const common_chat_templ
         "<tool_call|>",
         "<|turn>",
     };
+
+    // Assistant-prefill continuation (gemma4 channel format).
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.continue_msg.empty()) {
+        const auto & msg = inputs.continue_msg;
+        // After a tool result the template leaves the model turn open
+        // (no trailing <turn|>\n); after a user message it closes the turn
+        // and we have to reopen the model turn ourselves.
+        data.generation_prompt = string_ends_with(data.prompt, "<turn|>\n") ? "<|turn>model\n" : "";
+        data.generation_prompt += "<|channel>thought\n" + msg.reasoning_content;
+        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            data.generation_prompt += "<channel|>" + msg.render_content();
+        }
+        data.prompt += data.generation_prompt;
+    }
 
     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
     auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
@@ -1244,6 +1413,14 @@ static common_chat_params common_chat_params_init_functionary_v3_2(const common_
     auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
     auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 
+    // Assistant-prefill continuation (functionary uses ">>>all\n{content}"
+    // with no separate reasoning section, so reasoning_content is dropped).
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.continue_msg.empty()) {
+        const auto & msg = inputs.continue_msg;
+        data.generation_prompt = "<|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n" + msg.render_content();
+        data.prompt += data.generation_prompt;
+    }
+
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         // Functionary v3.2 format:
         // - Normal content: >>>all\n{content}
@@ -1354,9 +1531,20 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
 
     const std::string THINK_START = "<think>";
     const std::string THINK_END   = "</think>";
+    const std::string GEN_PROMPT  = "<|im_assistant|>assistant<|im_middle|>";
 
     data.thinking_start_tag = THINK_START;
     data.thinking_end_tag   = THINK_END;
+
+    // Assistant-prefill continuation (kimi-k2 uses <think>...</think>content).
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.continue_msg.empty()) {
+        const auto & msg = inputs.continue_msg;
+        data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            data.generation_prompt += THINK_END + msg.render_content();
+        }
+        data.prompt += data.generation_prompt;
+    }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         // Kimi K2 Thinking format:
@@ -1472,9 +1660,20 @@ static common_chat_params common_chat_params_init_lfm2(const common_chat_templat
     const std::string TOOL_CALL_END   = "<|tool_call_end|>";
     const std::string THINK_START     = "<think>";
     const std::string THINK_END       = "</think>";
+    const std::string GEN_PROMPT     = "<|im_start|>assistant\n";
 
     data.thinking_start_tag = THINK_START;
     data.thinking_end_tag   = THINK_END;
+
+    // Assistant-prefill continuation (lfm2 uses <think>...</think>content).
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.continue_msg.empty()) {
+        const auto & msg = inputs.continue_msg;
+        data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            data.generation_prompt += THINK_END + msg.render_content();
+        }
+        data.prompt += data.generation_prompt;
+    }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.prefix(inputs.generation_prompt, THINK_START);
@@ -1547,9 +1746,20 @@ static common_chat_params common_chat_params_init_lfm2_5(const common_chat_templ
 
     const std::string THINK_START     = "<think>";
     const std::string THINK_END       = "</think>";
+    const std::string GEN_PROMPT     = "<|im_start|>assistant\n";
 
     data.thinking_start_tag = THINK_START;
     data.thinking_end_tag   = THINK_END;
+
+    // Assistant-prefill continuation (lfm2.5 uses <think>...</think>content).
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.continue_msg.empty()) {
+        const auto & msg = inputs.continue_msg;
+        data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            data.generation_prompt += THINK_END + msg.render_content();
+        }
+        data.prompt += data.generation_prompt;
+    }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.prefix(inputs.generation_prompt, THINK_START);
@@ -1613,6 +1823,13 @@ static common_chat_params common_chat_params_init_gigachat_v3(
     auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
     auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
     const auto *tool_call_start_prefix = "<|message_sep|>\n\nfunction call<|role_sep|>\n";
+
+    // Assistant-prefill continuation (gigachat has no reasoning section).
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.continue_msg.empty()) {
+        const auto & msg = inputs.continue_msg;
+        data.generation_prompt = "assistant<|role_sep|>\n" + msg.render_content();
+        data.prompt += data.generation_prompt;
+    }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto ret = p.eps();
@@ -1698,6 +1915,17 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     const std::string INVOKE_END   = "</" + DSML + "invoke>";
     const std::string PARAM_START  = "<" + DSML + "parameter";
     const std::string PARAM_END    = "</" + DSML + "parameter>";
+    const std::string GEN_PROMPT   = "<｜Assistant｜>";
+
+    // Assistant-prefill continuation (deepseek uses <think>...</think>content).
+    if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !inputs.continue_msg.empty()) {
+        const auto & msg = inputs.continue_msg;
+        data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            data.generation_prompt += THINK_END + msg.render_content();
+        }
+        data.prompt += data.generation_prompt;
+    }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.prefix(inputs.generation_prompt, THINK_START);
@@ -2138,7 +2366,6 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         params.tools.is_array() && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
     const auto & src        = tmpl.source();
     const auto & caps       = tmpl.original_caps();
-    params.messages         = render_message_to_json(inputs.messages, tmpl.original_caps());
     params.tool_choice      = inputs.tool_choice;
     params.reasoning_format = inputs.reasoning_format;
     params.enable_thinking  = inputs.enable_thinking;
@@ -2146,6 +2373,32 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     params.now              = inputs.now;
     params.add_bos          = tmpls->add_bos;
     params.add_eos          = tmpls->add_eos;
+    params.continue_final_message = inputs.continue_final_message;
+
+    // When continue_final_message != NONE, the trailing assistant message is
+    // a prefill that the model should continue from. Move it into
+    // continue_msg and drop it from the rendered messages so the template
+    // doesn't emit a closing token for it; the downstream peg_generator /
+    // common_chat_params_init_* handlers consume continue_msg and rebuild
+    // the prompt + generation_prompt to end mid-assistant.
+    auto adjusted_messages = inputs.messages;
+    if (params.continue_final_message != COMMON_CHAT_CONTINUATION_NONE &&
+        !adjusted_messages.empty() &&
+        adjusted_messages.back().role == "assistant") {
+        params.continue_msg = adjusted_messages.back();
+        adjusted_messages.pop_back();
+
+        if (params.continue_final_message == COMMON_CHAT_CONTINUATION_AUTO) {
+            // Resolve based on message content
+            params.continue_final_message = COMMON_CHAT_CONTINUATION_CONTENT;
+            if (!params.continue_msg.reasoning_content.empty() &&
+                params.continue_msg.content.empty() &&
+                params.continue_msg.content_parts.empty()) {
+                params.continue_final_message = COMMON_CHAT_CONTINUATION_REASONING;
+            }
+        }
+    }
+    params.messages = render_message_to_json(adjusted_messages, tmpl.original_caps());
 
     if (src.find("<|channel|>") == std::string::npos) {
         // map developer to system for all models except for GPT-OSS
@@ -2234,9 +2487,15 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     };
 
     if (auto result = common_chat_try_specialized_template(tmpl, src, params)) {
-        result->generation_prompt     = params.generation_prompt;
+        // Preserve any continuation-extended generation_prompt that the
+        // specialized handler may have built (see e.g. common_chat_params_init_gpt_oss);
+        // only fall back to params.generation_prompt for the non-continuation path.
+        if (params.continue_final_message == COMMON_CHAT_CONTINUATION_NONE ||
+            params.continue_msg.empty()) {
+            result->generation_prompt = params.generation_prompt;
+        }
         result->thinking_forced_open  = result->supports_thinking &&
-            thinking_forced_open_from_gen_prompt(params.generation_prompt,
+            thinking_forced_open_from_gen_prompt(result->generation_prompt,
                                                  result->thinking_start_tag,
                                                  result->thinking_end_tag);
         return *result;
@@ -2252,7 +2511,17 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
             auto_params.thinking_start_tag = autoparser.reasoning.start;
             auto_params.thinking_end_tag   = autoparser.reasoning.end;
         }
-        auto_params.generation_prompt    = params.generation_prompt;
+        // Leave auto_params.generation_prompt as what generate_parser computed
+        // (character-level diff via common_chat_template_generation_prompt, plus
+        // any continuation-mode reasoning/content extensions). We previously
+        // overwrote this with params.generation_prompt (which uses the
+        // segment-based calculate_diff_split), but for templates like
+        // MiniMax-M2 whose role delimiters are bracket-shaped (`[e~[`, `]~b]`),
+        // segment-based diff includes the trailing `[e~[` of the prior message
+        // as part of the "right" diff. That makes auto_params.generation_prompt
+        // disagree with parser_generation_prompt (used to build the parser),
+        // and the PEG parser then fails on inputs that include the spurious
+        // delimiter prefix.
         auto_params.thinking_forced_open = auto_params.supports_thinking &&
             thinking_forced_open_from_gen_prompt(params.generation_prompt,
                                                  auto_params.thinking_start_tag,

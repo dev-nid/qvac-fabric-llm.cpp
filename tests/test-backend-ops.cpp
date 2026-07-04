@@ -3706,7 +3706,11 @@ struct test_gated_delta_net : public test_case {
         const int64_t g_ne0 = kda ? head_size : 1;
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_2d(ctx, type, head_size * v_repeat * head_size * head_count, n_seqs);
+        // State must be 3D [D, K, n_seqs] so K (snapshot count, here 1) and the
+        // sequence count are in distinct dims. A 2D [D, n_seqs] state makes the
+        // op read K = ne[1] = n_seqs (conflating K with n_seqs), which is
+        // out-of-bounds for n_seqs > 1 (NaN on CPU too).
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, type, head_size * v_repeat * head_size * head_count, 1, n_seqs);
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
         return out;
     }

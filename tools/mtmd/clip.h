@@ -5,6 +5,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#ifdef __cplusplus
+#include <map>
+#endif
 
 // !!! Internal header, to be used by mtmd only !!!
 
@@ -32,6 +35,12 @@ enum clip_flash_attn_type {
     CLIP_FLASH_ATTN_TYPE_ENABLED  = 1,
 };
 
+enum clip_image_tile_mode {
+    CLIP_IMAGE_TILE_MODE_BATCHED    = 0,
+    CLIP_IMAGE_TILE_MODE_SEQUENTIAL = 1,
+    CLIP_IMAGE_TILE_MODE_DISABLED   = 2,
+};
+
 struct clip_context_params {
     bool use_gpu;
     enum clip_flash_attn_type flash_attn_type;
@@ -42,6 +51,7 @@ struct clip_context_params {
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
     const char * backend_device; // optional, if null will use env var or default GPU backend
+    int image_tile_mode; // 0=batched (default), 1=sequential, 2=disabled
 };
 
 struct clip_init_result {
@@ -118,3 +128,10 @@ void clip_image_f32_batch_add_mel(struct clip_image_f32_batch * batch, int n_mel
 bool clip_has_vision_encoder(const struct clip_ctx * ctx);
 bool clip_has_audio_encoder(const struct clip_ctx * ctx);
 bool clip_has_whisper_encoder(const struct clip_ctx * ctx);
+
+#ifdef __cplusplus
+// qvac: per-device memory usage of an initialised clip_ctx — weight buffers
+// summed with the scheduler's compute reservations. Used by mtmd_get_memory_usage
+// (and ultimately by common/fit.cpp's heuristic). Restored from upstream b9341.
+std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx);
+#endif
