@@ -2137,12 +2137,42 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 {192, 192, 16, 16}, {256, 256, 16, 16},
             };
 
+            // Flash attention relies on +/-INFINITY (initial m_i = -INFINITY and
+            // masked scores), so it must NOT be built with the Inf-assuming
+            // fast-math flags used for the other kernels. Under
+            // -cl-finite-math-only / -cl-fast-relaxed-math the compiler assumes
+            // no Inf/NaN, which makes the online-softmax init and masking
+            // produce deterministically wrong results (e.g. the Qwen3-VL vision
+            // encoder loses semantics). Strip those flags for the FA programs;
+            // -cl-mad-enable and the rest are kept for speed.
+            std::string fa_compile_opts = compile_opts;
+            for (const char* unsafe_flag : { " -cl-fast-relaxed-math",
+                                             " -cl-finite-math-only",
+                                             " -cl-unsafe-math-optimizations" }) {
+                // Erase every occurrence: the strip must not depend on the flag
+                // appearing exactly once or in a particular position. A surviving
+                // copy would silently rebuild FA with finite-math and reintroduce
+                // the -INFINITY miscompile this strip exists to prevent.
+                for (size_t pos = fa_compile_opts.find(unsafe_flag);
+                     pos != std::string::npos;
+                     pos = fa_compile_opts.find(unsafe_flag)) {
+                    fa_compile_opts.erase(pos, std::string(unsafe_flag).size());
+                }
+            }
+            // Fail loudly if any Inf-assuming flag survived (e.g. a future change
+            // to compile_opts spelling/spacing that the strip above misses),
+            // rather than shipping a silently miscompiled flash-attention kernel.
+            GGML_ASSERT(fa_compile_opts.find("finite-math")  == std::string::npos &&
+                        fa_compile_opts.find("fast-relaxed") == std::string::npos &&
+                        fa_compile_opts.find("unsafe-math")  == std::string::npos &&
+                        "flash-attn kernels must not be built with finite-math/fast-math flags");
+
             for (size_t i = 0; i < sizeof(fa_dims)/sizeof(fa_dims[0]); ++i) {
                 const int dk = fa_dims[i].dk;
                 const int dv = fa_dims[i].dv;
                 const int bm = fa_dims[i].bm;
                 const int bn = fa_dims[i].bn;
-                std::string OPTS = compile_opts +
+                std::string OPTS = fa_compile_opts +
                     " -D DK=" + std::to_string(dk) +
                     " -D DV=" + std::to_string(dv) +
                     " -D BLOCK_M=" + std::to_string(bm) +
@@ -4398,9 +4428,27 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_UPSCALE: {
             ggml_scale_mode mode = (ggml_scale_mode)(ggml_get_op_params_i32(op, 0) & 0xFF);
-            const bool antialias = (ggml_scale_mode)(ggml_get_op_params_i32(op, 0) & GGML_SCALE_FLAG_ANTIALIAS);
-            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                   (mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR) && !antialias;
+            const bool antialias = (ggml_get_op_params_i32(op, 0) & GGML_SCALE_FLAG_ANTIALIAS) != 0;
+            if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (mode == GGML_SCALE_MODE_NEAREST) {
+                return !antialias;
+            }
+            if (mode == GGML_SCALE_MODE_BILINEAR) {
+                if (!antialias) {
+                    return true;
+                }
+                // Antialiasing only changes results when downsampling; for
+                // upsampling it is a mathematical no-op, so the plain bilinear
+                // kernel is numerically exact. Qwen3-VL interpolates its
+                // position embeddings with BILINEAR|ANTIALIAS and upsamples
+                // (trained grid -> e.g. 92x92), so accept that here to keep the
+                // whole CLIP graph on OpenCL instead of splitting UPSCALE to CPU.
+                return op->ne[0] >= op->src[0]->ne[0] &&
+                       op->ne[1] >= op->src[0]->ne[1];
+            }
+            return false;
         }
         case GGML_OP_POOL_2D: {
             const int pool_op = ggml_get_op_params_i32(op, 0);
@@ -9525,6 +9573,12 @@ static void ggml_cl_upscale(ggml_backend_t backend, const ggml_tensor * src0, gg
     const int ne2 = dst->ne[2];
     const int ne3 = dst->ne[3];
 
+    // Zero source dims would make the sf* scale factors below divide by zero (+inf);
+    // the later dst-zero early-exit does not cover this.
+    if (ne00 == 0 || ne01 == 0 || ne02 == 0 || ne03 == 0) {
+        return;
+    }
+
     float sf0 = (float)ne0 / ne00;
     float sf1 = (float)ne1 / ne01;
     float sf2 = (float)ne2 / ne02;
@@ -9817,7 +9871,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     max_bias      = params[1];
     logit_softcap = params[2];
 
-    const int is_causal = (mask == NULL && n_q > 1 && n_q == n_kv);
+    // A null mask means no masking, i.e. bidirectional attention (e.g. the
+    // SigLIP vision / embedding encoders). Causal attention always supplies an
+    // explicit causal mask in this codebase (llama-graph.cpp build_attn passes
+    // kq_mask filled with -INFINITY), so a null mask must NOT be inferred as
+    // causal. The previous `mask == NULL && n_q == n_kv` heuristic wrongly made
+    // the bidirectional Qwen3-VL vision tower attend causally, corrupting the
+    // image embedding (each patch only saw earlier patches).
+    //
+    // INVARIANT: this backend treats a null mask as bidirectional. Any caller
+    // that needs causal masking MUST supply an explicit causal mask; relying on
+    // shape inference here will silently produce bidirectional (wrong) output.
+    const int is_causal = 0;
 
     const int n_head_log2_val = n_head > 0 ? 1u << (int)floorf(log2f((float)n_head)) : 0;
     const float n_head_log2_f = n_head_log2_val > 0 ? (float)n_head_log2_val : 1.0f;
