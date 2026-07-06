@@ -766,6 +766,7 @@ private:
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.image_tile_mode  = (int) params_base.image_tile_mode;
+            mparams.image_max_tiles  = params_base.image_max_tiles;
             mparams.media_marker     = get_media_marker();
         }
 

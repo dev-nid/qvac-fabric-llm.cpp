@@ -595,6 +595,7 @@ struct common_params {
     int image_min_tokens = -1;
     int image_max_tokens = -1;
     common_image_tile_mode image_tile_mode = COMMON_IMAGE_TILE_MODE_SEQUENTIAL;
+    int image_max_tiles = -1;  // override preproc_max_tiles from GGUF; -1 = use model default
 
     // finetune
     struct lr_opt lr;

@@ -178,7 +178,7 @@ struct clip_ctx {
     size_t fa_mem_capacity  = 0;   // device memory used to cap the cutoff (0 = unknown)
 
     bool debug_output_embeddings = false;
-    clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_BATCHED;
+    clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_SEQUENTIAL;
 
     // When the GPU backend lacks bf16 support but the GGUF has bf16 weights,
     // we declare the in-context tensors as f16 and convert on disk-load.
@@ -1529,8 +1529,34 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
-                        // optional multi-tile cap; absent in GGUF → stays 0 and the qwen3vl preprocessor falls back to 4
+                        // SigLIP2-Large ViT (n_head=16, n_layer=24) is used for 2B/4B — max_tiles=4 confirmed.
+                        // Larger ViT variants (8B+) use SigLIP2-SO-400M with unknown max_tiles.
+                        // Read from GGUF if present; otherwise default to 4 and warn for unknown ViTs.
+                        hparams.preproc_max_tiles = 4;
+                        const bool has_max_tiles_key = gguf_find_key(ctx_gguf.get(), KEY_PREPROC_MAX_TILES) >= 0;
                         get_u32(KEY_PREPROC_MAX_TILES, hparams.preproc_max_tiles, false);
+                        if (has_max_tiles_key && (hparams.preproc_max_tiles < 1 || hparams.preproc_max_tiles > CLIP_PREPROC_MAX_TILES_LIMIT)) {
+                            LOG_WRN("%s: clip.vision.preproc_max_tiles=%d out of range [1,%d] in GGUF — defaulting to 4\n",
+                                    __func__, hparams.preproc_max_tiles, CLIP_PREPROC_MAX_TILES_LIMIT);
+                            hparams.preproc_max_tiles = 4;
+                        }
+                        if (!has_max_tiles_key && (hparams.n_head > 16 || hparams.n_layer > 24)) {
+                            const char * model_name =
+                                model.proj_type == PROJECTOR_TYPE_QWEN2VL  ? "Qwen2VL"  :
+                                model.proj_type == PROJECTOR_TYPE_QWEN25VL ? "Qwen2.5VL" : "Qwen3VL";
+                            // preproc_max_tiles is only read by the Qwen3VL preprocessor; Qwen2/2.5VL
+                            // use dyn_size, so --image-max-tiles is inert there and must not be suggested.
+                            if (model.proj_type == PROJECTOR_TYPE_QWEN3VL) {
+                                LOG_WRN("%s: %s large ViT detected (n_head=%d, n_layer=%d) but "
+                                        "clip.vision.preproc_max_tiles not in GGUF — defaulting to 4. "
+                                        "If using an 8B+ model, set the correct value with --image-max-tiles.\n",
+                                        __func__, model_name, hparams.n_head, hparams.n_layer);
+                            } else {
+                                LOG_WRN("%s: %s large ViT detected (n_head=%d, n_layer=%d) but "
+                                        "clip.vision.preproc_max_tiles not in GGUF — defaulting to 4.\n",
+                                        __func__, model_name, hparams.n_head, hparams.n_layer);
+                            }
+                        }
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
                         hparams.warmup_image_size = hparams.image_size; // warmup at actual tile size to match inference graph shape
@@ -2934,6 +2960,33 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
         if (loader.has_vision) {
             ctx_vision = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
+            // apply CLI/binding overrides after load_hparams so GGUF defaults don't clobber them.
+            // Only the Qwen3VL preprocessor reads preproc_max_tiles live; Qwen2/2.5VL use dyn_size
+            // and InternVL uses a candidate list already frozen in load_hparams, so the override is
+            // inert for them — apply (and validate) it only where it takes effect.
+            //
+            // Treat only a POSITIVE value as an explicit override. -1 is the documented unset
+            // sentinel, and 0 is what a zero-initialized clip_context_params / mtmd_context_params
+            // passes (bindings / direct C API callers that never set the field). Both are treated
+            // as unset here so those callers keep the GGUF/model default instead of silently
+            // forcing single-tile and losing multi-tile preprocessing on large/high-res images.
+            if (ctx_params.image_max_tiles > 0) {
+                if (ctx_vision->model.proj_type != PROJECTOR_TYPE_QWEN3VL) {
+                    LOG_WRN("%s: --image-max-tiles is only supported for Qwen3VL; ignoring for this model\n", __func__);
+                } else {
+                    int max_tiles = ctx_params.image_max_tiles;
+                    // Re-validate at this library boundary: bindings populate clip_context_params
+                    // directly and bypass the CLI's [1,256] check. An unbounded value reaches the
+                    // grid-fitting reserve in mtmd-image.cpp and can OOM the process.
+                    if (max_tiles > CLIP_PREPROC_MAX_TILES_LIMIT) {
+                        LOG_WRN("%s: --image-max-tiles=%d exceeds [1,%d]; clamping\n",
+                                __func__, max_tiles, CLIP_PREPROC_MAX_TILES_LIMIT);
+                        max_tiles = CLIP_PREPROC_MAX_TILES_LIMIT;
+                    }
+                    ctx_vision->model.hparams.preproc_max_tiles = max_tiles;
+                    LOG_INF("%s: preproc_max_tiles: %d (custom value)\n", __func__, max_tiles);
+                }
+            }
             loader.load_tensors(*ctx_vision);
             if (ctx_params.warmup) {
                 loader.warmup(*ctx_vision);
@@ -3624,21 +3677,27 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 GGML_ASSERT(pw % merge_ratio == 0 && ph % merge_ratio == 0 &&
                             "tile dimensions must be divisible by n_merge");
                 const int n_pos_tile   = pw * ph; // raw patches per tile == n_patches (graph sequence length)
-                // positions layout: tile-major [tile0: y,x,y,x | tile1: y,x,y,x
-                // | ...] each tile's block starts at b * n_pos_tile * 4
-                // (matches ggml_view_1d in graph)
-                std::vector<int32_t> positions((size_t)n_pos_tile * (size_t)batch_size * 4);
+                // positions layout: section-major over the FULL batched sequence. The mrope kernel
+                // reads section s of token i as positions[s * N + i], where N = n_pos_tile * batch_size
+                // is the rope tensor's ne[2]. The four sections are [y, x, y, x]. Every tile gets the
+                // same local-coordinate block (per-tile absolute offsets cancel under relative
+                // attention), so each section just repeats the tile coordinates batch_size times.
+                // For batch_size == 1 this is identical to the old tile-major layout; for
+                // batch_size > 1 (batched mode) it is the only layout the kernel reads correctly —
+                // a tile-major buffer would mis-index every section beyond the first tile.
+                const size_t N = (size_t)n_pos_tile * (size_t)batch_size;
+                std::vector<int32_t> positions(N * 4);
                 for (int b = 0; b < batch_size; b++) {
-                    const size_t base  = (size_t)b * (size_t)n_pos_tile * 4;
+                    const size_t tile_off = (size_t)b * (size_t)n_pos_tile;
                     int ptr = 0;
                     for (int y = 0; y < ph; y += merge_ratio) {
                         for (int x = 0; x < pw; x += merge_ratio) {
                             for (int dy = 0; dy < merge_ratio; dy++) {
                                 for (int dx = 0; dx < merge_ratio; dx++) {
-                                    positions[base + ptr]                          = y + dy;
-                                    positions[base + (size_t)n_pos_tile + ptr]     = x + dx;
-                                    positions[base + (size_t)2 * n_pos_tile + ptr] = y + dy;
-                                    positions[base + (size_t)3 * n_pos_tile + ptr] = x + dx;
+                                    positions[0 * N + tile_off + ptr] = y + dy;
+                                    positions[1 * N + tile_off + ptr] = x + dx;
+                                    positions[2 * N + tile_off + ptr] = y + dy;
+                                    positions[3 * N + tile_off + ptr] = x + dx;
                                     ptr++;
                                 }
                             }
