@@ -203,8 +203,17 @@ function gg_wget {
     mkdir -p $out
     cd $out
 
-    # should not re-download if file is the same
-    wget -nv -c -N $url
+    if command -v wget >/dev/null 2>&1; then
+        wget -nv -c -N $url
+    else
+        # macOS runners don't ship wget; emulate `wget -N` with curl
+        local fname=$(basename "$url")
+        if [ -f "$fname" ]; then
+            curl -fsSL --remote-time -z "$fname" -o "$fname" "$url"
+        else
+            curl -fsSL --remote-time -o "$fname" "$url"
+        fi
+    fi
 
     cd $cwd
 }
