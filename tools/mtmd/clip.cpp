@@ -2723,6 +2723,35 @@ struct clip_model_loader {
     static void warmup(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         support_info_graph info;
 
+        // Disable FA on GPU projectors that lack efficient (coopmat) flash attention.
+        // Without coopmat, Vulkan uses FA_SCALAR which is ~2.6x slower than the matmul path
+        // for CLIP encoder attention (Mali-G715: 38 vs ~100 GFLOPS/s). Coopmat-capable GPUs
+        // keep FA enabled. Resolved at runtime via proc_address — no compile-time backend dep.
+        // Acts on AUTO *and* ENABLED (the addon enables FA by default) — an inefficient
+        // scalar-FA GPU should never be forced into FA; only explicit DISABLED is left alone.
+        // Default when the backend can't confirm efficient FA = KEEP it. Only ggml-vulkan
+        // implements the query (returning false for Mali/non-coopmat); backends that don't
+        // answer (Metal, CUDA, …) have efficient FA and must keep it — disabling there forces
+        // explicit attention whose QK^T overflows the clip compute buffer at high n_pos
+        // (GGML_ASSERT in ggml-backend, e.g. image_tile_mode=disabled + large image_max_tokens).
+        if (ctx_clip.flash_attn_type != CLIP_FLASH_ATTN_TYPE_DISABLED &&
+            ctx_clip.backend && ctx_clip.backend != ctx_clip.backend_cpu) {
+            bool efficient_fa = true;
+            ggml_backend_dev_t dev = ggml_backend_get_device(ctx_clip.backend);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (reg) {
+                typedef bool (*supports_efficient_fa_t)(ggml_backend_t);
+                auto fn = (supports_efficient_fa_t)ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_supports_efficient_fa");
+                if (fn) {
+                    efficient_fa = fn(ctx_clip.backend);
+                }
+            }
+            if (!efficient_fa) {
+                ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
+            }
+        }
+
         if (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO) {
             // Probe flash-attention support by forcing it on for the warmup
             // graph, then restore AUTO so the per-image budget heuristic in
