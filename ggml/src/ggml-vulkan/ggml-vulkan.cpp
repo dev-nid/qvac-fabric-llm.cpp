@@ -1408,6 +1408,13 @@ struct vk_op_rope_push_constants {
     uint32_t nb11;
     uint32_t nb12;
     uint32_t nb13;
+    // qvac fix: the ROPE shader (rope_head.glsl) declares a 116-byte push-constant
+    // block ending in a_offset/d_offset (read at bytes [108,116)); the qvac rebase
+    // dropped these two fields, truncating the pipeline push-constant range to 108
+    // bytes so the shader read undefined push-constant memory → deterministic
+    // garbage ("of of of...") on multi-token prefill. Restore them.
+    uint32_t a_offset;
+    uint32_t d_offset;
 };
 static_assert(sizeof(vk_op_rope_push_constants) <= 128, "sizeof(vk_op_rope_push_constants) must be <= 128");
 
@@ -1561,6 +1568,11 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
     float scale;
+    // qvac fix: the MTP-support commit added a trailing `uint K` (the recurrent
+    // snapshot/rollback slot count = state->ne[1]) to the gated_delta_net shader
+    // but not to this struct, so the shader read K from undefined push-constant
+    // memory → NaN/garbage (test-backend-ops 0/13). Restore it.
+    uint32_t K;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -3147,6 +3159,19 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         }
     }
 
+    // qvac: Arm Mali scalar flash-attn tuning. The scalar path is the only FA
+    // path on GPUs without cooperative-matrix (e.g. Arm Mali), and the generic
+    // config (D_split=8, Br=8) is not tuned for Mali's subgroup size of 16. An
+    // on-device sweep (Pixel 9 Pro, Mali-G715, Gemma 4 E2B vision encoder,
+    // head_dim 64) found D_split=4 + Br=4 fastest (clean encode -6% at 196
+    // tokens, -11% at 784; smaller splits / larger tiles regress sharply). Gated
+    // tightly to the measured shape: head size <= 64 and multi-row attention
+    // (the n_rows == 1 decode path is untouched).
+    if (device->vendor_id == VK_VENDOR_ID_ARM && n_rows > 1 && hsk <= 64 && hsv <= 64) {
+        result.d_split    = std::min(result.d_split, 4u);
+        result.block_rows = std::min(result.block_rows, 4u);
+    }
+
     return result;
 }
 
@@ -3563,21 +3588,31 @@ static void ggml_vk_load_shaders(vk_device& device) {
         const uint32_t tk_m_f32 = coopmat_support_f32 ? device->coopmat_f32_k : 1;
         const uint32_t tk_s_f32 = coopmat_support_f32 ? device->coopmat_f32_k : 1;
 
-        const uint32_t s_warptile_wm = device->subgroup_size == 8 ? 8 : 32;
+        const auto calc_tile = [&](uint32_t base_bm, uint32_t base_bn, uint32_t block_tk, uint32_t base_wm,
+                             uint32_t base_wn, uint32_t tm, uint32_t tn, uint32_t tk) -> std::vector<uint32_t>{
+            const uint32_t wm = std::max(base_wm, tm);
+            const uint32_t wn = std::max(base_wn, tn);
+            const uint32_t bm = base_bm * wm / base_wm;
+            const uint32_t bn = base_bn * wn / base_wn;
+            const uint32_t num_warps = (bm / wm) * (bn / wn);
+            const uint32_t block_size = num_warps * subgroup_size_8;
+            return { block_size, bm, bn, block_tk, wm, wn, 2, tm, tn, tk, subgroup_size_8 };
+        };
 
+        const uint32_t s_warptile_wm = std::clamp(device->subgroup_size, 8u, 32u);
         const uint32_t s_warptile_wm_f32 = std::clamp(device->subgroup_size, 16u, 32u);
 
-        l_warptile = { 128,             128, 128, 16, subgroup_size_8 * 2, 64, 2, tm_l, tn_l, tk_l, subgroup_size_8 };
-        m_warptile = { 128,              64,  64, 16, subgroup_size_8,     32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
-        s_warptile = { subgroup_size_32, 32,  32, 16, s_warptile_wm,       32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
+        l_warptile = calc_tile(128, 128, 16, subgroup_size_8 * 2, 64, tm_l, tn_l, tk_l);
+        m_warptile = calc_tile( 64,  64, 16, subgroup_size_8,     32, tm_m, tn_m, tk_m);
+        s_warptile = calc_tile( 32,  32, 16, s_warptile_wm,       32, tm_s, tn_s, tk_s);
 
-        l_warptile_f32 = { 128,             128, 128, 32, subgroup_size_8 * 2, 64, 2, tm_l_f32, tn_l_f32, tk_l_f32, subgroup_size_8 };
-        m_warptile_f32 = { 128,              64,  64, 32, subgroup_size_8,     32, 2, tm_m_f32, tn_m_f32, tk_m_f32, subgroup_size_8 };
-        s_warptile_f32 = { subgroup_size_32, 32,  32, 32, s_warptile_wm_f32,   32, 2, tm_s_f32, tn_s_f32, tk_s_f32, subgroup_size_8 };
+        l_warptile_f32 = calc_tile(128, 128, 32, subgroup_size_8 * 2, 64, tm_l_f32, tn_l_f32, tk_l_f32);
+        m_warptile_f32 = calc_tile( 64,  64, 32, subgroup_size_8,     32, tm_m_f32, tn_m_f32, tk_m_f32);
+        s_warptile_f32 = calc_tile( 32,  32, 32, s_warptile_wm_f32,   32, tm_s_f32, tn_s_f32, tk_s_f32);
 
-        l_warptile_mmq = { 128,             128, 128, 32, subgroup_size_8 * 2, 64, 2, tm_l, tn_l, tk_l, subgroup_size_8 };
-        m_warptile_mmq = { 128,              64,  64, 32, subgroup_size_8,     32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
-        s_warptile_mmq = { subgroup_size_32, 32,  32, 32, s_warptile_wm,       32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
+        l_warptile_mmq = calc_tile(128, 128, 32, subgroup_size_8 * 2, 64, tm_l, tn_l, tk_l);
+        m_warptile_mmq = calc_tile( 64,  64, 32, subgroup_size_8,     32, tm_m, tn_m, tk_m);
+        s_warptile_mmq = calc_tile( 32,  32, 32, s_warptile_wm,       32, tm_s, tn_s, tk_s);
 
         // Integer MMQ has a smaller shared memory profile, but heavier register use
         l_warptile_mmq_int = { 128,             128, 128, 32, subgroup_size_8 * 2, 64, 2, 4, 4, 1, subgroup_size_8 };
@@ -3620,9 +3655,12 @@ static void ggml_vk_load_shaders(vk_device& device) {
             l_warptile_mmq = { 512, 128, 128, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
         }
 
-        l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
-        m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
-        s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
+        l_wg_denoms     = { l_warptile[1],     l_warptile[2],     1 };
+        m_wg_denoms     = { m_warptile[1],     m_warptile[2],     1 };
+        s_wg_denoms     = { s_warptile[1],     s_warptile[2],     1 };
+        l_mmq_wg_denoms = { l_warptile_mmq[1], l_warptile_mmq[2], 1 };
+        m_mmq_wg_denoms = { m_warptile_mmq[1], m_warptile_mmq[2], 1 };
+        s_mmq_wg_denoms = { s_warptile_mmq[1], s_warptile_mmq[2], 1 };
         l_align = 128;
         m_align =  64;
         s_align =  32;
@@ -3796,7 +3834,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
 
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+#if 0 // qvac: FlashAttn MMQ (_int8) variants disabled — matches the
+      // shader-gen gate above. flash_attn_mmq_funcs.glsl references the
+      // FaTypeK spec constant that was never ported into the qvac fork's
+      // macro-based dispatch, so the _int8 shader binaries don't exist.
+      // The non-_int8 FA path below covers Q4_0/Q8_0/Q4_1/Q5_0/Q5_1/IQ4_NL
+      // on every backend. Other integer-dot paths (mul_mat_mat_q8_1,
+      // mul_mat_vec_q8_1, incl. TQ2_0) are unaffected.
         if (device->integer_dot_product && device->subgroup_clustered) {
             CREATE_FA(GGML_TYPE_Q4_0,     q4_0, FA_SCALAR, _int8)
             CREATE_FA(GGML_TYPE_Q8_0,     q8_0, FA_SCALAR, _int8)
@@ -3827,7 +3871,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, _fp32)
 
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+#if 0 // qvac: FlashAttn MMQ (_fp32_int8) variants disabled — see matching gate above.
         if (device->integer_dot_product && device->subgroup_clustered) {
             CREATE_FA(GGML_TYPE_Q4_0,     q4_0, FA_SCALAR, _fp32_int8)
             CREATE_FA(GGML_TYPE_Q8_0,     q8_0, FA_SCALAR, _fp32_int8)
@@ -4172,29 +4216,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
             CREATE_MM_FP32(GGML_TYPE_F32, pipeline_matmul_f32_cm1, matmul_f32_f32, wg_denoms, warptile_f32, vk_mat_mat_push_constants, 3, );
         }
 
-        // ARM Mali / Qualcomm Adreno KHR_coopmat1: the F16 coopmat1 shaders produce zeros for tiles beyond M=32,
-        // corrupting F16-weight model outputs. Populate the .f32acc slots with non-coopmat fp32 shaders instead
-        if (device->vendor_id == VK_VENDOR_ID_ARM || device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
-#define CREATE_MM_F16_NC(PIPELINE_NAME, NAMELC) \
-            if (device->mul_mat_l[GGML_TYPE_F16]) { \
-                ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l,   #NAMELC "_l",         NAMELC ## _fp32_len,         NAMELC ## _fp32_data,         "main", 3, sizeof(vk_mat_mat_push_constants), l_wg_denoms, l_warptile, 1,       false, false, 0); \
-                ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC "_aligned_l", NAMELC ## _aligned_fp32_len, NAMELC ## _aligned_fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_wg_denoms, l_warptile, l_align, false, false, 0); \
-            } \
-            if (device->mul_mat_m[GGML_TYPE_F16]) { \
-                ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m,   #NAMELC "_m",         NAMELC ## _fp32_len,         NAMELC ## _fp32_data,         "main", 3, sizeof(vk_mat_mat_push_constants), m_wg_denoms, m_warptile, 1,       false, false, 0); \
-                ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC "_aligned_m", NAMELC ## _aligned_fp32_len, NAMELC ## _aligned_fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), m_wg_denoms, m_warptile, m_align, false, false, 0); \
-            } \
-            if (device->mul_mat_s[GGML_TYPE_F16]) { \
-                ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s,   #NAMELC "_s",         NAMELC ## _fp32_len,         NAMELC ## _fp32_data,         "main", 3, sizeof(vk_mat_mat_push_constants), s_wg_denoms, s_warptile, 1,       false, false, 0); \
-                ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC "_aligned_s", NAMELC ## _aligned_fp32_len, NAMELC ## _aligned_fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), s_wg_denoms, s_warptile, s_align, false, false, 0); \
-            }
-            CREATE_MM_F16_NC(pipeline_matmul_f16.f32acc,     matmul_f16);
-            CREATE_MM_F16_NC(pipeline_matmul_f16_f32.f32acc, matmul_f16_f32);
-#undef CREATE_MM_F16_NC
-        } else {
-            CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
-            CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
-        }
+        CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
 #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
         if (device->coopmat_bf16_support) {
             CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, )
@@ -4657,7 +4680,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         && !device->coopmat_bf16_support
 #endif
         ) {
-        const uint32_t s_warptile_wm = device->subgroup_size == 8 ? 8 : 32;
+        const uint32_t s_warptile_wm = std::clamp(device->subgroup_size, 8u, 32u);
 
         // use scalar tile sizes
         l_warptile = { 128, 128, 128, 16, subgroup_size_8 * 2, 64, 2, 4, 4, 1, subgroup_size_8 };
@@ -5473,7 +5496,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size, 16}, 1, true, true);
     }
 
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 3, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
+    // qvac fix: the ssm_conv_f32 shader was updated upstream to fuse BIAS+SILU
+    // and now declares 4 bindings (src0, src1, bias, dst). The rebase kept this
+    // shader but left the pipeline at 3 params, so the dst (binding 3) was
+    // unbound and the conv result was never written → garbage (all SSM_CONV
+    // test-backend-ops cases failed, ERR~2). Use 4 params; the dispatch binds a
+    // dummy bias buffer (APPLY_BIAS/APPLY_SILU stay false, so it is never read).
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -6239,11 +6268,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             VK_LOG_DEBUG("ggml_vulkan: Cooperative Matrix Shapes: " << cm_props.size());
 
             for (auto& prop : cm_props) {
-                if (prop.MSize > 16 || prop.NSize > 16 || prop.KSize > 16) {
-                    continue;
-                }
-
-                VK_LOG_DEBUG("ggml_vulkan: M: " << prop.MSize << " N: " << prop.NSize << " K: " << prop.KSize << " A: " << vk::to_string((vk::ComponentTypeKHR)prop.AType) << " B: " << vk::to_string((vk::ComponentTypeKHR)prop.BType) << " C: " << vk::to_string((vk::ComponentTypeKHR)prop.CType) << " Result: " << vk::to_string((vk::ComponentTypeKHR)prop.ResultType) << " saturatingAccumulation: " << prop.saturatingAccumulation << " scope: " << vk::to_string((vk::ScopeKHR)prop.scope));
+                VK_LOG_DEBUG("ggml_vulkan: M: " << prop.MSize << " N: " << prop.NSize << " K: " << prop.KSize << " A: " << vk::to_string((vk::ComponentTypeKHR)prop.AType) << " B: " << vk::to_string((vk::ComponentTypeKHR)prop.BType) << " C: " << vk::to_string((vk::ComponentTypeKHR)prop.CType) << " Result: " << vk::to_string((vk::ComponentTypeKHR)prop.ResultType) << " saturatingAccumulation: " << prop.saturatingAccumulation << " scope: " << vk::to_string((vk::ComponentTypeKHR)prop.scope));
 
                 if ((vk::ComponentTypeKHR)prop.AType == vk::ComponentTypeKHR::eFloat32 &&
                     (vk::ComponentTypeKHR)prop.BType == vk::ComponentTypeKHR::eFloat32 &&
@@ -7062,13 +7087,6 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
             assert(ctx->device->coopmat_support);
             return ctx->device->pipeline_matmul_f32_cm1;
         }
-        // KHR coopmat1 only supports fp16 inputs natively. The _cm1 f32xf32 shader
-        // converts inputs to fp16 internally which causes precision loss and timeouts
-        // on embedded GPUs like Mali and Adreno. We return nullptr to force a proper dequant to
-        // f16 for BOTH inputs before running the f16xf16 coopmat path.
-        if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
-            return nullptr;
-        }
         return ctx->device->pipeline_matmul_f32;
     }
     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F16) {
@@ -7079,19 +7097,9 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     }
     if (prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
-            // Mali / Adreno KHR_coopmat1: F16 accumulation overflows on wide reductions
-            // (e.g. bert encoder graphs at large batch). Force F32 accumulation.
-            if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
-                return ctx->device->pipeline_matmul_f16_f32.f32acc;
-            }
             return ctx->device->pipeline_matmul_f16_f32.f16acc;
         }
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F16) {
-            // Mali / Adreno KHR_coopmat1: F16 accumulation overflows on wide reductions
-            // (e.g. bert encoder graphs at large batch). Force F32 accumulation.
-            if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
-                return ctx->device->pipeline_matmul_f16.f32acc;
-            }
             return ctx->device->pipeline_matmul_f16.f16acc;
         }
     } else {
@@ -8196,11 +8204,6 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         }
         return aligned ? mmp->a_s : mmp->s;
     }
-    if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
-        if (src0_type == GGML_TYPE_F16) {
-            return aligned ? mmp->a_l : mmp->l;
-        }
-    }
 
     if ((ctx->device->mul_mat_s[src0_type] && (m <= 32 || n <= 32)) || (!ctx->device->mul_mat_m[src0_type] && !ctx->device->mul_mat_l[src0_type])) {
         return aligned ? mmp->a_s : mmp->s;
@@ -8840,20 +8843,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         src1_uma = d_Qy != nullptr;
     }
 
-    const bool use_f32_cm1 = src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
-                            ctx->device->coopmat_f32_support_16x16x16_f32acc;
-
     // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
     const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
                               !ggml_vk_dim01_contiguous(src0);
     const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
-                              // Force F32 src1 through the strided cpy path which uses correct strides.
-                              // Skip for TQ1_0/TQ2_0: those have a dedicated TQ x F32 f32acc pipeline,
-                              // and forcing the F16 cast path here causes first-step NaN in bitnet finetuning
-                              // because F32 activations >65504 overflow F16. Mirrors the !is_tq guard below.
-                              ((ctx->device->vendor_id == VK_VENDOR_ID_ARM) && ctx->device->coopmat_support && !ctx->device->coopmat2 && src1->type == GGML_TYPE_F32 &&
-                               src0->type != GGML_TYPE_TQ1_0 && src0->type != GGML_TYPE_TQ2_0 && !use_f32_cm1) ||
                               !ggml_vk_dim01_contiguous(src1);
 
     // If src0 is BF16, try to use a BF16 x BF16 multiply
@@ -8862,15 +8856,6 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
-
-    // Mali/Adreno KHR_coopmat1 workaround: F16 x F16 path is the only safe coopmat path.
-    // Force both inputs to be dequantized/casted to F16.
-    const bool is_tq = src0->type == GGML_TYPE_TQ1_0 || src0->type == GGML_TYPE_TQ2_0;
-    if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) &&
-        ctx->device->coopmat_support && !ctx->device->coopmat2 && !is_tq && !use_f32_cm1) {
-        y_f32_kernel = false;
-        quantize_y = false;
-    }
 
     // Check for mmq first
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
@@ -8883,11 +8868,6 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     bool qx_needs_dequant = mmp == nullptr || x_non_contig;
     const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
-
-    if (src0->type == GGML_TYPE_F32 && (ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) &&
-        ctx->device->coopmat_support && !ctx->device->coopmat2 && !use_f32_cm1) {
-        qx_needs_dequant = true;
-    }
 
     if (qx_needs_dequant) {
         // Fall back to dequant + f16 mulmat
@@ -11860,6 +11840,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     } else if (op == GGML_OP_OPT_STEP_SGD) {
         // OPT_STEP_SGD works on src0, it does not need dst
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf }, pc, elements);
+    } else if (op == GGML_OP_SSM_CONV) {
+        // qvac fix: the ssm_conv_f32 shader declares 4 bindings (src0, src1,
+        // bias, dst) since the upstream BIAS+SILU fusion. We don't fuse bias
+        // here (APPLY_BIAS=false), but the binding still has to exist, so bind a
+        // dummy (src0_buf) at the bias slot; dst must be the 4th buffer.
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src0_buf, dst_buf }, pc, elements);
     } else if (use_src3) {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf, src3_buf, dst_buf }, pc, elements);
     } else if (use_src2) {
@@ -12204,13 +12190,16 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
+    // K = recurrent snapshot/rollback slot count = state (src[5]) ne[1].
+    const uint32_t K = (uint32_t)dst->src[5]->ne[1];
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         sq1, sq2, sq3,
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         neq1, rq3,
-        scale
+        scale,
+        K
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -12645,6 +12634,7 @@ static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *
         (uint32_t)src0->ne[2],
         nb01, nb02, nb03,
         nb11, nb12, nb13,
+        0, 0, // a_offset, d_offset (rope asserts zero misalignment; see struct note)
     };
 
     return rope;
@@ -16013,7 +16003,23 @@ static bool ggml_vk_can_fuse_topk_moe(ggml_backend_vk_context * ctx, const struc
 
 static bool ggml_vk_can_fuse_rope_set_rows(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                            int node_idx) {
-    GGML_UNUSED(ctx);
+    // qvac: Mali/Adreno KHR_coopmat1 disable. The ROPE+VIEW+SET_ROWS fusion
+    // makes the ROPE shader write directly into the KV cache buffer (a
+    // permuted view 6+ MiB long) instead of a small intermediate compute
+    // buffer + a separate SET_ROWS. On Mali-G715 this fused dispatch
+    // corrupts subsequent GPU state — the next op's descriptor-pool submit
+    // (e.g. attention Q@K^T mul_mat_q_f16) fence-waits and gets
+    // ErrorDeviceLost. Pre-b9341 the unfused two-op sequence (ROPE → compute
+    // buf, then SET_ROWS → cache) ran cleanly on the same hardware
+    // (verified end-to-end with f686a1324 source at 19.6 t/s). Disabling the
+    // fusion on Mali/Adreno coopmat1 restores the un-fused path while
+    // leaving the optimization on for desktop GPUs / coopmat2 hardware.
+    const vk_device & device = ctx->device;
+    if ((device->vendor_id == VK_VENDOR_ID_ARM || device->vendor_id == VK_VENDOR_ID_QUALCOMM) &&
+        device->coopmat_support && !device->coopmat2) {
+        return false;
+    }
+
     const ggml_tensor *rope = cgraph->nodes[node_idx + 0];
     const ggml_tensor *view = cgraph->nodes[node_idx + 1];
     const ggml_tensor *set_rows = cgraph->nodes[node_idx + 2];

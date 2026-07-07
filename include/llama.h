@@ -198,6 +198,11 @@ extern "C" {
         LLAMA_SPLIT_MODE_TENSOR = 3,
     };
 
+    enum llama_context_type {
+        LLAMA_CONTEXT_TYPE_DEFAULT = 0,
+        LLAMA_CONTEXT_TYPE_MTP     = 1,
+    };
+
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -333,9 +338,11 @@ extern "C" {
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
+        uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
+        enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
         enum llama_attention_type    attention_type;    // attention type to use for embeddings
@@ -525,7 +532,7 @@ extern "C" {
     };
 
     // fits mparams and cparams to free device memory (assumes system memory is unlimited)
-    //   - returns true if the parameters could be successfully modified to fit device memory
+    //   - returns SUCCESS if the parameters could be successfully modified to fit device memory
     //   - this function is NOT thread safe because it modifies the global llama logger state
     //   - only parameters that have the same value as in llama_default_model_params are modified
     //     with the exception of the context size which is modified if and only if equal to 0
@@ -558,6 +565,7 @@ extern "C" {
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
@@ -785,6 +793,15 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Returns the number of memory cells currently associated with the
+    // specified sequence. This differs from pos_max - pos_min + 1 for models
+    // that can map multiple cache cells to the same logical position, such as
+    // M-RoPE multimodal image embeddings.
+    // seq_id < 0 : count all non-empty cells
+    LLAMA_API uint32_t llama_memory_seq_token_count(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
@@ -886,11 +903,17 @@ extern "C" {
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
 
+#define LLAMA_STATE_SEQ_FLAGS_NONE 0
+
 // for backwards-compat
 #define LLAMA_STATE_SEQ_FLAGS_SWA_ONLY 1
 
 // work only with partial states, such as SWA KV cache or recurrent cache (e.g. Mamba)
 #define LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY 1
+
+// Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
+// Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
+#define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
     typedef uint32_t llama_state_seq_flags;
 
@@ -1552,9 +1575,6 @@ extern "C" {
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
-
-    // print a breakdown of per-device memory use via LLAMA_LOG:
-    LLAMA_API void llama_memory_breakdown_print(const struct llama_context * ctx);
 
     //
     // training

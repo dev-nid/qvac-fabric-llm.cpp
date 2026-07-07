@@ -731,7 +731,14 @@ void process_shaders() {
                     std::string data_a_key = "DATA_A_" + to_uppercase(tname);
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+#if 0 // qvac: FlashAttn MMQ (integer-dot) variants disabled. flash_attn_mmq_funcs.glsl
+      // references FaTypeK / FA_TYPE_* spec constants that were never ported into the
+      // qvac fork's macro-based shader dispatch, so compiling these would fail with
+      // "FaTypeK : undeclared identifier". The other integer-dot paths (mul_mat_mat_q8_1
+      // and mul_mat_vec_q8_1) are unaffected and stay enabled, which keeps the fast
+      // TQ2_0 / quant matmul path on Mali working end-to-end. The matching pipeline
+      // registration in ggml-vulkan.cpp (CREATE_FA(... _int8) / (... _fp32_int8))
+      // is gated identically.
                     // TBQ/PQ use the HAS_CENTROID_K dequant path, not the MMQ
                     // integer-dot path; mul_mmq_shmem_types.glsl has no
                     // block_a_cache definition for them.

@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "llama-cpp.h"
 
+#include <algorithm>
 #include <set>
 #include <sstream>
 #include <string>
@@ -170,8 +171,9 @@ enum common_params_sampling_config : uint64_t {
 
 enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
-    COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
+    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // simple draft-model speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // eagle3 draft-model speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // multi-token-prediction draft (requires recurrent state)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -287,6 +289,7 @@ struct common_params_sampling {
     std::vector<llama_token> reasoning_budget_start;           // start tag token sequence
     std::vector<llama_token> reasoning_budget_end;             // end tag token sequence
     std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
+    std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
 
     bool backend_sampling = false;
 
@@ -309,36 +312,20 @@ struct common_params_model {
 
 struct common_ngram_mod;
 
-struct common_params_speculative {
-    common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE; // type of speculative decoding
+struct common_params_speculative_draft {
+    int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
+    int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
-    // general-purpose speculative decoding parameters
+    float p_split = 0.1f; // speculative decoding split probability
+    float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
-    int32_t n_max   = 16; // maximum number of tokens to draft during speculative decoding
-    int32_t n_min   = 0; // minimum number of draft tokens to use for speculative decoding
-    float   p_split = 0.1f; // speculative decoding split probability
-    float   p_min   = 0.75f; // minimum speculative decoding probability (greedy)
+    bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
-    // ngram-based speculative decoding
+    common_params_model mparams;
 
-    uint16_t ngram_size_n     = 12; // ngram size for lookup
-    uint16_t ngram_size_m     = 48; // mgram size for speculative tokens
-    uint16_t ngram_min_hits   =  1; // minimum hits at ngram/mgram lookup for mgram to be proposed
+    llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_dft = nullptr;
 
-    std::shared_ptr<common_ngram_mod> ngram_mod;
-
-    std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding           // NOLINT
-    std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding          // NOLINT
-
-    // draft-model speculative decoding
-
-    struct common_params_model mparams_dft;
-
-    llama_model * model_dft = nullptr; // a llama_model that can be shared by multiple speculative contexts
-
-    llama_context_params cparams_dft; // these are the parameters for the draft llama_context
-
-    int32_t n_ctx        = 0;  // draft context size
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -349,11 +336,50 @@ struct common_params_speculative {
 
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
-    std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+};
+
+struct common_params_speculative_ngram_mod {
+    int32_t n_match = 24;
+
+    int32_t n_max = 64;
+    int32_t n_min = 48;
+};
+
+struct common_params_speculative_ngram_map {
+    uint16_t size_n   = 12; // ngram size for lookup
+    uint16_t size_m   = 48; // mgram size for speculative tokens
+    uint16_t min_hits = 1;  // minimum hits at ngram/mgram lookup for mgram to be proposed
+};
+
+struct common_params_speculative_ngram_cache {
+    std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding
+    std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
+};
+
+struct common_params_speculative {
+    std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
+
+    // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
+    common_params_speculative_draft draft;
+
+    common_params_speculative_ngram_mod ngram_mod;
+    common_params_speculative_ngram_map ngram_simple;
+    common_params_speculative_ngram_map ngram_map_k;
+    common_params_speculative_ngram_map ngram_map_k4v;
+
+    common_params_speculative_ngram_cache ngram_cache;
 
     bool has_dft() const {
-        return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();
+        return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
+    }
+
+    uint32_t need_n_rs_seq() const {
+        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        });
+
+        return needs_rs_seq ? draft.n_max : 0u;
     }
 };
 
@@ -377,6 +403,13 @@ struct common_params_diffusion {
 
     float   cfg_scale     = 0;        // classifier-free guidance scale
     bool    add_gumbel_noise = false; // add gumbel noise to the logits if temp > 0.0
+};
+
+// tile encoding mode for multi-tile vision models (e.g. Qwen3VL)
+enum common_image_tile_mode {
+    COMMON_IMAGE_TILE_MODE_BATCHED    = 0, // all tiles in one forward pass
+    COMMON_IMAGE_TILE_MODE_SEQUENTIAL = 1, // encode tiles one-by-one (default)
+    COMMON_IMAGE_TILE_MODE_DISABLED   = 2, // tiling disabled — single tile only
 };
 
 // reasoning API response format (not to be confused as chat template's reasoning format)
@@ -436,8 +469,9 @@ struct common_params {
     int32_t n_gpu_layers       = -1;   // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;    // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};  // how split tensors should be distributed across GPUs
-    bool    fit_params         = true; // whether to fit unset model/context parameters to free device memory
-    int32_t fit_params_min_ctx = 4096; // minimum context size to set when trying to reduce memory use
+    bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
+    bool    fit_params_print   = false; // print the estimated required memory to run the model
+    int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
@@ -560,6 +594,7 @@ struct common_params {
     std::vector<std::string> image; // path to image file(s)
     int image_min_tokens = -1;
     int image_max_tokens = -1;
+    common_image_tile_mode image_tile_mode = COMMON_IMAGE_TILE_MODE_SEQUENTIAL;
 
     // finetune
     struct lr_opt lr;
@@ -582,7 +617,9 @@ struct common_params {
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    clear_idle          = true;  // save and clear idle slots upon starting a new task
+    bool    cache_idle_slots    = true;  // qvac: idle-slot cache eviction
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+    int32_t checkpoint_min_step = 0;     // qvac: minimum spacing between context checkpoints in tokens (0 = no minimum)
     int32_t checkpoint_every_nt = 8192;  // make a checkpoint every n tokens during prefill
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
@@ -607,10 +644,15 @@ struct common_params {
 
     std::map<std::string, std::string> default_template_kwargs;
 
-    // webui configs
+    // webui configs (deprecated names kept for backward compat in qvac fork)
     bool webui = true;
     bool webui_mcp_proxy = false;
     std::string webui_config_json;
+
+    // new ui_* names — qvac kept both during the rename transition
+    bool ui = true;
+    bool ui_mcp_proxy = false;
+    std::string ui_config_json;
 
     // "advanced" endpoints are disabled by default for better security
     bool endpoint_slots   = true;
@@ -690,6 +732,11 @@ struct common_params {
 void common_init();
 
 std::string common_params_get_system_info(const common_params & params);
+
+// qvac: upstream b9341 added this; rebase dropped it. Logs build info, optionally
+// enumerates devices, and prints the system info string. `print_devices` should
+// be false in router/non-GPU servers to avoid creating a CUDA primary context.
+void common_params_print_info(const common_params & params, bool print_devices = true);
 
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);
@@ -834,7 +881,7 @@ struct common_sampler;
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
-    common_init_result(common_params & params);
+    common_init_result(common_params & params, bool model_only = false);
     ~common_init_result();
 
     llama_model * model();
@@ -860,7 +907,7 @@ private:
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
-common_init_result_ptr common_init_from_params(common_params & params);
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_init_result_ptr res,
                                                          common_params & params);
 common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params);
@@ -873,6 +920,58 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_p
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 
 std::string                   get_model_endpoint();
+
+//
+// Context utils
+//
+// qvac: upstream b9341 (MTP support, commit 255582687) added these but the rebase
+// silently dropped them; restored here so the server/cli/speculative-simple
+// callers compile.
+//
+
+enum common_context_seq_rm_type {
+    COMMON_CONTEXT_SEQ_RM_TYPE_NO   = 0, // seq_rm not supported (e.g. no memory module)
+    COMMON_CONTEXT_SEQ_RM_TYPE_PART = 1, // can seq_rm partial sequences
+    COMMON_CONTEXT_SEQ_RM_TYPE_FULL = 2, // can seq_rm full sequences only
+    COMMON_CONTEXT_SEQ_RM_TYPE_RS   = 3, // can seq_rm partial sequences, bounded by n_rs_seq
+};
+
+// check if the llama_context can remove sequences (clears the memory of the context as a side effect)
+common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
+
+// abort execution on failure
+void common_context_seq_rm (llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
+void common_context_seq_cp (llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
+
+//
+// Prompt checkpoints
+//
+
+struct common_prompt_checkpoint {
+    int64_t n_tokens = 0;
+
+    llama_pos pos_min = -1;
+    llama_pos pos_max = -1;
+
+    std::vector<uint8_t> data_tgt;
+    std::vector<uint8_t> data_dft;
+
+    size_t size() const;
+    bool   empty() const;
+    void   clear();
+
+    void update_pos(int64_t n_tokens, llama_pos pos_min, llama_pos pos_max);
+
+    void update_tgt(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags);
+    void update_dft(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags);
+
+    void load_tgt(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) const;
+    void load_dft(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) const;
+
+    void clear_tgt();
+    void clear_dft();
+};
 
 //
 // Batch utils

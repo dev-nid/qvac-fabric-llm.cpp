@@ -163,9 +163,21 @@ struct clip_ctx {
     int max_nodes = 8192;
     ggml_backend_sched_ptr sched;
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
+    // Whether the active backend can run GGML_OP_FLASH_ATTN_EXT at all. Probed
+    // once at warmup; in AUTO mode the per-image decision falls back to the
+    // explicit attention path when this is false.
+    bool flash_attn_supported = true;
     bool is_allocated = false;
 
+    // Inputs to the AUTO flash-attn budget decision, resolved once (getenv +
+    // Mali detection + device-memory query) and cached, since none of them
+    // change between images. Populated lazily on the first AUTO resolve.
+    bool   fa_budget_cached = false;
+    int    fa_auto_min_kv   = 0;   // explicit-attention cutoff (n_patches); <=0 disables it
+    size_t fa_mem_capacity  = 0;   // device memory used to cap the cutoff (0 = unknown)
+
     bool debug_output_embeddings = false;
+    clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_BATCHED;
 
     // When the GPU backend lacks bf16 support but the GGUF has bf16 weights,
     // we declare the in-context tensors as f16 and convert on disk-load.
@@ -238,6 +250,11 @@ struct clip_ctx {
         }
 
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
+        if (ctx_params.image_tile_mode < 0 || ctx_params.image_tile_mode > 2) {
+            GGML_ABORT("invalid image_tile_mode %d; valid: 0=batched, 1=sequential, 2=disabled",
+                       ctx_params.image_tile_mode);
+        }
+        tile_mode = static_cast<clip_image_tile_mode>(ctx_params.image_tile_mode);
     }
 
     ~clip_ctx() {
@@ -257,6 +274,107 @@ struct clip_ctx {
 // clip_graph
 //
 
+// Whether the active GPU is an Arm Mali. Mali has no cooperative-matrix units,
+// so the Vulkan flash-attention kernel runs a slow scalar path; the explicit
+// mul_mat attention is faster there for short sequences. Detected from the
+// backend device description (e.g. "Mali-G715"). Safe-fails to false (which just
+// keeps the legacy flash-attention behavior), so a missed match never crashes.
+static bool clip_backend_is_mali(const clip_ctx * ctx) {
+    if (!ctx->backend || ctx->backend == ctx->backend_cpu) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
+    if (!dev) {
+        return false;
+    }
+    const char * strs[2] = { ggml_backend_dev_description(dev), ggml_backend_dev_name(dev) };
+    for (const char * s : strs) {
+        for (; s && *s; ++s) {
+            if ((s[0] == 'M' || s[0] == 'm') && (s[1] == 'a' || s[1] == 'A') &&
+                (s[2] == 'l' || s[2] == 'L') && (s[3] == 'i' || s[3] == 'I')) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Default explicit-attention cutoff (n_patches) applied on Mali when the user
+// hasn't set MTMD_CLIP_AUTO_FA_MIN_KV. Tuned for the Gemma 4 E2B vision encoder
+// on Pixel 9 Pro: 196-tok (1764) and 400-tok (3600) use explicit, 784-tok
+// (7056) uses flash-attention (explicit would OOM there).
+static const int CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT = 4096;
+
+// Resolve the effective flash-attention mode for a single image graph.
+//
+// ENABLED/DISABLED are explicit user choices and are honored as-is. AUTO is
+// budget-aware: flash-attention is the memory-frugal path and is required for
+// long sequences, but on backends without cooperative-matrix (notably Arm
+// Mali) its scalar kernel is slower than the explicit mul_mat + softmax path
+// for short sequences. When MTMD_CLIP_AUTO_FA_MIN_KV is set (>0), AUTO uses
+// the explicit path below that attention length (n_patches) and flash-attention
+// at/above it. Unset (the default) preserves the legacy behavior: use
+// flash-attention whenever the backend supports it.
+static clip_flash_attn_type clip_resolve_flash_attn_type(clip_ctx * ctx, int n_patches) {
+    if (ctx->flash_attn_type != CLIP_FLASH_ATTN_TYPE_AUTO) {
+        return ctx->flash_attn_type;
+    }
+    if (!ctx->flash_attn_supported) {
+        return CLIP_FLASH_ATTN_TYPE_DISABLED;
+    }
+    // Resolve the budget inputs once and cache them: getenv, Mali detection and
+    // the device-memory query don't change between images, so they must not run
+    // on the per-image hot path.
+    if (!ctx->fa_budget_cached) {
+        // Explicit-attention cutoff. The env var overrides on any backend (set
+        // to 0 to disable); otherwise it defaults on for Mali (where explicit is
+        // faster) and off everywhere else (where flash-attention is better).
+        const char * env_min_kv = std::getenv("MTMD_CLIP_AUTO_FA_MIN_KV");
+        if (env_min_kv && env_min_kv[0]) {
+            ctx->fa_auto_min_kv = (int) std::strtol(env_min_kv, nullptr, 10);
+        } else {
+            ctx->fa_auto_min_kv = clip_backend_is_mali(ctx) ? CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT : 0;
+        }
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_t dev = ctx->backend ? ggml_backend_get_device(ctx->backend) : nullptr;
+        if (dev) {
+            ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        }
+        // Prefer free memory when the backend reports it; many mobile drivers
+        // report 0, so fall back to total. If neither is known, rely on the
+        // threshold alone.
+        ctx->fa_mem_capacity = free_mem > 0 ? free_mem : total_mem;
+        ctx->fa_budget_cached = true;
+    }
+
+    const int auto_fa_min_kv = ctx->fa_auto_min_kv;
+
+    // Cutoff disabled => legacy behavior: flash-attention whenever supported.
+    if (auto_fa_min_kv <= 0) {
+        return CLIP_FLASH_ATTN_TYPE_ENABLED;
+    }
+
+    // Explicit attention (mul_mat + softmax) is faster than the scalar FA kernel
+    // on no-coopmat GPUs for short sequences, but it materializes an
+    // O(n_patches^2 * n_head) score matrix. Memory-constrained devices can't
+    // hold that, so cap the "use explicit" cutoff by how much device memory is
+    // available: the effective cutoff is the smaller of the configured threshold
+    // and the largest n_patches whose explicit scratch (scores + softmax/kqv
+    // temporaries, ~3x) fits in ~half of device memory. This only ever lowers
+    // the cutoff, so low-memory devices fall back to memory-frugal FA sooner.
+    int eff_min_kv = auto_fa_min_kv;
+    const size_t capacity = ctx->fa_mem_capacity;
+    if (capacity > 0) {
+        const size_t n_head = (size_t) ctx->model.hparams.n_head;
+        // 3 * n^2 * n_head * 4 bytes <= capacity / 2  =>  n <= sqrt(capacity / (24*n_head))
+        const double n_max = std::sqrt((double) capacity / (24.0 * (double) std::max<size_t>(n_head, 1)));
+        eff_min_kv = std::min(eff_min_kv, (int) n_max);
+    }
+
+    return (n_patches < eff_min_kv) ? CLIP_FLASH_ATTN_TYPE_DISABLED
+                                    : CLIP_FLASH_ATTN_TYPE_ENABLED;
+}
+
 clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
         model(ctx->model),
         hparams(model.hparams),
@@ -273,7 +391,7 @@ clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
         n_mmproj_embd(clip_n_mmproj_embd(ctx)),
         eps(hparams.eps),
         kq_scale(1.0f / sqrtf((float)d_head)),
-        flash_attn_type(ctx->flash_attn_type) {
+        flash_attn_type(clip_resolve_flash_attn_type(ctx, n_patches)) {
     struct ggml_init_params params = {
         /*.mem_size   =*/ ctx->buf_compute_meta.size(),
         /*.mem_buffer =*/ ctx->buf_compute_meta.data(),
@@ -328,8 +446,10 @@ ggml_tensor * clip_graph::build_vit(
             norm_type norm_t,
             ffn_op_type ffn_t,
             ggml_tensor * learned_pos_embd,
-            std::function<ggml_tensor *(ggml_tensor *, const clip_layer &)> add_pos
+            std::function<ggml_tensor *(ggml_tensor *, const clip_layer &)> add_pos,
+            const build_vit_opts & opts
         ) {
+    GGML_UNUSED(opts);  // qvac: opts plumbing not yet wired through this implementation
     if (learned_pos_embd) {
         inp = ggml_add(ctx0, inp, learned_pos_embd);
         cb(inp, "pos_embed", -1);
@@ -670,7 +790,9 @@ ggml_tensor * clip_graph::build_attn(
         ggml_tensor * v_cur,
         ggml_tensor * kq_mask,
         float kq_scale,
-        int il) const {
+        int il,
+        ggml_tensor * sinks) const {
+    GGML_UNUSED(sinks);  // qvac: not used by the legacy attention path yet
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
@@ -854,9 +976,13 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
 }
 
 static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32_batch & imgs) {
-    GGML_ASSERT(imgs.entries.size() == 1 && "n_batch > 1 is not supported");
+    // Qwen3VL supports batch_size > 1 (multi-tile batching); all others are single-image only.
+    if (ctx->proj_type() != PROJECTOR_TYPE_QWEN3VL) {
+        GGML_ASSERT(imgs.entries.size() == 1 && "n_batch > 1 is not supported");
+    }
 
     const clip_image_f32 & img = *imgs.entries[0];
+    const int batch_size = (int)imgs.entries.size();
     std::unique_ptr<clip_graph> builder;
 
     switch (ctx->proj_type()) {
@@ -892,7 +1018,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             } break;
         case PROJECTOR_TYPE_QWEN3VL:
             {
-                builder = std::make_unique<clip_graph_qwen3vl>(ctx, img);
+                builder = std::make_unique<clip_graph_qwen3vl>(ctx, img, batch_size);
             } break;
         case PROJECTOR_TYPE_STEP3VL:
             {
@@ -941,7 +1067,9 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             } break;
         case PROJECTOR_TYPE_HUNYUANOCR:
             {
-                builder = std::make_unique<clip_graph_hunyuanocr>(ctx, img);
+                // qvac: upstream b9341 commit 6a257d446 merged HunyuanOCR into HunyuanVL,
+                // so the OCR path now reuses the VL graph builder.
+                builder = std::make_unique<clip_graph_hunyuanvl>(ctx, img);
             } break;
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_MLP_NORM:
@@ -1238,12 +1366,12 @@ struct clip_model_loader {
                         hparams.has_llava_projector = model.proj_type != PROJECTOR_TYPE_COGVLM;
                         hparams.image_pad_color     = {122, 116, 104};
                         if (!hparams.image_res_candidates.empty()) {
-                            hparams.image_resize_pad  = true;
+                            hparams.image_resize_pad  = PAD_CEIL;
                             hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         } else {
                             // llava-1.6 default params
-                            hparams.image_pad_ov         = false;
-                            hparams.image_pad_rf         = true;
+                            hparams.image_pad_ov         = PAD_NONE;
+                            hparams.image_pad_rf         = PAD_CEIL;
                             hparams.image_pad_color_rf   = {122, 116, 104};
                             hparams.image_resize_algo_rf = RESIZE_ALGO_BICUBIC;
                             hparams.image_resize_algo_ov = RESIZE_ALGO_BILINEAR;
@@ -1251,7 +1379,7 @@ struct clip_model_loader {
                     } break;
                 case PROJECTOR_TYPE_GLM_EDGE:
                     {
-                        hparams.image_resize_pad  = true;
+                        hparams.image_resize_pad  = PAD_CEIL;
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                     } break;
                 case PROJECTOR_TYPE_MINICPMV:
@@ -1400,9 +1528,11 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
+                        // optional multi-tile cap; absent in GGUF → stays 0 and the qwen3vl preprocessor falls back to 4
+                        get_u32(KEY_PREPROC_MAX_TILES, hparams.preproc_max_tiles, false);
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
-                        hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                        hparams.warmup_image_size = hparams.image_size; // warmup at actual tile size to match inference graph shape
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
                         if (hparams.image_min_pixels < warn_min_pixels) {
                             LOG_WRN("%s: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks\n", __func__);
@@ -1425,7 +1555,7 @@ struct clip_model_loader {
                     {
                         hparams.n_merge = 2;
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
-                        hparams.image_resize_pad  = false;
+                        hparams.image_resize_pad  = PAD_NONE;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_ATTN_WINDOW_SIZE, hparams.attn_window_size, true);
                         std::vector<int> wa_layer_indexes_vec;
@@ -2498,9 +2628,13 @@ struct clip_model_loader {
         support_info_graph info;
 
         if (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO) {
-            // try to enable flash attention to see if it's supported
+            // Probe flash-attention support by forcing it on for the warmup
+            // graph, then restore AUTO so the per-image budget heuristic in
+            // clip_resolve_flash_attn_type() decides at encode time.
             ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED;
             info = alloc_compute_meta(ctx_clip, batch);
+            ctx_clip.flash_attn_supported = info.fattn;
+            ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
             if (!info.fattn && info.fattn_op) {
                 auto op = info.fattn_op;
                 LOG_WRN("%s: *****************************************************************\n", __func__);
@@ -2518,11 +2652,12 @@ struct clip_model_loader {
                 print_shape(__func__, "src2", op->src[2]);
                 LOG_WRN("%s: please report this on github as an issue\n", __func__);
                 LOG_WRN("%s: *****************************************************************\n", __func__);
-                ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
-                alloc_compute_meta(ctx_clip, batch);
+                // re-measure with FA now resolving to DISABLED (unsupported)
+                info = alloc_compute_meta(ctx_clip, batch);
             }
         } else {
             info = alloc_compute_meta(ctx_clip, batch);
+            ctx_clip.flash_attn_supported = info.fattn;
             if (!info.fattn && ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
                 LOG_WRN("%s: flash attention is not supported by the current backend; falling back to CPU (performance will be degraded)\n", __func__);
             }
@@ -2530,8 +2665,11 @@ struct clip_model_loader {
 
         ctx_clip.is_allocated = true; // mark buffers as allocated
 
-        LOG_INF("%s: flash attention is %s\n", __func__,
-            (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) ? "enabled" : "disabled");
+        const char * fa_state =
+            ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED  ? "enabled"  :
+            ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_DISABLED ? "disabled" :
+            ctx_clip.flash_attn_supported ? "auto (per-image)" : "auto -> disabled (unsupported)";
+        LOG_INF("%s: flash attention is %s\n", __func__, fa_state);
 
         // print ops that are not supported by the GPU backend (if there is one)
         if (ctx_clip.backend && ctx_clip.backend != ctx_clip.backend_cpu) {
@@ -2981,14 +3119,33 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
             } break;
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA4V:
-        case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_INTERNVL:
-        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
         case PROJECTOR_TYPE_LLAMA4:
             {
-                // both X and Y are downscaled by the scale factor
+                // These pool/reshape per dimension (ggml_pool_2d with pad 0, or a
+                // reshape that requires divisibility), so the graph emits
+                // floor(W/p/s) * floor(H/p/s). Round per dimension to match; this
+                // differs from floor(W/p * H/p / s^2) when a side is not divisible
+                // by s, which would otherwise mismatch the actual graph output and
+                // trip the token-count sanity check in clip_image_batch_encode.
                 int scale_factor = ctx->model.hparams.n_merge;
-                n_patches /= (scale_factor * scale_factor);
+                int x_patch = (img->nx / patch_size) / scale_factor;
+                int y_patch = (img->ny / patch_size) / scale_factor;
+                n_patches = x_patch * y_patch;
+            } break;
+        case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_NEMOTRON_V2_VL:
+            {
+                // These merge via build_patch_merge_permute(), which pads each
+                // dimension up to a multiple of the scale factor (CLIP_ALIGN)
+                // before the merge, so the graph emits
+                // ceil(W/p/s) * ceil(H/p/s). Match that rounding (mirrors the
+                // LFM2/KIMIVL and PaddleOCR merge cases below); floor would
+                // under-count on non-divisible grids and trip the sanity check.
+                int scale_factor = ctx->model.hparams.n_merge;
+                int x_patch = CLIP_ALIGN(img->nx / patch_size, scale_factor) / scale_factor;
+                int y_patch = CLIP_ALIGN(img->ny / patch_size, scale_factor) / scale_factor;
+                n_patches = x_patch * y_patch;
             } break;
         case PROJECTOR_TYPE_GEMMA3NV:
             {
@@ -3126,10 +3283,58 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     const clip_image_f32_batch & imgs = *imgs_c_ptr;
     int batch_size = imgs.entries.size();
 
-    // TODO @ngxson : implement batch size > 1 as a loop
-    //                we don't need true batching support because the cgraph will gonna be big anyway
-    if (batch_size != 1) {
-        return false; // only support batch size of 1
+    if (batch_size == 0) {
+        return false;
+    }
+
+    if (batch_size != 1 && ctx->proj_type() != PROJECTOR_TYPE_QWEN3VL) {
+        // Only Qwen3VL supports multi-tile batching; all other models encode one image at a time
+        return false;
+    }
+
+    LOG_INF("%s: encoding %d tile(s), grid=%dx%d, tile_size=%dx%d\n", __func__,
+            batch_size,
+            imgs.grid_x, imgs.grid_y,
+            batch_size > 0 ? (int)imgs.entries[0]->nx : 0,
+            batch_size > 0 ? (int)imgs.entries[0]->ny : 0);
+
+    // Validate that all tiles share the same dimensions; logs an error and returns false if not.
+    auto validate_tile_sizes = [&](const char * tag) -> bool {
+        const int tile_nx = imgs.entries[0]->nx;
+        const int tile_ny = imgs.entries[0]->ny;
+        for (int b = 1; b < batch_size; b++) {
+            if (imgs.entries[b]->nx != tile_nx || imgs.entries[b]->ny != tile_ny) {
+                LOG_ERR("%s: %s tile %d size %dx%d != expected %dx%d; all tiles must be the same size\n",
+                        __func__, tag, b, imgs.entries[b]->nx, imgs.entries[b]->ny, tile_nx, tile_ny);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Encode tiles one by one. Used for SEQUENTIAL tile mode and as OOM fallback from BATCHED mode.
+    auto do_encode_sequential = [&]() -> bool {
+        if (!validate_tile_sizes("sequential mode")) { return false; }
+        const int n_tokens_per_tile = clip_n_output_tokens(ctx, imgs.entries[0].get());
+        const int out_embd           = clip_n_mmproj_embd(ctx);
+        float * out_ptr = vec;
+        for (int b = 0; b < batch_size; b++) {
+            clip_image_f32_batch single;
+            single.entries.emplace_back(new clip_image_f32(*imgs.entries[b]));
+            single.grid_x = 1;
+            single.grid_y = 1;
+            bool ok = clip_image_batch_encode(ctx, n_threads, &single, out_ptr);
+            if (!ok) return false;
+            if (out_ptr != nullptr) {
+                out_ptr += (size_t)n_tokens_per_tile * out_embd;
+            }
+        }
+        return true;
+    };
+
+    // Explicit sequential mode.
+    if (batch_size > 1 && ctx->tile_mode == CLIP_IMAGE_TILE_MODE_SEQUENTIAL) {
+        return do_encode_sequential();
     }
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
@@ -3140,7 +3345,39 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_image_build_graph(ctx, imgs);
-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+        // The explicit-attention path that AUTO selects for short sequences needs
+        // O(n_patches^2) scratch and can OOM on memory-constrained devices. If
+        // flash-attention is available, rebuild this image with FA (which never
+        // materializes the full scores) and retry before falling back to slower
+        // sequential tiling. This is a no-op when FA was already the chosen path.
+        bool allocated = false;
+        if (ctx->flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO && ctx->flash_attn_supported) {
+            LOG_WRN("%s: explicit-attention graph alloc failed (OOM); retrying with flash-attention\n", __func__);
+            const clip_flash_attn_type saved = ctx->flash_attn_type;
+            ctx->flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED; // force FA for this rebuild
+            ggml_backend_sched_reset(ctx->sched.get());
+            gf = clip_image_build_graph(ctx, imgs);
+            allocated = ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+            ctx->flash_attn_type = saved; // restore AUTO for subsequent images
+        }
+        if (!allocated) {
+            // Still failing (or FA unavailable) — fall back to sequential. We
+            // already know the batched explicit path OOMs here, so force
+            // flash-attention (the memory-frugal path) for the whole sequential
+            // run when it's supported; otherwise each tile would re-resolve to
+            // explicit, re-OOM and rebuild (up to N x2 allocations). Restore the
+            // prior mode afterwards for subsequent images.
+            LOG_WRN("%s: graph alloc failed (OOM), retrying with sequential encoding\n", __func__);
+            const clip_flash_attn_type saved = ctx->flash_attn_type;
+            if (ctx->flash_attn_supported) {
+                ctx->flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED;
+            }
+            const bool ok = do_encode_sequential();
+            ctx->flash_attn_type = saved;
+            return ok;
+        }
+    }
 
     // set inputs
     const auto & model   = ctx->model;
@@ -3185,7 +3422,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     if (!imgs.is_audio) {
         size_t nelem = 0;
         for (const auto & img : imgs.entries) {
-            nelem += img->nx * img->ny * 3;
+            nelem += (size_t)img->nx * (size_t)img->ny * 3;
         }
         std::vector<float> inp_raw(nelem);
 
@@ -3200,21 +3437,22 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         // └─────┘ │
         //   ──────┘ x B
 
-        for (size_t i = 0; i < imgs.entries.size(); i++) {
-            const int nx = imgs.entries[i]->nx;
-            const int ny = imgs.entries[i]->ny;
-            const int n = nx * ny;
-
-            for (int b = 0; b < batch_size; b++) {
-                float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x); // idx of the first channel
-                        size_t base_dst =    y * nx + x;  // idx of the first channel
-                        batch_entry[      base_dst] = imgs.entries[b]->buf[base_src    ];
-                        batch_entry[1*n + base_dst] = imgs.entries[b]->buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = imgs.entries[b]->buf[base_src + 2];
-                    }
+        // Layout: [nx, ny, 3, batch_size] — channel-first per tile, tiles packed along last dim.
+        // All tiles must be the same size (ensured by the Qwen3VL tiling preprocessor).
+        GGML_ASSERT(batch_size > 0);
+        if (!validate_tile_sizes("batched")) { return false; }
+        for (int b = 0; b < batch_size; b++) {
+            const int    nx = imgs.entries[b]->nx;
+            const int    ny = imgs.entries[b]->ny;
+            const size_t n  = (size_t)nx * (size_t)ny;
+            float * tile_entry = inp_raw.data() + (size_t)b * 3 * n;
+            for (int y = 0; y < ny; y++) {
+                for (int x = 0; x < nx; x++) {
+                    size_t base_src = 3 * (y * nx + x);
+                    size_t base_dst =      y * nx + x;
+                    tile_entry[      base_dst] = imgs.entries[b]->buf[base_src    ];
+                    tile_entry[1*n + base_dst] = imgs.entries[b]->buf[base_src + 1];
+                    tile_entry[2*n + base_dst] = imgs.entries[b]->buf[base_src + 2];
                 }
             }
         }
@@ -3278,7 +3516,6 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 set_input_f32("omega", omega);
             } break;
         case PROJECTOR_TYPE_QWEN2VL:
-        case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_GLM4V:
             {
                 const int merge_ratio = hparams.n_merge;
@@ -3295,6 +3532,45 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                                 positions[2 * num_patches + ptr] = y + dy;
                                 positions[3 * num_patches + ptr] = x + dx;
                                 ptr++;
+                            }
+                        }
+                    }
+                }
+
+                set_input_i32("positions", positions);
+            } break;
+        case PROJECTOR_TYPE_QWEN3VL:
+            {
+                // Per-tile M-RoPE positions use *local* patch coordinates (origin at each tile's
+                // top-left). Attention is computed per-tile and RoPE scores depend only on the
+                // relative position pos_i - pos_j, so any per-tile absolute offset would cancel
+                // exactly and have no effect on the encoder. Every tile therefore gets the same
+                // local-coordinate block. Absolute tile placement reaches the LM via decoder
+                // positions (mtmd_image_tokens_get_decoder_pos in mtmd.cpp), not here.
+                const int merge_ratio  = hparams.n_merge;
+                GGML_ASSERT(merge_ratio > 0);
+                const int pw           = image_size_width  / patch_size; // per-tile width in patches
+                const int ph           = image_size_height / patch_size; // per-tile height in patches
+                GGML_ASSERT(pw % merge_ratio == 0 && ph % merge_ratio == 0 &&
+                            "tile dimensions must be divisible by n_merge");
+                const int n_pos_tile   = pw * ph; // raw patches per tile == n_patches (graph sequence length)
+                // positions layout: tile-major [tile0: y,x,y,x | tile1: y,x,y,x
+                // | ...] each tile's block starts at b * n_pos_tile * 4
+                // (matches ggml_view_1d in graph)
+                std::vector<int32_t> positions((size_t)n_pos_tile * (size_t)batch_size * 4);
+                for (int b = 0; b < batch_size; b++) {
+                    const size_t base  = (size_t)b * (size_t)n_pos_tile * 4;
+                    int ptr = 0;
+                    for (int y = 0; y < ph; y += merge_ratio) {
+                        for (int x = 0; x < pw; x += merge_ratio) {
+                            for (int dy = 0; dy < merge_ratio; dy++) {
+                                for (int dx = 0; dx < merge_ratio; dx++) {
+                                    positions[base + ptr]                          = y + dy;
+                                    positions[base + (size_t)n_pos_tile + ptr]     = x + dx;
+                                    positions[base + (size_t)2 * n_pos_tile + ptr] = y + dy;
+                                    positions[base + (size_t)3 * n_pos_tile + ptr] = x + dx;
+                                    ptr++;
+                                }
                             }
                         }
                     }
@@ -3660,11 +3936,11 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     // the last node is the embedding tensor
     ggml_tensor * embeddings = ggml_graph_node(gf, -1);
 
-    // sanity check (only support batch size of 1 for now)
+    // sanity check: ne[1] = tokens per tile, ne[2] = batch_size (1 for non-batched models)
     const int n_tokens_out = embeddings->ne[1];
     const int expected_n_tokens_out = clip_n_output_tokens(ctx, imgs.entries[0].get());
     if (n_tokens_out != expected_n_tokens_out) {
-        LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
+        LOG_ERR("%s: expected output %d tokens (per tile), got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
         GGML_ABORT("Invalid number of output tokens");
     }
 
@@ -3675,13 +3951,14 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
     // Debug: dump final embeddings if MTMD_DEBUG_EMBEDDINGS is set
     if (ctx->debug_output_embeddings) {
-        const int64_t n_embd = embeddings->ne[0];
-        const int64_t n_tokens = embeddings->ne[1];
-        std::vector<float> emb_data(n_embd * n_tokens);
+        const int64_t n_embd   = embeddings->ne[0];
+        const int64_t n_tokens = embeddings->ne[1]; // per tile
+        const int64_t n_tiles  = embeddings->ne[2]; // batch_size (1 for non-batched models)
+        std::vector<float> emb_data(n_embd * n_tokens * n_tiles);
         ggml_backend_tensor_get(embeddings, emb_data.data(), 0, ggml_nbytes(embeddings));
 
         LOG_INF("\n=== MTMD_DEBUG_EMBEDDINGS ===\n");
-        LOG_INF("Shape: [%lld, %lld]\n", (long long)n_embd, (long long)n_tokens);
+        LOG_INF("Shape: [%lld, %lld, %lld]\n", (long long)n_embd, (long long)n_tokens, (long long)n_tiles);
 
         // Print first few values of first token
         LOG_INF("Token 0 (first 16 values): ");
@@ -3815,6 +4092,42 @@ bool clip_has_audio_encoder(const struct clip_ctx * ctx) {
     return ctx->model.modality == CLIP_MODALITY_AUDIO;
 }
 
+// qvac: per-device memory accounting for an initialised clip context. Combines
+// the weight buffer (ctx->buf) with the scheduler's compute reservation for
+// each backend in ctx->backend_ptrs. Mirrors the upstream b9341
+// `clip_get_mem_usage` whose body relied on cached mem_usage/mem_compute maps
+// that don't exist in the qvac fork — here we read the same data live from
+// the backend buffer and sched APIs.
+std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx) {
+    std::map<ggml_backend_dev_t, size_t> result;
+    if (ctx == nullptr) {
+        return result;
+    }
+
+    // weight buffer
+    if (ctx->buf) {
+        ggml_backend_buffer_t buf = ctx->buf.get();
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev != nullptr) {
+            result[dev] += ggml_backend_buffer_get_size(buf);
+        }
+    }
+
+    // compute reservations (per backend tracked by the scheduler)
+    if (ctx->sched) {
+        for (ggml_backend_t backend : ctx->backend_ptrs) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            if (dev == nullptr) continue;
+            const size_t sz = ggml_backend_sched_get_buffer_size(ctx->sched.get(), backend);
+            if (sz > 0) {
+                result[dev] += sz;
+            }
+        }
+    }
+    return result;
+}
+
 bool clip_has_whisper_encoder(const struct clip_ctx * ctx) {
     switch (ctx->proj_type()) {
         case PROJECTOR_TYPE_ULTRAVOX:
@@ -3864,6 +4177,10 @@ void clip_image_f32_batch_add_mel(struct clip_image_f32_batch * batch, int n_mel
 
 const clip_hparams * clip_get_hparams(const struct clip_ctx * ctx) {
     return &ctx->model.hparams;
+}
+
+clip_image_tile_mode clip_get_tile_mode(const struct clip_ctx * ctx) {
+    return ctx->tile_mode;
 }
 
 //

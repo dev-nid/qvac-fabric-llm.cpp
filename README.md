@@ -3,7 +3,7 @@
 **AI inference and training engine for desktop and mobile platforms.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Based on llama.cpp](https://img.shields.io/badge/based%20on-llama.cpp%20b7248-orange.svg)](https://github.com/ggml-org/llama.cpp)
+[![Based on llama.cpp](https://img.shields.io/badge/based%20on-llama.cpp%20b9341-orange.svg)](https://github.com/ggml-org/llama.cpp)
 
 `qvac-fabric-llm.cpp` is a specialized fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) optimized for embedded systems, mobile devices, and enterprise deployment scenarios. It extends the excellent foundation of llama.cpp with additional capabilities focused on low-bit KV-cache quantization, mobile GPU optimization, and flexible integration patterns.
 
@@ -120,7 +120,7 @@ For more detailed build instructions, see [docs/build.md](docs/build.md).
 
 qvac-fabric-llm.cpp is a maintained fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). The project regularly synchronizes with upstream releases to incorporate improvements, bug fixes, and new model support, while extending the engine with capabilities not present in the upstream project.
 
-**Current upstream baseline:** llama.cpp b7248
+**Current upstream baseline:** llama.cpp b9341
 
 ### Exclusive Features
 

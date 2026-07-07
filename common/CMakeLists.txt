@@ -40,6 +40,10 @@ add_library(${TARGET} OBJECT ${OUTPUT_FILE})
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
+# qvac: the generated build-info.cpp lives under ${CMAKE_CURRENT_BINARY_DIR}, so
+# CMake didn't pick up the sibling build-info.h from the source tree without an
+# explicit include path. The rebase onto upstream b9341 dropped these.
+target_include_directories(${TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 set(TARGET common)
 
@@ -53,6 +57,7 @@ set(${TARGET}_HEADERS
   console.h
   debug.h
   download.h
+  fit.h   # qvac: declarations for the fit helpers (memory_breakdown_print, get_device_memory_data)
   hf-cache.h
   http.h
   json-partial.h
@@ -94,6 +99,7 @@ add_library(${TARGET} STATIC
     console.cpp
     debug.cpp
     download.cpp
+    fit.cpp   # qvac: common_memory_breakdown_print / common_get_device_memory_data live here; was missing from this list after the rebase
     hf-cache.cpp
     json-partial.cpp
     json-schema-to-grammar.cpp
@@ -173,6 +179,13 @@ target_include_directories(
 
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
+
+# qvac: rebase onto upstream b9341 renamed the common target to `llama-common`.
+# Keep both names addressable so qvac-side CMakeLists (target `common`) and
+# upstream/example/tool CMakeLists (target `llama-common`) both link.
+if (NOT TARGET llama-common)
+    add_library(llama-common ALIAS ${TARGET})
+endif()
 
 
 #

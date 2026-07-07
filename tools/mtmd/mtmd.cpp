@@ -34,11 +34,14 @@ struct mtmd_bitmap {
 };
 
 struct mtmd_image_tokens {
-    uint32_t nx; // number of tokens in x direction
-    uint32_t ny; // number of tokens in y direction
+    uint32_t nx; // number of tokens in x direction (full image, across all tiles)
+    uint32_t ny; // number of tokens in y direction (full image, across all tiles)
     bool use_mrope_pos = false; // use M-RoPE position counting (the whole image is 1 temporal position)
+    // tile grid dimensions (1×1 means no tiling; used for decoder position mapping)
+    uint32_t grid_x = 1;
+    uint32_t grid_y = 1;
     uint32_t n_tokens() const { return nx * ny; }
-    clip_image_f32_batch batch_f32; // preprocessed image patches
+    clip_image_f32_batch batch_f32; // preprocessed image patches (one entry per tile)
     std::string id; // optional user-defined ID, useful for KV cache tracking
 
     mtmd_image_tokens clone() {
@@ -46,6 +49,8 @@ struct mtmd_image_tokens {
             nx,
             ny,
             use_mrope_pos,
+            grid_x,
+            grid_y,
             batch_f32.clone(),
             id
         };
@@ -118,6 +123,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* cb_eval           */ nullptr,
         /* cb_eval_user_data */ nullptr,
         /* backend_device    */ nullptr,
+        /* image_tile_mode   */ 1, // 0=batched, 1=sequential (default), 2=disabled
     };
     return params;
 }
@@ -188,6 +194,7 @@ struct mtmd_context {
             /* cb_eval           */ ctx_params.cb_eval,
             /* cb_eval_user_data */ ctx_params.cb_eval_user_data,
             /* backend_device    */ ctx_params.backend_device,
+            /* image_tile_mode   */ ctx_params.image_tile_mode,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
@@ -282,12 +289,28 @@ struct mtmd_context {
                 } break;
             case PROJECTOR_TYPE_QWEN2VL:
             case PROJECTOR_TYPE_QWEN25VL:
-            case PROJECTOR_TYPE_QWEN3VL:
                 {
                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>
                     img_beg = "<|vision_start|>";
                     img_end = "<|vision_end|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_QWEN3VL:
+                {
+                    // <|vision_start|> ... (image embeddings) ... <|vision_end|>
+                    img_beg = "<|vision_start|>";
+                    img_end = "<|vision_end|>";
+                    // disabled mode replicates pre-PR behaviour: whole image resized to fit
+                    // image_max_pixels (dyn_size), no tiling.
+                    const clip_image_tile_mode tile_mode_val = clip_get_tile_mode(ctx_v);
+                    if (tile_mode_val == CLIP_IMAGE_TILE_MODE_DISABLED) {
+                        LOG_INF("%s: image_tile_mode: disabled\n", __func__);
+                        image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    } else {
+                        LOG_INF("%s: image_tile_mode: %s\n", __func__,
+                                tile_mode_val == CLIP_IMAGE_TILE_MODE_BATCHED ? "batched" : "sequential");
+                        image_preproc = std::make_unique<mtmd_image_preprocessor_qwen3vl>(ctx_v);
+                    }
                 } break;
             case PROJECTOR_TYPE_YOUTUVL:
                 {
@@ -572,6 +595,74 @@ void mtmd_log_set_llama_callback(ggml_log_callback llama_cb, void * llama_user_d
     clip_log_set_callback(llama_cb, llama_user_data);
 }
 
+// qvac: light-weight mmproj capability probe used by the server. The previous
+// implementation relied on a `clip_get_cap` helper that hasn't been ported yet
+// from upstream b9341. Fall back to a full clip_init load so the server can
+// still detect vision/audio capability — slightly heavier than the upstream
+// metadata-only path, but functionally correct.
+struct mtmd_caps mtmd_get_cap_from_file(const char * fname) {
+    mtmd_caps cap{ false, false };
+    try {
+        clip_context_params cp{};
+        cp.use_gpu          = false;
+        cp.flash_attn_type  = CLIP_FLASH_ATTN_TYPE_DISABLED;
+        cp.image_min_tokens = -1;
+        cp.image_max_tokens = -1;
+        cp.warmup           = false;
+        cp.has_bf16_weights = false;
+        cp.cb_eval          = nullptr;
+        cp.cb_eval_user_data= nullptr;
+        cp.backend_device   = nullptr;
+        clip_init_result init = clip_init(fname, cp);
+        if (init.ctx_v != nullptr) {
+            cap.inp_vision = clip_has_vision_encoder(init.ctx_v);
+            clip_free(init.ctx_v);
+        }
+        if (init.ctx_a != nullptr) {
+            cap.inp_audio = clip_has_audio_encoder(init.ctx_a);
+            clip_free(init.ctx_a);
+        }
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: failed to get capabilities from file '%s': %s\n", __func__, fname, e.what());
+    }
+    return cap;
+}
+
+// qvac: per-device memory footprint of an mmproj. Ports upstream b9341 — opens
+// a temporary mtmd_context from the mmproj file (no text model, so we don't
+// need n_embd_text), then sums weight+compute memory from the vision and audio
+// clip contexts via clip_get_mem_usage.
+std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(
+        const char * mmproj_fname,
+        struct mtmd_context_params ctx_params) {
+    std::map<ggml_backend_dev_t, size_t> total_mem;
+    try {
+        clip_context_params cp{};
+        cp.use_gpu          = ctx_params.use_gpu;
+        cp.flash_attn_type  = CLIP_FLASH_ATTN_TYPE_DISABLED;
+        cp.image_min_tokens = ctx_params.image_min_tokens;
+        cp.image_max_tokens = ctx_params.image_max_tokens;
+        cp.warmup           = false;
+        cp.has_bf16_weights = false;
+        cp.cb_eval          = nullptr;
+        cp.cb_eval_user_data= nullptr;
+        cp.backend_device   = nullptr;
+        clip_init_result init = clip_init(mmproj_fname, cp);
+        auto merge = [&](struct clip_ctx * c) {
+            if (c == nullptr) return;
+            for (const auto & [dev, size] : clip_get_mem_usage(c)) {
+                total_mem[dev] += size;
+            }
+            clip_free(c);
+        };
+        merge(init.ctx_v);
+        merge(init.ctx_a);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: error querying mmproj '%s': %s\n", __func__, mmproj_fname, e.what());
+    }
+    return total_mem;
+}
+
 struct mtmd_tokenizer {
     mtmd_context * ctx;
     std::vector<const mtmd_bitmap *> bitmaps;
@@ -774,36 +865,61 @@ struct mtmd_tokenizer {
                 }
 
             } else {
-                size_t n_tokens = 0;
-                for (const auto & entry : batch_f32.entries) {
-                    n_tokens += clip_n_output_tokens(ctx->ctx_v, entry.get());
-                }
+                // Build one image chunk from a batch with explicit grid dims, then append it.
+                auto emit_image_chunk = [&](clip_image_f32_batch && b, int gx, int gy) {
+                    size_t n_tokens = 0;
+                    for (const auto & entry : b.entries) {
+                        n_tokens += clip_n_output_tokens(ctx->ctx_v, entry.get());
+                    }
 
-                mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
-                if (mtmd_decode_use_mrope(ctx)) {
-                    // for Qwen2VL, we need this information for M-RoPE decoding positions
-                    image_tokens->nx = clip_n_output_tokens_x(ctx->ctx_v, batch_f32.entries[0].get());
-                    image_tokens->ny = clip_n_output_tokens_y(ctx->ctx_v, batch_f32.entries[0].get());
-                    image_tokens->use_mrope_pos = true;
-                } else {
-                    // other models, we only need the total number of tokens
-                    image_tokens->nx = n_tokens;
-                    image_tokens->ny = 1;
-                }
-                image_tokens->batch_f32 = std::move(batch_f32);
-                image_tokens->id = bitmap->id; // optional
+                    mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+                    if (mtmd_decode_use_mrope(ctx)) {
+                        // for Qwen2VL/Qwen3VL, set full-image grid dims for M-RoPE decoding
+                        const int tile_nx = clip_n_output_tokens_x(ctx->ctx_v, b.entries[0].get());
+                        const int tile_ny = clip_n_output_tokens_y(ctx->ctx_v, b.entries[0].get());
+                        image_tokens->nx     = tile_nx * gx;
+                        image_tokens->ny     = tile_ny * gy;
+                        image_tokens->grid_x = gx;
+                        image_tokens->grid_y = gy;
+                        image_tokens->use_mrope_pos = true;
+                    } else {
+                        // other models, we only need the total number of tokens
+                        image_tokens->nx = n_tokens;
+                        image_tokens->ny = 1;
+                    }
+                    image_tokens->batch_f32 = std::move(b);
+                    image_tokens->id = bitmap->id; // optional
 
-                LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
-                LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
-                LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
+                    LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
+                    LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
+                    LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
 
-                mtmd_input_chunk chunk{
-                    MTMD_INPUT_CHUNK_TYPE_IMAGE,
-                    {}, // text tokens
-                    std::move(image_tokens),
-                    nullptr, // audio tokens
+                    mtmd_input_chunk chunk{
+                        MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                        {}, // text tokens
+                        std::move(image_tokens),
+                        nullptr, // audio tokens
+                    };
+                    cur.entries.emplace_back(std::move(chunk));
                 };
-                cur.entries.emplace_back(std::move(chunk));
+
+                const int gx = batch_f32.grid_x > 0 ? batch_f32.grid_x : 1;
+                const int gy = batch_f32.grid_y > 0 ? batch_f32.grid_y : 1;
+                if (batch_f32.has_overview) {
+                    // Qwen3VL multi-tile with a global overview: emit the downscaled full image
+                    // (entries[0]) as its own 1×1 chunk first, then the tile grid as a second chunk.
+                    GGML_ASSERT(!batch_f32.entries.empty());
+                    clip_image_f32_batch ov_batch;
+                    ov_batch.entries.push_back(std::move(batch_f32.entries.front()));
+                    batch_f32.entries.erase(batch_f32.entries.begin());
+                    batch_f32.has_overview = false; // overview consumed; entries[0] is now a tile
+                    GGML_ASSERT((int) batch_f32.entries.size() == gx * gy &&
+                                "overview split left an unexpected tile count");
+                    emit_image_chunk(std::move(ov_batch), 1, 1);
+                    emit_image_chunk(std::move(batch_f32), gx, gy);
+                } else {
+                    emit_image_chunk(std::move(batch_f32), gx, gy);
+                }
             }
 
             if (!ctx->img_end.empty()) {
@@ -1021,7 +1137,10 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
     return ctx->image_embd_v.data();
 }
 
-bool mtmd_decode_use_non_causal(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
+// qvac: const-qualifiers updated to match the declarations in mtmd.h. The
+// previous non-const signatures caused link failures because the public API
+// shape (declared via extern "C" in the header) didn't match what we emitted.
+bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk) {
     auto proj_type = ctx->proj_type_v();
     if (chunk && chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         proj_type = ctx->proj_type_a();
@@ -1035,7 +1154,7 @@ bool mtmd_decode_use_non_causal(mtmd_context * ctx, const mtmd_input_chunk * chu
     }
 }
 
-bool mtmd_decode_use_mrope(mtmd_context * ctx) {
+bool mtmd_decode_use_mrope(const mtmd_context * ctx) {
     if (ctx->ctx_v == nullptr && ctx->proj_type_a() == PROJECTOR_TYPE_QWEN3A) {
         // qwen3-asr
         return true;
@@ -1052,15 +1171,15 @@ bool mtmd_decode_use_mrope(mtmd_context * ctx) {
     }
 }
 
-bool mtmd_support_vision(mtmd_context * ctx) {
+bool mtmd_support_vision(const mtmd_context * ctx) {
     return ctx->ctx_v != nullptr;
 }
 
-bool mtmd_support_audio(mtmd_context * ctx) {
+bool mtmd_support_audio(const mtmd_context * ctx) {
     return ctx->ctx_a != nullptr;
 }
 
-int mtmd_get_audio_sample_rate(mtmd_context * ctx) {
+int mtmd_get_audio_sample_rate(const mtmd_context * ctx) {
     if (!ctx->ctx_a) {
         return -1;
     }
@@ -1253,11 +1372,50 @@ size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens) {
     return image_tokens->ny;
 }
 
-mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, size_t i) {
+mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, llama_pos pos_0, size_t i) {
+    // M-RoPE: the whole image shares one temporal position (pos_0) and occupies
+    // a 2D grid in the spatial (y,x) dimensions, each offset by pos_0. This must
+    // stay consistent with mtmd_image_tokens_get_n_pos() == max(nx, ny): the
+    // largest position written here is pos_0 + max(nx,ny) - 1, so the following
+    // text chunk (which starts at pos_0 + n_pos) satisfies the M-RoPE memory
+    // invariant X < Y. The previous code set t = pos_0 + i (sequential), which
+    // overshot to pos_0 + n_tokens - 1 for multi-row images (ny > 1, e.g.
+    // PaddleOCR-VL) and made llama_decode reject the next text chunk. z was also
+    // left uninitialized.
     mtmd_decoder_pos pos;
-    pos.t = 0;
-    pos.x = i % image_tokens->nx;
-    pos.y = i / image_tokens->nx;
+    pos.t = static_cast<uint32_t>(pos_0);
+    pos.z = 0;
+
+    if (image_tokens->grid_x <= 1 && image_tokens->grid_y <= 1) {
+        // no tiling — simple scan-line order
+        pos.x = static_cast<uint32_t>(pos_0) + static_cast<uint32_t>(i % image_tokens->nx);
+        pos.y = static_cast<uint32_t>(pos_0) + static_cast<uint32_t>(i / image_tokens->nx);
+    } else {
+        // tile-major order: tokens are laid out as all tokens of tile 0, then tile 1, etc.
+        // tile 0 = (row=0,col=0), tile 1 = (row=0,col=1), ..., tile grid_x = (row=1,col=0)
+        if (image_tokens->grid_x == 0 || image_tokens->grid_y == 0) {
+            GGML_ABORT("image token grid is zero: grid_x=%u grid_y=%u",
+                       image_tokens->grid_x, image_tokens->grid_y);
+        }
+        if (image_tokens->nx % image_tokens->grid_x != 0 || image_tokens->ny % image_tokens->grid_y != 0) {
+            GGML_ABORT("image token grid mismatch: nx=%u grid_x=%u, ny=%u grid_y=%u",
+                       image_tokens->nx, image_tokens->grid_x, image_tokens->ny, image_tokens->grid_y);
+        }
+        const uint32_t pw = image_tokens->nx / image_tokens->grid_x; // merged patches per tile in X
+        const uint32_t ph = image_tokens->ny / image_tokens->grid_y; // merged patches per tile in Y
+        const uint32_t n_per_tile = pw * ph;
+        if (n_per_tile == 0) {
+            GGML_ABORT("image tile has zero tokens: pw=%u ph=%u", pw, ph);
+        }
+        const uint32_t tile_idx   = i / n_per_tile;
+        const uint32_t local_idx  = i % n_per_tile;
+        const uint32_t tr = tile_idx / image_tokens->grid_x;
+        const uint32_t tc = tile_idx % image_tokens->grid_x;
+        const uint32_t ly = local_idx / pw;
+        const uint32_t lx = local_idx % pw;
+        pos.y = static_cast<uint32_t>(pos_0) + tr * ph + ly;
+        pos.x = static_cast<uint32_t>(pos_0) + tc * pw + lx;
+    }
     return pos;
 }
 

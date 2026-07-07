@@ -377,6 +377,31 @@ void common_init() {
     LOG_DBG("build: %d (%s) with %s for %s%s\n", LLAMA_BUILD_NUMBER, LLAMA_COMMIT, LLAMA_COMPILER, LLAMA_BUILD_TARGET, build_type);
 }
 
+// qvac: upstream b9341 — logs build info and (optionally) device list. The
+// rebase silently dropped this; restored so tools/server compiles.
+void common_params_print_info(const common_params & params, bool print_devices) {
+#ifdef NDEBUG
+    const char * build_type = "";
+#else
+    const char * build_type = " (debug)";
+#endif
+    LOG_INF("build: %d (%s) with %s for %s%s\n",
+            LLAMA_BUILD_NUMBER, LLAMA_COMMIT, LLAMA_COMPILER, LLAMA_BUILD_TARGET, build_type);
+
+    if (print_devices) {
+        LOG_INF("device_info:\n");
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            auto * dev = ggml_backend_dev_get(i);
+            size_t free, total;
+            ggml_backend_dev_memory(dev, &free, &total);
+            LOG_INF("  - %-8s: %s (%zu MiB, %zu MiB free)\n",
+                    ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                    total / 1024 / 1024, free / 1024 / 1024);
+        }
+    }
+    LOG_INF("%s\n", common_params_get_system_info(params).c_str());
+}
+
 std::string common_params_get_system_info(const common_params & params) {
     std::ostringstream os;
 
@@ -1143,7 +1168,7 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result() : pimpl(new impl{}) {}
 
-common_init_result::common_init_result(common_params & params) :
+common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -1164,6 +1189,10 @@ common_init_result::common_init_result(common_params & params) :
     }
 
     pimpl->model.reset(model);
+
+    if (model_only) {
+        return;
+    }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -1377,12 +1406,16 @@ common_init_result_ptr common_init_from_model_and_params(llama_model* model, com
 
 common_init_result::~common_init_result() = default;
 
-common_init_result_ptr common_init_from_params(common_params & params) {
-    common_init_result_ptr res(new common_init_result(params));
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
     if (model == NULL) {
         LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
         return res;
     }
 
@@ -1486,6 +1519,141 @@ std::string get_model_endpoint() {
         }
     }
     return model_endpoint;
+}
+
+// qvac: upstream b9341 (MTP support, 255582687) added these. The rebase silently
+// dropped them; restored here so the server/cli/speculative-simple callers link.
+
+common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
+    auto * mem = llama_get_memory(ctx);
+    if (mem == nullptr) {
+        return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    }
+
+    common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+
+    llama_memory_clear(mem, true);
+
+    // eval 2 tokens to check if the context is compatible
+    std::vector<llama_token> tmp;
+    tmp.push_back(0);
+    tmp.push_back(0);
+
+    int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
+    if (ret != 0) {
+        LOG_ERR("%s: llama_decode() failed: %d\n", __func__, ret);
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        goto done;
+    }
+
+    if (llama_n_rs_seq(ctx) > 0) {
+        LOG_INF("%s: the context supports bounded partial sequence removal\n", __func__);
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+        goto done;
+    }
+
+    if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
+        LOG_DBG("%s: the context does not support partial sequence removal\n", __func__);
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+        goto done;
+    }
+
+done:
+    llama_memory_clear(mem, true);
+    llama_synchronize(ctx);
+
+    return res;
+}
+
+void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    auto * mem = llama_get_memory(ctx);
+    if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
+        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
+    }
+}
+
+void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    auto * mem = llama_get_memory(ctx);
+    llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
+}
+
+void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+    auto * mem = llama_get_memory(ctx);
+    llama_memory_seq_add(mem, seq_id, p0, p1, delta);
+}
+
+size_t common_prompt_checkpoint::size() const {
+    return data_tgt.size() + data_dft.size();
+}
+
+bool common_prompt_checkpoint::empty() const {
+    return data_tgt.empty();
+}
+
+void common_prompt_checkpoint::clear() {
+    n_tokens = 0;
+    pos_min  = 0;
+    pos_max  = 0;
+    data_tgt.clear();
+    data_dft.clear();
+}
+
+void common_prompt_checkpoint::update_pos(int64_t n_tokens, llama_pos pos_min, llama_pos pos_max) {
+    this->n_tokens = n_tokens;
+    this->pos_min  = pos_min;
+    this->pos_max  = pos_max;
+}
+
+void common_prompt_checkpoint::update_tgt(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (ctx == nullptr) {
+        return;
+    }
+    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    data_tgt.resize(ckpt_size);
+    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    if (n != ckpt_size) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    }
+}
+
+void common_prompt_checkpoint::update_dft(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (ctx == nullptr) {
+        return;
+    }
+    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    data_dft.resize(ckpt_size);
+    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    if (n != ckpt_size) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    }
+}
+
+void common_prompt_checkpoint::load_tgt(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (ctx == nullptr || data_tgt.empty()) {
+        return;
+    }
+    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
+    if (n != data_tgt.size()) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
+    }
+}
+
+void common_prompt_checkpoint::load_dft(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (ctx == nullptr || data_dft.empty()) {
+        return;
+    }
+    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
+    if (n != data_dft.size()) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
+    }
+}
+
+void common_prompt_checkpoint::clear_tgt() {
+    data_tgt.clear();
+}
+
+void common_prompt_checkpoint::clear_dft() {
+    data_dft.clear();
 }
 
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
