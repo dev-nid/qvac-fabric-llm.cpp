@@ -397,6 +397,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TBQ3_0,
+    GGML_TYPE_TBQ4_0,
+    GGML_TYPE_PQ3_0,
+    GGML_TYPE_PQ4_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2221,6 +2225,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
+        {"--mmproj-backend"}, "NAME",
+        "GPU backend for multimodal projector (e.g. CUDA, Metal, Vulkan)\n"
+        "if not specified, will use MTMD_BACKEND_DEVICE env var or default GPU backend",
+        [](common_params & params, const std::string & value) {
+            params.mmproj_backend = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--image", "--audio"}, "FILE",
         "path to an image or audio file. use with multimodal models, use comma-separated values for multiple files\n",
         [](common_params & params, const std::string & value) {
@@ -2243,6 +2255,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.image_max_tokens = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TOKENS"));
+    add_opt(common_arg(
+        {"--image-tile-mode"}, "MODE",
+        "tile encoding mode for multi-tile vision models (e.g. Qwen3VL):\n"
+        "  batched    - all tiles in one forward pass\n"
+        "  sequential - tiles encoded one-by-one (default)\n"
+        "  disabled   - tiling disabled, single tile only",
+        [](common_params & params, const std::string & value) {
+            if (value == "batched")         { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_BATCHED; }
+            else if (value == "sequential") { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_SEQUENTIAL; }
+            else if (value == "disabled")   { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_DISABLED; }
+            else { throw std::invalid_argument("unknown --image-tile-mode: " + value + " (use batched, sequential, or disabled)"); }
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_TILE_MODE"));
     if (llama_supports_rpc()) {
         add_opt(common_arg(
             {"--rpc"}, "SERVERS",

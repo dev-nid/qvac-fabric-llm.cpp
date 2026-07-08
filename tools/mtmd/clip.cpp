@@ -26,7 +26,12 @@
 #include <functional>
 #include <float.h>
 
-struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
+// TODO: allow to pass callback from user code
+struct clip_logger_state g_logger_state = {
+    GGML_LOG_LEVEL_CONT,           // verbosity_thold
+    clip_log_callback_default,     // log_callback
+    NULL                           // log_callback_user_data
+};
 
 //#define CLIP_DEBUG_FUNCTIONS
 
@@ -161,11 +166,16 @@ struct clip_ctx {
     bool is_allocated = false;
 
     bool debug_output_embeddings = false;
+    clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_BATCHED;
 
     // for measuring memory usage
     bool no_alloc = false;
     std::map<ggml_backend_dev_t, size_t> mem_usage;
     std::map<ggml_backend_dev_t, size_t> mem_compute;
+
+    // When the GPU backend lacks bf16 support but the GGUF has bf16 weights,
+    // we declare the in-context tensors as f16 and convert on disk-load.
+    bool convert_bf16_to_f16 = false;
 
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
@@ -175,7 +185,7 @@ struct clip_ctx {
             throw std::runtime_error("failed to initialize CPU backend");
         }
         if (ctx_params.use_gpu) {
-            auto * backend_name = std::getenv("MTMD_BACKEND_DEVICE");
+            auto * backend_name = ctx_params.backend_device ? ctx_params.backend_device : std::getenv("MTMD_BACKEND_DEVICE");
             if (backend_name != nullptr) {
                 backend = ggml_backend_init_by_name(backend_name, nullptr);
                 if (!backend) {
@@ -185,6 +195,25 @@ struct clip_ctx {
             if (!backend) {
                 backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
                 backend = backend ? backend : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
+            }
+        }
+
+        // When the GPU backend can't host bf16 weights (e.g. Metal on M1 / older
+        // GPUs without bfloat support), convert bf16 tensors to f16 on load.
+        // This keeps the projector running on the GPU instead of falling back
+        // to CPU. Without this, ggml_backend_sched_reserve aborts on the first
+        // bf16 leaf tensor with "buffer that cannot run the operation (NONE)".
+        if (backend && backend != backend_cpu && ctx_params.has_bf16_weights) {
+            ggml_init_params probe_params = { /*.mem_size=*/ ggml_tensor_overhead(), /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+            ggml_context * probe_ctx = ggml_init(probe_params);
+            ggml_tensor * probe = ggml_new_tensor_1d(probe_ctx, GGML_TYPE_BF16, 1);
+            const bool gpu_supports_bf16 = ggml_backend_supports_op(backend, probe);
+            ggml_free(probe_ctx);
+
+            if (!gpu_supports_bf16) {
+                LOG_WRN("%s: GPU backend %s does not support bf16; converting bf16 weights to f16 on load\n",
+                        __func__, ggml_backend_name(backend));
+                convert_bf16_to_f16 = true;
             }
         }
 
@@ -216,6 +245,11 @@ struct clip_ctx {
         }
 
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
+        if (ctx_params.image_tile_mode < 0 || ctx_params.image_tile_mode > 2) {
+            GGML_ABORT("invalid image_tile_mode %d; valid: 0=batched, 1=sequential, 2=disabled",
+                       ctx_params.image_tile_mode);
+        }
+        tile_mode = static_cast<clip_image_tile_mode>(ctx_params.image_tile_mode);
     }
 
     ~clip_ctx() {
@@ -844,9 +878,13 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
 }
 
 static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32_batch & imgs) {
-    GGML_ASSERT(imgs.entries.size() == 1 && "n_batch > 1 is not supported");
+    // Qwen3VL supports batch_size > 1 (multi-tile batching); all others are single-image only.
+    if (ctx->proj_type() != PROJECTOR_TYPE_QWEN3VL) {
+        GGML_ASSERT(imgs.entries.size() == 1 && "n_batch > 1 is not supported");
+    }
 
     const clip_image_f32 & img = *imgs.entries[0];
+    const int batch_size = (int)imgs.entries.size();
     std::unique_ptr<clip_graph> builder;
 
     switch (ctx->proj_type()) {
@@ -886,7 +924,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             } break;
         case PROJECTOR_TYPE_QWEN3VL:
             {
-                builder = std::make_unique<clip_graph_qwen3vl>(ctx, img);
+                builder = std::make_unique<clip_graph_qwen3vl>(ctx, img, batch_size);
             } break;
         case PROJECTOR_TYPE_EXAONE4_5:
             {
@@ -1015,6 +1053,17 @@ struct clip_model_loader {
     std::string fname;
 
     size_t model_size = 0; // in bytes
+
+    // Returns true if any weight tensor in the GGUF is stored as bf16.
+    bool has_bf16_weights() const {
+        const int n = gguf_get_n_tensors(ctx_gguf.get());
+        for (int i = 0; i < n; ++i) {
+            if (gguf_get_tensor_type(ctx_gguf.get(), i) == GGML_TYPE_BF16) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     bool has_vision = false;
     bool has_audio  = false;
@@ -1407,7 +1456,17 @@ struct clip_model_loader {
                         }
                         // @ngxson : the model performs quite poor with small images, we need to bump minimum image tokens to 40 to avoid that
                         hparams.set_limit_image_tokens(40, 280);
-                        hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
+                        // hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
+                        // intentionally NOT calling set_warmup_n_tokens here: the previous
+                        // set_warmup_n_tokens(256) would override warmup_image_size with a
+                        // size smaller than the real-image max (280 tokens), so the gallocr
+                        // reserved a buffer that didn't fit the actual graph and tripped the
+                        // bounds assert in ggml_backend_tensor_alloc on iOS Heavy9-Gemma4.
+                        // Letting set_limit_image_tokens(40, 280) seed warmup_image_size
+                        // for the 280-token upper bound matches what the real run will need.
+                        // The memory cost is small here (max=280 tokens) compared to other
+                        // projectors with thousands of tokens where the OOM-on-warmup guard
+                        // matters.
                     } break;
 
                 case PROJECTOR_TYPE_GEMMA3NV:
@@ -1425,9 +1484,11 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
+                        // optional multi-tile cap; absent in GGUF → stays 0 and the qwen3vl preprocessor falls back to 4
+                        get_u32(KEY_PREPROC_MAX_TILES, hparams.preproc_max_tiles, false);
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
-                        hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                        hparams.warmup_image_size = hparams.image_size; // warmup at actual tile size to match inference graph shape
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
                         if (hparams.image_min_pixels < warn_min_pixels) {
                             LOG_WRN("%s: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks\n", __func__);
@@ -1736,7 +1797,15 @@ struct clip_model_loader {
             }
             if (cur) {
                 tensors_to_load.push_back(cur);
-                ggml_tensor * data_tensor = ggml_dup_tensor(ctx_clip.ctx_data.get(), cur);
+                ggml_tensor * data_tensor;
+                if (ctx_clip.convert_bf16_to_f16 && cur->type == GGML_TYPE_BF16) {
+                    // Allocate the in-context tensor as F16; the actual values
+                    // get converted from BF16 in the load loop below.
+                    data_tensor = ggml_new_tensor(ctx_clip.ctx_data.get(), GGML_TYPE_F16,
+                                                  ggml_n_dims(cur), cur->ne);
+                } else {
+                    data_tensor = ggml_dup_tensor(ctx_clip.ctx_data.get(), cur);
+                }
                 ggml_set_name(data_tensor, cur->name);
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
@@ -2681,6 +2750,8 @@ struct clip_model_loader {
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            std::vector<float>       conv_f32;
+            std::vector<ggml_fp16_t> conv_f16;
             for (auto & t : tensors_to_load) {
                 ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
                 GGML_ASSERT(cur && "tensor not found in ctx_data");
@@ -2690,6 +2761,29 @@ struct clip_model_loader {
                 fin.seekg(offset, std::ios::beg);
                 if (!fin) {
                     throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
+                }
+                const bool need_bf16_to_f16 =
+                    ctx_clip.convert_bf16_to_f16 &&
+                    t->type == GGML_TYPE_BF16 &&
+                    cur->type == GGML_TYPE_F16;
+                if (need_bf16_to_f16) {
+                    // Read raw bf16 from disk, convert to f32 then to f16, write to tensor.
+                    const int64_t n = ggml_nelements(cur);
+                    const size_t  src_bytes = ggml_nbytes(t);  // bf16 layout
+                    read_buf.resize(src_bytes);
+                    fin.read(reinterpret_cast<char *>(read_buf.data()), src_bytes);
+                    conv_f32.resize(n);
+                    conv_f16.resize(n);
+                    ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(read_buf.data()),
+                                          conv_f32.data(), n);
+                    ggml_fp32_to_fp16_row(conv_f32.data(), conv_f16.data(), n);
+                    const size_t dst_bytes = ggml_nbytes(cur); // f16 layout
+                    if (ggml_backend_buft_is_host(buft)) {
+                        memcpy(cur->data, conv_f16.data(), dst_bytes);
+                    } else {
+                        ggml_backend_tensor_set(cur, conv_f16.data(), 0, dst_bytes);
+                    }
+                    continue;
                 }
                 size_t num_bytes = ggml_nbytes(cur);
                 if (ggml_backend_buft_is_host(buft)) {
@@ -2971,6 +3065,8 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
     try {
         clip_model_loader loader(fname);
         bool skip_audio = false;
+
+        ctx_params.has_bf16_weights = loader.has_bf16_weights();
 
         if (loader.has_vision) {
             ctx_vision = new clip_ctx(ctx_params);
@@ -3417,10 +3513,58 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     const clip_image_f32_batch & imgs = *imgs_c_ptr;
     int batch_size = imgs.entries.size();
 
-    // TODO @ngxson : implement batch size > 1 as a loop
-    //                we don't need true batching support because the cgraph will gonna be big anyway
-    if (batch_size != 1) {
-        return false; // only support batch size of 1
+    if (batch_size == 0) {
+        return false;
+    }
+
+    if (batch_size != 1 && ctx->proj_type() != PROJECTOR_TYPE_QWEN3VL) {
+        // Only Qwen3VL supports multi-tile batching; all other models encode one image at a time
+        return false;
+    }
+
+    LOG_INF("%s: encoding %d tile(s), grid=%dx%d, tile_size=%dx%d\n", __func__,
+            batch_size,
+            imgs.grid_x, imgs.grid_y,
+            batch_size > 0 ? (int)imgs.entries[0]->nx : 0,
+            batch_size > 0 ? (int)imgs.entries[0]->ny : 0);
+
+    // Validate that all tiles share the same dimensions; logs an error and returns false if not.
+    auto validate_tile_sizes = [&](const char * tag) -> bool {
+        const int tile_nx = imgs.entries[0]->nx;
+        const int tile_ny = imgs.entries[0]->ny;
+        for (int b = 1; b < batch_size; b++) {
+            if (imgs.entries[b]->nx != tile_nx || imgs.entries[b]->ny != tile_ny) {
+                LOG_ERR("%s: %s tile %d size %dx%d != expected %dx%d; all tiles must be the same size\n",
+                        __func__, tag, b, imgs.entries[b]->nx, imgs.entries[b]->ny, tile_nx, tile_ny);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Encode tiles one by one. Used for SEQUENTIAL tile mode and as OOM fallback from BATCHED mode.
+    auto do_encode_sequential = [&]() -> bool {
+        if (!validate_tile_sizes("sequential mode")) { return false; }
+        const int n_tokens_per_tile = clip_n_output_tokens(ctx, imgs.entries[0].get());
+        const int out_embd           = clip_n_mmproj_embd(ctx);
+        float * out_ptr = vec;
+        for (int b = 0; b < batch_size; b++) {
+            clip_image_f32_batch single;
+            single.entries.emplace_back(new clip_image_f32(*imgs.entries[b]));
+            single.grid_x = 1;
+            single.grid_y = 1;
+            bool ok = clip_image_batch_encode(ctx, n_threads, &single, out_ptr);
+            if (!ok) return false;
+            if (out_ptr != nullptr) {
+                out_ptr += (size_t)n_tokens_per_tile * out_embd;
+            }
+        }
+        return true;
+    };
+
+    // Explicit sequential mode.
+    if (batch_size > 1 && ctx->tile_mode == CLIP_IMAGE_TILE_MODE_SEQUENTIAL) {
+        return do_encode_sequential();
     }
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
@@ -3431,7 +3575,11 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_image_build_graph(ctx, imgs);
-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+        // Allocation failed (OOM) — fall back to sequential.
+        LOG_WRN("%s: batched graph alloc failed (OOM), retrying with sequential encoding\n", __func__);
+        return do_encode_sequential();
+    }
 
     // set inputs
     const auto & model   = ctx->model;
@@ -3476,7 +3624,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     if (!imgs.is_audio) {
         size_t nelem = 0;
         for (const auto & img : imgs.entries) {
-            nelem += img->nx * img->ny * 3;
+            nelem += (size_t)img->nx * (size_t)img->ny * 3;
         }
         std::vector<float> inp_raw(nelem);
 
@@ -3491,21 +3639,22 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         // └─────┘ │
         //   ──────┘ x B
 
-        for (size_t i = 0; i < imgs.entries.size(); i++) {
-            const int nx = imgs.entries[i]->nx;
-            const int ny = imgs.entries[i]->ny;
-            const int n = nx * ny;
-
-            for (int b = 0; b < batch_size; b++) {
-                float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x); // idx of the first channel
-                        size_t base_dst =    y * nx + x;  // idx of the first channel
-                        batch_entry[      base_dst] = imgs.entries[b]->buf[base_src    ];
-                        batch_entry[1*n + base_dst] = imgs.entries[b]->buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = imgs.entries[b]->buf[base_src + 2];
-                    }
+        // Layout: [nx, ny, 3, batch_size] — channel-first per tile, tiles packed along last dim.
+        // All tiles must be the same size (ensured by the Qwen3VL tiling preprocessor).
+        GGML_ASSERT(batch_size > 0);
+        if (!validate_tile_sizes("batched")) { return false; }
+        for (int b = 0; b < batch_size; b++) {
+            const int    nx = imgs.entries[b]->nx;
+            const int    ny = imgs.entries[b]->ny;
+            const size_t n  = (size_t)nx * (size_t)ny;
+            float * tile_entry = inp_raw.data() + (size_t)b * 3 * n;
+            for (int y = 0; y < ny; y++) {
+                for (int x = 0; x < nx; x++) {
+                    size_t base_src = 3 * (y * nx + x);
+                    size_t base_dst =      y * nx + x;
+                    tile_entry[      base_dst] = imgs.entries[b]->buf[base_src    ];
+                    tile_entry[1*n + base_dst] = imgs.entries[b]->buf[base_src + 1];
+                    tile_entry[2*n + base_dst] = imgs.entries[b]->buf[base_src + 2];
                 }
             }
         }
@@ -3655,7 +3804,6 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 set_input_i32("merger_ds_idx_3", m_ds_3);
             } break;
         case PROJECTOR_TYPE_QWEN2VL:
-        case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_GLM4V:
             {
                 const int merge_ratio = hparams.n_merge;
@@ -3672,6 +3820,45 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                                 positions[2 * num_patches + ptr] = y + dy;
                                 positions[3 * num_patches + ptr] = x + dx;
                                 ptr++;
+                            }
+                        }
+                    }
+                }
+
+                set_input_i32("positions", positions);
+            } break;
+        case PROJECTOR_TYPE_QWEN3VL:
+            {
+                // Per-tile M-RoPE positions use *local* patch coordinates (origin at each tile's
+                // top-left). Attention is computed per-tile and RoPE scores depend only on the
+                // relative position pos_i - pos_j, so any per-tile absolute offset would cancel
+                // exactly and have no effect on the encoder. Every tile therefore gets the same
+                // local-coordinate block. Absolute tile placement reaches the LM via decoder
+                // positions (mtmd_image_tokens_get_decoder_pos in mtmd.cpp), not here.
+                const int merge_ratio  = hparams.n_merge;
+                GGML_ASSERT(merge_ratio > 0);
+                const int pw           = image_size_width  / patch_size; // per-tile width in patches
+                const int ph           = image_size_height / patch_size; // per-tile height in patches
+                GGML_ASSERT(pw % merge_ratio == 0 && ph % merge_ratio == 0 &&
+                            "tile dimensions must be divisible by n_merge");
+                const int n_pos_tile   = pw * ph; // raw patches per tile == n_patches (graph sequence length)
+                // positions layout: tile-major [tile0: y,x,y,x | tile1: y,x,y,x
+                // | ...] each tile's block starts at b * n_pos_tile * 4
+                // (matches ggml_view_1d in graph)
+                std::vector<int32_t> positions((size_t)n_pos_tile * (size_t)batch_size * 4);
+                for (int b = 0; b < batch_size; b++) {
+                    const size_t base  = (size_t)b * (size_t)n_pos_tile * 4;
+                    int ptr = 0;
+                    for (int y = 0; y < ph; y += merge_ratio) {
+                        for (int x = 0; x < pw; x += merge_ratio) {
+                            for (int dy = 0; dy < merge_ratio; dy++) {
+                                for (int dx = 0; dx < merge_ratio; dx++) {
+                                    positions[base + ptr]                          = y + dy;
+                                    positions[base + (size_t)n_pos_tile + ptr]     = x + dx;
+                                    positions[base + (size_t)2 * n_pos_tile + ptr] = y + dy;
+                                    positions[base + (size_t)3 * n_pos_tile + ptr] = x + dx;
+                                    ptr++;
+                                }
                             }
                         }
                     }
@@ -4252,11 +4439,11 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     // the last node is the embedding tensor
     ggml_tensor * embeddings = ggml_graph_node(gf, -1);
 
-    // sanity check (only support batch size of 1 for now)
+    // sanity check: ne[1] = tokens per tile, ne[2] = batch_size (1 for non-batched models)
     const int n_tokens_out = embeddings->ne[1];
     const int expected_n_tokens_out = clip_n_output_tokens(ctx, imgs.entries[0].get());
     if (n_tokens_out != expected_n_tokens_out) {
-        LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
+        LOG_ERR("%s: expected output %d tokens (per tile), got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
         GGML_ABORT("Invalid number of output tokens");
     }
 
@@ -4267,13 +4454,14 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
     // Debug: dump final embeddings if MTMD_DEBUG_EMBEDDINGS is set
     if (ctx->debug_output_embeddings) {
-        const int64_t n_embd = embeddings->ne[0];
-        const int64_t n_tokens = embeddings->ne[1];
-        std::vector<float> emb_data(n_embd * n_tokens);
+        const int64_t n_embd   = embeddings->ne[0];
+        const int64_t n_tokens = embeddings->ne[1]; // per tile
+        const int64_t n_tiles  = embeddings->ne[2]; // batch_size (1 for non-batched models)
+        std::vector<float> emb_data(n_embd * n_tokens * n_tiles);
         ggml_backend_tensor_get(embeddings, emb_data.data(), 0, ggml_nbytes(embeddings));
 
         LOG_INF("\n=== MTMD_DEBUG_EMBEDDINGS ===\n");
-        LOG_INF("Shape: [%lld, %lld]\n", (long long)n_embd, (long long)n_tokens);
+        LOG_INF("Shape: [%lld, %lld, %lld]\n", (long long)n_embd, (long long)n_tokens, (long long)n_tiles);
 
         // Print first few values of first token
         LOG_INF("Token 0 (first 16 values): ");
@@ -4446,6 +4634,10 @@ std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * 
         result[dev] += size;
     }
     return result;
+}
+
+clip_image_tile_mode clip_get_tile_mode(const struct clip_ctx * ctx) {
+    return ctx->tile_mode;
 }
 
 //
