@@ -7,9 +7,11 @@
 //
 // Search: dot product across all slots + min-heap of size k. q8 search scores
 // directly against stored codes and per-vector scales, with ARM NEON or x86
-// AVX2 when available and a scalar fallback.
+// AVX2 when available and a scalar fallback. f32 indexes can also opt into an
+// exact Metal score-matrix path on Apple builds.
 
 #include "ggml-vector-index.h"
+#include "ggml-vector-index-metal.h"
 
 #include <algorithm>
 #include <atomic>
@@ -33,6 +35,284 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#ifndef GGML_VEC_INDEX_USE_METAL
+bool ggml_vec_index_metal_available(void) {
+    return false;
+}
+
+void ggml_vec_index_metal_free(ggml_vec_index_metal_index * cache) {
+    (void) cache;
+}
+
+int ggml_vec_index_metal_prepare_f32(
+        ggml_vec_index_metal_index ** cache,
+        const float   * vectors,
+        const uint8_t * active,
+        size_t          n_slots,
+        int             dim) {
+    (void) cache;
+    (void) vectors;
+    (void) active;
+    (void) n_slots;
+    (void) dim;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_metal_prepare_q8(
+        ggml_vec_index_metal_index ** cache,
+        const int8_t  * codes,
+        const float   * scales,
+        const uint8_t * active,
+        size_t          n_slots,
+        int             dim) {
+    (void) cache;
+    (void) codes;
+    (void) scales;
+    (void) active;
+    (void) n_slots;
+    (void) dim;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_metal_prepare_q4(
+        ggml_vec_index_metal_index ** cache,
+        const uint8_t * codes,
+        const float   * scales,
+        const uint8_t * active,
+        size_t          n_slots,
+        int             dim) {
+    (void) cache;
+    (void) codes;
+    (void) scales;
+    (void) active;
+    (void) n_slots;
+    (void) dim;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_metal_score_f32(
+        ggml_vec_index_metal_index * cache,
+        const float   * queries,
+        int             n_q,
+        float         * scores) {
+    (void) cache;
+    (void) queries;
+    (void) n_q;
+    (void) scores;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_metal_topk_f32(
+        ggml_vec_index_metal_index * cache,
+        const float   * queries,
+        int             n_q,
+        int             k,
+        int             block_size,
+        float         * candidate_scores,
+        uint32_t      * candidate_slots) {
+    (void) cache;
+    (void) queries;
+    (void) n_q;
+    (void) k;
+    (void) block_size;
+    (void) candidate_scores;
+    (void) candidate_slots;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_metal_topk_filter_f32(
+        ggml_vec_index_metal_index * cache,
+        const float   * queries,
+        const uint32_t * filter_slots,
+        size_t          n_filter,
+        int             n_q,
+        int             k,
+        int             block_size,
+        float         * candidate_scores,
+        uint32_t      * candidate_slots) {
+    (void) cache;
+    (void) queries;
+    (void) filter_slots;
+    (void) n_filter;
+    (void) n_q;
+    (void) k;
+    (void) block_size;
+    (void) candidate_scores;
+    (void) candidate_slots;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_metal_topk_filter_blocks_f32(
+        ggml_vec_index_metal_index * cache,
+        const float   * queries,
+        const uint32_t * filter_slots,
+        const uint32_t * block_queries,
+        const uint32_t * block_offsets,
+        const uint32_t * block_counts,
+        size_t          n_filter,
+        size_t          n_blocks,
+        int             n_q,
+        int             k,
+        int             block_size,
+        float         * candidate_scores,
+        uint32_t      * candidate_slots) {
+    (void) cache;
+    (void) queries;
+    (void) filter_slots;
+    (void) block_queries;
+    (void) block_offsets;
+    (void) block_counts;
+    (void) n_filter;
+    (void) n_blocks;
+    (void) n_q;
+    (void) k;
+    (void) block_size;
+    (void) candidate_scores;
+    (void) candidate_slots;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_metal_topk_q8(
+        ggml_vec_index_metal_index * cache,
+        const float   * queries,
+        int             n_q,
+        int             k,
+        int             block_size,
+        float         * candidate_scores,
+        uint32_t      * candidate_slots) {
+    (void) cache;
+    (void) queries;
+    (void) n_q;
+    (void) k;
+    (void) block_size;
+    (void) candidate_scores;
+    (void) candidate_slots;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_metal_topk_filter_q8(
+        ggml_vec_index_metal_index * cache,
+        const float   * queries,
+        const uint32_t * filter_slots,
+        size_t          n_filter,
+        int             n_q,
+        int             k,
+        int             block_size,
+        float         * candidate_scores,
+        uint32_t      * candidate_slots) {
+    (void) cache;
+    (void) queries;
+    (void) filter_slots;
+    (void) n_filter;
+    (void) n_q;
+    (void) k;
+    (void) block_size;
+    (void) candidate_scores;
+    (void) candidate_slots;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_metal_topk_filter_blocks_q8(
+        ggml_vec_index_metal_index * cache,
+        const float   * queries,
+        const uint32_t * filter_slots,
+        const uint32_t * block_queries,
+        const uint32_t * block_offsets,
+        const uint32_t * block_counts,
+        size_t          n_filter,
+        size_t          n_blocks,
+        int             n_q,
+        int             k,
+        int             block_size,
+        float         * candidate_scores,
+        uint32_t      * candidate_slots) {
+    (void) cache;
+    (void) queries;
+    (void) filter_slots;
+    (void) block_queries;
+    (void) block_offsets;
+    (void) block_counts;
+    (void) n_filter;
+    (void) n_blocks;
+    (void) n_q;
+    (void) k;
+    (void) block_size;
+    (void) candidate_scores;
+    (void) candidate_slots;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_metal_topk_q4(
+        ggml_vec_index_metal_index * cache,
+        const float   * queries,
+        int             n_q,
+        int             k,
+        int             block_size,
+        float         * candidate_scores,
+        uint32_t      * candidate_slots) {
+    (void) cache;
+    (void) queries;
+    (void) n_q;
+    (void) k;
+    (void) block_size;
+    (void) candidate_scores;
+    (void) candidate_slots;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_metal_topk_filter_q4(
+        ggml_vec_index_metal_index * cache,
+        const float   * queries,
+        const uint32_t * filter_slots,
+        size_t          n_filter,
+        int             n_q,
+        int             k,
+        int             block_size,
+        float         * candidate_scores,
+        uint32_t      * candidate_slots) {
+    (void) cache;
+    (void) queries;
+    (void) filter_slots;
+    (void) n_filter;
+    (void) n_q;
+    (void) k;
+    (void) block_size;
+    (void) candidate_scores;
+    (void) candidate_slots;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_metal_topk_filter_blocks_q4(
+        ggml_vec_index_metal_index * cache,
+        const float   * queries,
+        const uint32_t * filter_slots,
+        const uint32_t * block_queries,
+        const uint32_t * block_offsets,
+        const uint32_t * block_counts,
+        size_t          n_filter,
+        size_t          n_blocks,
+        int             n_q,
+        int             k,
+        int             block_size,
+        float         * candidate_scores,
+        uint32_t      * candidate_slots) {
+    (void) cache;
+    (void) queries;
+    (void) filter_slots;
+    (void) block_queries;
+    (void) block_offsets;
+    (void) block_counts;
+    (void) n_filter;
+    (void) n_blocks;
+    (void) n_q;
+    (void) k;
+    (void) block_size;
+    (void) candidate_scores;
+    (void) candidate_slots;
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+#endif
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
@@ -97,6 +377,9 @@ constexpr uint8_t  kTvidOpAdd      = 1;
 constexpr uint8_t  kTvidOpRemove   = 2;
 constexpr size_t   kTvidHeaderSize = 16;
 constexpr size_t   kTvidRecordHeaderSize = 24;
+constexpr int      kMetalTopKMaxK = 64;
+constexpr int      kMetalTopKBlockSize = 256;
+constexpr uint32_t kMetalInvalidSlot = UINT32_MAX;
 
 static_assert(sizeof(float) == sizeof(uint32_t), "ggml-vector-index requires float32");
 
@@ -677,6 +960,13 @@ struct ggml_vec_index {
     int ivf_n_lists = 0;
     std::vector<float> ivf_centroids;
     std::vector<std::vector<size_t>> ivf_lists;
+
+    ggml_vec_index_metal_index * gpu_metal = nullptr;
+    uint64_t gpu_generation = std::numeric_limits<uint64_t>::max();
+
+    ~ggml_vec_index() {
+        ggml_vec_index_metal_free(gpu_metal);
+    }
 };
 
 struct ggml_vec_index_filter {
@@ -691,6 +981,12 @@ static void invalidate_ivf(ggml_vec_index & idx) {
     idx.ivf_n_lists = 0;
     idx.ivf_centroids.clear();
     idx.ivf_lists.clear();
+}
+
+static void invalidate_gpu(ggml_vec_index & idx) {
+    ggml_vec_index_metal_free(idx.gpu_metal);
+    idx.gpu_metal = nullptr;
+    idx.gpu_generation = std::numeric_limits<uint64_t>::max();
 }
 
 static bool is_q8(const ggml_vec_index & idx) {
@@ -1476,6 +1772,7 @@ static int ggml_vec_index_add_unlocked(
         idx->n_active += n_sz;
         ++idx->generation;
         invalidate_ivf(*idx);
+        invalidate_gpu(*idx);
     } catch (const std::bad_alloc &) {
         rollback();
         return GGML_VEC_INDEX_E_OOM;
@@ -1524,6 +1821,7 @@ static int ggml_vec_index_remove_unlocked(ggml_vec_index_t * idx, uint64_t id) {
         idx->id_to_slot.erase(it);
         ++idx->generation;
         invalidate_ivf(*idx);
+        invalidate_gpu(*idx);
         return 1;
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
@@ -1635,6 +1933,7 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
         idx->n_active = idx->slot_to_id.size();
         ++idx->generation;
         invalidate_ivf(*idx);
+        invalidate_gpu(*idx);
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
@@ -2094,6 +2393,247 @@ void search_one(
     }
 }
 
+void search_one_from_scores(
+    const ggml_vec_index_t & idx,
+    const float            * slot_scores,
+    int                      k,
+    float                  * out_scores,
+    uint64_t               * out_ids) {
+
+    test_maybe_throw_bad_alloc();
+    std::priority_queue<ScoreId, std::vector<ScoreId>, MinHeapCmp> heap;
+
+    const size_t n_slots = idx.slot_to_id.size();
+    for (size_t slot = 0; slot < n_slots; ++slot) {
+        if (!slot_is_active(idx, slot)) {
+            continue;
+        }
+        const float s = slot_scores[slot];
+        if (heap.size() < static_cast<size_t>(k)) {
+            heap.push({ s, idx.slot_to_id[slot] });
+        } else if (s > heap.top().score) {
+            heap.pop();
+            heap.push({ s, idx.slot_to_id[slot] });
+        }
+    }
+
+    std::vector<ScoreId> drained;
+    drained.reserve(heap.size());
+    while (!heap.empty()) {
+        drained.push_back(heap.top());
+        heap.pop();
+    }
+    std::reverse(drained.begin(), drained.end());
+
+    for (int i = 0; i < k; ++i) {
+        if (static_cast<size_t>(i) < drained.size()) {
+            out_scores[i] = drained[i].score;
+            out_ids[i]    = drained[i].id;
+        } else {
+            out_scores[i] = -FLT_MAX;
+            out_ids[i]    = UINT64_MAX;
+        }
+    }
+}
+
+void search_one_from_candidate_slots(
+    const ggml_vec_index_t & idx,
+    const float            * candidate_scores,
+    const uint32_t         * candidate_slots,
+    size_t                   n_candidates,
+    int                      k,
+    float                  * out_scores,
+    uint64_t               * out_ids) {
+
+    test_maybe_throw_bad_alloc();
+    std::priority_queue<ScoreId, std::vector<ScoreId>, MinHeapCmp> heap;
+
+    const size_t n_slots = idx.slot_to_id.size();
+    for (size_t i = 0; i < n_candidates; ++i) {
+        const uint32_t slot_u32 = candidate_slots[i];
+        if (slot_u32 == kMetalInvalidSlot) {
+            continue;
+        }
+        const size_t slot = static_cast<size_t>(slot_u32);
+        if (slot >= n_slots || !slot_is_active(idx, slot)) {
+            continue;
+        }
+
+        const float s = candidate_scores[i];
+        if (heap.size() < static_cast<size_t>(k)) {
+            heap.push({ s, idx.slot_to_id[slot] });
+        } else if (s > heap.top().score) {
+            heap.pop();
+            heap.push({ s, idx.slot_to_id[slot] });
+        }
+    }
+
+    std::vector<ScoreId> drained;
+    drained.reserve(heap.size());
+    while (!heap.empty()) {
+        drained.push_back(heap.top());
+        heap.pop();
+    }
+    std::reverse(drained.begin(), drained.end());
+
+    for (int i = 0; i < k; ++i) {
+        if (static_cast<size_t>(i) < drained.size()) {
+            out_scores[i] = drained[i].score;
+            out_ids[i]    = drained[i].id;
+        } else {
+            out_scores[i] = -FLT_MAX;
+            out_ids[i]    = UINT64_MAX;
+        }
+    }
+}
+
+std::vector<size_t> ivf_candidate_slots_for_query(
+    const ggml_vec_index_t & idx,
+    const float            * query,
+    int                      nprobe) {
+
+    const int dim = idx.dim;
+    const int probe_count = std::min(nprobe, idx.ivf_n_lists);
+    std::vector<ScoreId> centroid_scores;
+    centroid_scores.reserve(static_cast<size_t>(idx.ivf_n_lists));
+    for (int list = 0; list < idx.ivf_n_lists; ++list) {
+        const float score = dot(
+            query,
+            idx.ivf_centroids.data() + static_cast<size_t>(list) * static_cast<size_t>(dim),
+            dim);
+        centroid_scores.push_back({ score, static_cast<uint64_t>(list) });
+    }
+    std::sort(
+        centroid_scores.begin(),
+        centroid_scores.end(),
+        [](const ScoreId & a, const ScoreId & b) {
+            return a.score > b.score;
+        });
+
+    size_t n_candidates = 0;
+    for (int probe = 0; probe < probe_count; ++probe) {
+        n_candidates +=
+            idx.ivf_lists[static_cast<size_t>(centroid_scores[probe].id)].size();
+    }
+
+    std::vector<size_t> candidates;
+    candidates.reserve(n_candidates);
+    for (int probe = 0; probe < probe_count; ++probe) {
+        const std::vector<size_t> & list =
+            idx.ivf_lists[static_cast<size_t>(centroid_scores[probe].id)];
+        candidates.insert(candidates.end(), list.begin(), list.end());
+    }
+    return candidates;
+}
+
+int metal_topk_filter_for_slots(
+    const ggml_vec_index_t & idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    const uint32_t         * filter_slots,
+    size_t                   n_filter,
+    std::vector<float>     & candidate_scores,
+    std::vector<uint32_t>  & candidate_slots) {
+
+    if (idx.bit_width == 8) {
+        return ggml_vec_index_metal_topk_filter_q8(
+            idx.gpu_metal,
+            queries,
+            filter_slots,
+            n_filter,
+            n_q,
+            k,
+            kMetalTopKBlockSize,
+            candidate_scores.data(),
+            candidate_slots.data());
+    }
+    if (idx.bit_width == 4) {
+        return ggml_vec_index_metal_topk_filter_q4(
+            idx.gpu_metal,
+            queries,
+            filter_slots,
+            n_filter,
+            n_q,
+            k,
+            kMetalTopKBlockSize,
+            candidate_scores.data(),
+            candidate_slots.data());
+    }
+    return ggml_vec_index_metal_topk_filter_f32(
+        idx.gpu_metal,
+        queries,
+        filter_slots,
+        n_filter,
+        n_q,
+        k,
+        kMetalTopKBlockSize,
+        candidate_scores.data(),
+        candidate_slots.data());
+}
+
+int metal_topk_filter_blocks_for_slots(
+    const ggml_vec_index_t & idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    const uint32_t         * filter_slots,
+    const uint32_t         * block_queries,
+    const uint32_t         * block_offsets,
+    const uint32_t         * block_counts,
+    size_t                   n_filter,
+    size_t                   n_blocks,
+    std::vector<float>     & candidate_scores,
+    std::vector<uint32_t>  & candidate_slots) {
+
+    if (idx.bit_width == 8) {
+        return ggml_vec_index_metal_topk_filter_blocks_q8(
+            idx.gpu_metal,
+            queries,
+            filter_slots,
+            block_queries,
+            block_offsets,
+            block_counts,
+            n_filter,
+            n_blocks,
+            n_q,
+            k,
+            kMetalTopKBlockSize,
+            candidate_scores.data(),
+            candidate_slots.data());
+    }
+    if (idx.bit_width == 4) {
+        return ggml_vec_index_metal_topk_filter_blocks_q4(
+            idx.gpu_metal,
+            queries,
+            filter_slots,
+            block_queries,
+            block_offsets,
+            block_counts,
+            n_filter,
+            n_blocks,
+            n_q,
+            k,
+            kMetalTopKBlockSize,
+            candidate_scores.data(),
+            candidate_slots.data());
+    }
+    return ggml_vec_index_metal_topk_filter_blocks_f32(
+        idx.gpu_metal,
+        queries,
+        filter_slots,
+        block_queries,
+        block_offsets,
+        block_counts,
+        n_filter,
+        n_blocks,
+        n_q,
+        k,
+        kMetalTopKBlockSize,
+        candidate_scores.data(),
+        candidate_slots.data());
+}
+
 std::vector<size_t> allowed_slots_for_ids(
     const ggml_vec_index_t & idx,
     const uint64_t         * allowed_ids,
@@ -2293,6 +2833,416 @@ int ggml_vec_index_search(
         idx, queries, n_q, k, false, nullptr, 0, nullptr, out_scores, out_ids);
 }
 
+int ggml_vec_index_prepare_gpu(ggml_vec_index_t * idx) {
+    if (idx == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+
+    try {
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        if ((idx->bit_width != 32 && idx->bit_width != 8 && idx->bit_width != 4) ||
+            !has_vector_storage(*idx) ||
+            !ggml_vec_index_metal_available()) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const size_t n_slots = idx->slot_to_id.size();
+        if (n_slots > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        if (n_slots == 0) {
+            invalidate_gpu(*idx);
+            idx->gpu_generation = idx->generation;
+            return GGML_VEC_INDEX_OK;
+        }
+
+        int rc = GGML_VEC_INDEX_E_INVALID_ARG;
+        if (idx->bit_width == 8) {
+            rc = ggml_vec_index_metal_prepare_q8(
+                &idx->gpu_metal,
+                q8_data_ptr(*idx),
+                idx->q8_scale.data(),
+                idx->slot_active.data(),
+                n_slots,
+                idx->dim);
+        } else if (idx->bit_width == 4) {
+            rc = ggml_vec_index_metal_prepare_q4(
+                &idx->gpu_metal,
+                q4_data_ptr(*idx),
+                idx->q4_scale.data(),
+                idx->slot_active.data(),
+                n_slots,
+                idx->dim);
+        } else {
+            rc = ggml_vec_index_metal_prepare_f32(
+                &idx->gpu_metal,
+                f32_data_ptr(*idx),
+                idx->slot_active.data(),
+                n_slots,
+                idx->dim);
+        }
+        if (rc != GGML_VEC_INDEX_OK) {
+            return rc;
+        }
+        idx->gpu_generation = idx->generation;
+        return GGML_VEC_INDEX_OK;
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_search_gpu(
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    float                  * out_scores,
+    uint64_t               * out_ids) {
+
+    if (idx == nullptr || queries == nullptr ||
+        out_scores == nullptr || out_ids == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    if (n_q < 0 || k <= 0) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    if (n_q == 0) {
+        return GGML_VEC_INDEX_OK;
+    }
+
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        if (idx->bit_width != 32 || !has_vector_storage(*idx) ||
+            idx->gpu_generation != idx->generation) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const int dim = idx->dim;
+        const size_t n_slots = idx->slot_to_id.size();
+        const size_t n_q_sz = static_cast<size_t>(n_q);
+        const size_t k_sz   = static_cast<size_t>(k);
+        const size_t dim_sz = static_cast<size_t>(dim);
+        if ((dim_sz != 0 && n_q_sz > std::numeric_limits<size_t>::max() / dim_sz) ||
+            n_q_sz > std::numeric_limits<size_t>::max() / k_sz ||
+            n_slots > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+            n_slots > std::numeric_limits<size_t>::max() / n_q_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (!all_finite(queries, n_q_sz * dim_sz)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        if (n_slots == 0) {
+            for (int q = 0; q < n_q; ++q) {
+                float * scores = out_scores + static_cast<size_t>(q) * k_sz;
+                uint64_t * ids = out_ids + static_cast<size_t>(q) * k_sz;
+                for (int i = 0; i < k; ++i) {
+                    scores[i] = -FLT_MAX;
+                    ids[i] = UINT64_MAX;
+                }
+            }
+            return GGML_VEC_INDEX_OK;
+        }
+
+        if (idx->gpu_metal == nullptr) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const size_t total_scores = n_slots * n_q_sz;
+        if (total_scores > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+            total_scores > std::numeric_limits<size_t>::max() / sizeof(float)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        std::vector<float> gpu_scores(total_scores);
+        const int rc = ggml_vec_index_metal_score_f32(
+            idx->gpu_metal,
+            queries,
+            n_q,
+            gpu_scores.data());
+        if (rc != GGML_VEC_INDEX_OK) {
+            return rc;
+        }
+
+        for (int q = 0; q < n_q; ++q) {
+            search_one_from_scores(
+                *idx,
+                gpu_scores.data() + static_cast<size_t>(q) * n_slots,
+                k,
+                out_scores + static_cast<size_t>(q) * k_sz,
+                out_ids    + static_cast<size_t>(q) * k_sz);
+        }
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+    return GGML_VEC_INDEX_OK;
+}
+
+int ggml_vec_index_search_gpu_topk(
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    float                  * out_scores,
+    uint64_t               * out_ids) {
+
+    if (idx == nullptr || queries == nullptr ||
+        out_scores == nullptr || out_ids == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    if (n_q < 0 || k <= 0 || k > kMetalTopKMaxK) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    if (n_q == 0) {
+        return GGML_VEC_INDEX_OK;
+    }
+
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        if ((idx->bit_width != 32 && idx->bit_width != 8 && idx->bit_width != 4) ||
+            !has_vector_storage(*idx) ||
+            idx->gpu_generation != idx->generation) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const int dim = idx->dim;
+        const size_t n_slots = idx->slot_to_id.size();
+        const size_t n_q_sz = static_cast<size_t>(n_q);
+        const size_t k_sz   = static_cast<size_t>(k);
+        const size_t dim_sz = static_cast<size_t>(dim);
+        if ((dim_sz != 0 && n_q_sz > std::numeric_limits<size_t>::max() / dim_sz) ||
+            n_q_sz > std::numeric_limits<size_t>::max() / k_sz ||
+            n_slots > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (!all_finite(queries, n_q_sz * dim_sz)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        if (n_slots == 0) {
+            for (int q = 0; q < n_q; ++q) {
+                float * scores = out_scores + static_cast<size_t>(q) * k_sz;
+                uint64_t * ids = out_ids + static_cast<size_t>(q) * k_sz;
+                for (int i = 0; i < k; ++i) {
+                    scores[i] = -FLT_MAX;
+                    ids[i] = UINT64_MAX;
+                }
+            }
+            return GGML_VEC_INDEX_OK;
+        }
+
+        if (idx->gpu_metal == nullptr) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const size_t block_size = static_cast<size_t>(kMetalTopKBlockSize);
+        const size_t n_blocks = (n_slots + block_size - 1) / block_size;
+        if (n_blocks == 0 ||
+            n_blocks > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+            n_blocks > std::numeric_limits<size_t>::max() / n_q_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const size_t total_blocks = n_blocks * n_q_sz;
+        if (total_blocks > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+            total_blocks > std::numeric_limits<size_t>::max() / k_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const size_t total_candidates = total_blocks * k_sz;
+        if (total_candidates > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+            total_candidates > std::numeric_limits<size_t>::max() / sizeof(float) ||
+            total_candidates > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        std::vector<float> candidate_scores(total_candidates);
+        std::vector<uint32_t> candidate_slots(total_candidates);
+        int rc = GGML_VEC_INDEX_E_INVALID_ARG;
+        if (idx->bit_width == 8) {
+            rc = ggml_vec_index_metal_topk_q8(
+                idx->gpu_metal,
+                queries,
+                n_q,
+                k,
+                kMetalTopKBlockSize,
+                candidate_scores.data(),
+                candidate_slots.data());
+        } else if (idx->bit_width == 4) {
+            rc = ggml_vec_index_metal_topk_q4(
+                idx->gpu_metal,
+                queries,
+                n_q,
+                k,
+                kMetalTopKBlockSize,
+                candidate_scores.data(),
+                candidate_slots.data());
+        } else {
+            rc = ggml_vec_index_metal_topk_f32(
+                idx->gpu_metal,
+                queries,
+                n_q,
+                k,
+                kMetalTopKBlockSize,
+                candidate_scores.data(),
+                candidate_slots.data());
+        }
+        if (rc != GGML_VEC_INDEX_OK) {
+            return rc;
+        }
+
+        const size_t candidates_per_query = n_blocks * k_sz;
+        for (int q = 0; q < n_q; ++q) {
+            search_one_from_candidate_slots(
+                *idx,
+                candidate_scores.data() + static_cast<size_t>(q) * candidates_per_query,
+                candidate_slots.data() + static_cast<size_t>(q) * candidates_per_query,
+                candidates_per_query,
+                k,
+                out_scores + static_cast<size_t>(q) * k_sz,
+                out_ids    + static_cast<size_t>(q) * k_sz);
+        }
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+    return GGML_VEC_INDEX_OK;
+}
+
+int ggml_vec_index_search_gpu_prepared_filtered_topk(
+    const ggml_vec_index_t        * idx,
+    const ggml_vec_index_filter_t * filter,
+    const float                   * queries,
+    int                             n_q,
+    int                             k,
+    float                         * out_scores,
+    uint64_t                      * out_ids) {
+
+    if (idx == nullptr || filter == nullptr || queries == nullptr ||
+        out_scores == nullptr || out_ids == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    if (n_q < 0 || k <= 0 || k > kMetalTopKMaxK) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    if (n_q == 0) {
+        return GGML_VEC_INDEX_OK;
+    }
+
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        if ((idx->bit_width != 32 && idx->bit_width != 8 && idx->bit_width != 4) ||
+            !has_vector_storage(*idx) ||
+            idx->gpu_generation != idx->generation ||
+            filter->dim != idx->dim ||
+            filter->bit_width != idx->bit_width ||
+            filter->generation != idx->generation) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const int dim = idx->dim;
+        const size_t n_slots = idx->slot_to_id.size();
+        const size_t n_filter = filter->slots.size();
+        const size_t n_q_sz = static_cast<size_t>(n_q);
+        const size_t k_sz   = static_cast<size_t>(k);
+        const size_t dim_sz = static_cast<size_t>(dim);
+        if ((dim_sz != 0 && n_q_sz > std::numeric_limits<size_t>::max() / dim_sz) ||
+            n_q_sz > std::numeric_limits<size_t>::max() / k_sz ||
+            n_slots > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+            n_filter > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (!all_finite(queries, n_q_sz * dim_sz)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        if (n_filter == 0) {
+            for (int q = 0; q < n_q; ++q) {
+                float * scores = out_scores + static_cast<size_t>(q) * k_sz;
+                uint64_t * ids = out_ids + static_cast<size_t>(q) * k_sz;
+                for (int i = 0; i < k; ++i) {
+                    scores[i] = -FLT_MAX;
+                    ids[i] = UINT64_MAX;
+                }
+            }
+            return GGML_VEC_INDEX_OK;
+        }
+
+        if (idx->gpu_metal == nullptr) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const size_t block_size = static_cast<size_t>(kMetalTopKBlockSize);
+        const size_t n_blocks = (n_filter + block_size - 1) / block_size;
+        if (n_blocks == 0 ||
+            n_blocks > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+            n_blocks > std::numeric_limits<size_t>::max() / n_q_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const size_t total_blocks = n_blocks * n_q_sz;
+        if (total_blocks > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+            total_blocks > std::numeric_limits<size_t>::max() / k_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const size_t total_candidates = total_blocks * k_sz;
+        if (total_candidates > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+            total_candidates > std::numeric_limits<size_t>::max() / sizeof(float) ||
+            total_candidates > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        std::vector<uint32_t> filter_slots;
+        filter_slots.reserve(n_filter);
+        for (size_t slot : filter->slots) {
+            if (slot >= n_slots ||
+                slot > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+                return GGML_VEC_INDEX_E_INVALID_ARG;
+            }
+            filter_slots.push_back(static_cast<uint32_t>(slot));
+        }
+
+        std::vector<float> candidate_scores(total_candidates);
+        std::vector<uint32_t> candidate_slots(total_candidates);
+        const int rc = metal_topk_filter_for_slots(
+            *idx,
+            queries,
+            n_q,
+            k,
+            filter_slots.data(),
+            filter_slots.size(),
+            candidate_scores,
+            candidate_slots);
+        if (rc != GGML_VEC_INDEX_OK) {
+            return rc;
+        }
+
+        const size_t candidates_per_query = n_blocks * k_sz;
+        for (int q = 0; q < n_q; ++q) {
+            search_one_from_candidate_slots(
+                *idx,
+                candidate_scores.data() + static_cast<size_t>(q) * candidates_per_query,
+                candidate_slots.data() + static_cast<size_t>(q) * candidates_per_query,
+                candidates_per_query,
+                k,
+                out_scores + static_cast<size_t>(q) * k_sz,
+                out_ids    + static_cast<size_t>(q) * k_sz);
+        }
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+    return GGML_VEC_INDEX_OK;
+}
+
 int ggml_vec_index_search_filtered(
     const ggml_vec_index_t * idx,
     const float            * queries,
@@ -2431,6 +3381,190 @@ int ggml_vec_index_search_ivf(
                 candidate_slots.insert(candidate_slots.end(), list.begin(), list.end());
             }
             search_one(*idx, query, k, scores, ids, &candidate_slots);
+        }
+        return GGML_VEC_INDEX_OK;
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_search_gpu_ivf_topk(
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    int                      nprobe,
+    float                  * out_scores,
+    uint64_t               * out_ids) {
+
+    if (idx == nullptr || queries == nullptr ||
+        out_scores == nullptr || out_ids == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    if (n_q < 0 || k <= 0 || k > kMetalTopKMaxK || nprobe <= 0) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    if (n_q == 0) {
+        return GGML_VEC_INDEX_OK;
+    }
+
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        if ((idx->bit_width != 32 && idx->bit_width != 8 && idx->bit_width != 4) ||
+            !has_vector_storage(*idx) ||
+            idx->gpu_generation != idx->generation) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const int dim = idx->dim;
+        const size_t n_q_sz = static_cast<size_t>(n_q);
+        const size_t k_sz = static_cast<size_t>(k);
+        const size_t dim_sz = static_cast<size_t>(dim);
+        if ((dim_sz != 0 && n_q_sz > std::numeric_limits<size_t>::max() / dim_sz) ||
+            n_q_sz > std::numeric_limits<size_t>::max() / k_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (!all_finite(queries, n_q_sz * dim_sz)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (idx->ivf_generation != idx->generation ||
+            idx->ivf_n_lists < 0 ||
+            static_cast<size_t>(idx->ivf_n_lists) != idx->ivf_lists.size() ||
+            idx->ivf_centroids.size() != static_cast<size_t>(idx->ivf_n_lists) * dim_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (idx->ivf_n_lists != 0 && idx->gpu_metal == nullptr) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        std::vector<uint32_t> filter_slots;
+        std::vector<uint32_t> block_queries;
+        std::vector<uint32_t> block_offsets;
+        std::vector<uint32_t> block_counts;
+        std::vector<size_t> query_block_offsets(static_cast<size_t>(n_q) + 1);
+        const size_t block_size = static_cast<size_t>(kMetalTopKBlockSize);
+
+        for (int q = 0; q < n_q; ++q) {
+            query_block_offsets[static_cast<size_t>(q)] = block_queries.size();
+            if (idx->ivf_n_lists == 0) {
+                continue;
+            }
+
+            const float * query = queries + static_cast<size_t>(q) * dim_sz;
+            const std::vector<size_t> candidate_slots_sz =
+                ivf_candidate_slots_for_query(*idx, query, nprobe);
+            if (candidate_slots_sz.empty()) {
+                continue;
+            }
+            if (candidate_slots_sz.size() >
+                    static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+                filter_slots.size() >
+                    static_cast<size_t>(std::numeric_limits<uint32_t>::max()) -
+                    candidate_slots_sz.size()) {
+                return GGML_VEC_INDEX_E_INVALID_ARG;
+            }
+
+            const size_t slot_base = filter_slots.size();
+            filter_slots.reserve(filter_slots.size() + candidate_slots_sz.size());
+            for (size_t slot : candidate_slots_sz) {
+                if (slot >= idx->slot_to_id.size() ||
+                    slot > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+                    return GGML_VEC_INDEX_E_INVALID_ARG;
+                }
+                filter_slots.push_back(static_cast<uint32_t>(slot));
+            }
+
+            const size_t n_blocks_for_query =
+                (candidate_slots_sz.size() + block_size - 1) / block_size;
+            if (n_blocks_for_query >
+                    static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+                block_queries.size() >
+                    static_cast<size_t>(std::numeric_limits<uint32_t>::max()) -
+                    n_blocks_for_query) {
+                return GGML_VEC_INDEX_E_INVALID_ARG;
+            }
+            for (size_t block = 0; block < n_blocks_for_query; ++block) {
+                const size_t offset = slot_base + block * block_size;
+                const size_t count = std::min(block_size, filter_slots.size() - offset);
+                block_queries.push_back(static_cast<uint32_t>(q));
+                block_offsets.push_back(static_cast<uint32_t>(offset));
+                block_counts.push_back(static_cast<uint32_t>(count));
+            }
+        }
+        query_block_offsets[static_cast<size_t>(n_q)] = block_queries.size();
+
+        const size_t n_blocks = block_queries.size();
+        if (n_blocks == 0) {
+            for (int q = 0; q < n_q; ++q) {
+                const std::vector<size_t> empty_slots;
+                search_one(
+                    *idx,
+                    queries + static_cast<size_t>(q) * dim_sz,
+                    k,
+                    out_scores + static_cast<size_t>(q) * k_sz,
+                    out_ids + static_cast<size_t>(q) * k_sz,
+                    &empty_slots);
+            }
+            return GGML_VEC_INDEX_OK;
+        }
+        if (n_blocks > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+            n_blocks > std::numeric_limits<size_t>::max() / k_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const size_t total_candidates = n_blocks * k_sz;
+        if (total_candidates > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) ||
+            total_candidates > std::numeric_limits<size_t>::max() / sizeof(float) ||
+            total_candidates > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        std::vector<float> gpu_candidate_scores(total_candidates);
+        std::vector<uint32_t> gpu_candidate_slots(total_candidates);
+        const int rc = metal_topk_filter_blocks_for_slots(
+            *idx,
+            queries,
+            n_q,
+            k,
+            filter_slots.data(),
+            block_queries.data(),
+            block_offsets.data(),
+            block_counts.data(),
+            filter_slots.size(),
+            n_blocks,
+            gpu_candidate_scores,
+            gpu_candidate_slots);
+        if (rc != GGML_VEC_INDEX_OK) {
+            return rc;
+        }
+
+        for (int q = 0; q < n_q; ++q) {
+            const size_t block_begin = query_block_offsets[static_cast<size_t>(q)];
+            const size_t block_end = query_block_offsets[static_cast<size_t>(q) + 1];
+            const size_t candidates_begin = block_begin * k_sz;
+            const size_t candidates_count = (block_end - block_begin) * k_sz;
+            if (candidates_count == 0) {
+                const std::vector<size_t> empty_slots;
+                search_one(
+                    *idx,
+                    queries + static_cast<size_t>(q) * dim_sz,
+                    k,
+                    out_scores + static_cast<size_t>(q) * k_sz,
+                    out_ids + static_cast<size_t>(q) * k_sz,
+                    &empty_slots);
+                continue;
+            }
+
+            search_one_from_candidate_slots(
+                *idx,
+                gpu_candidate_scores.data() + candidates_begin,
+                gpu_candidate_slots.data() + candidates_begin,
+                candidates_count,
+                k,
+                out_scores + static_cast<size_t>(q) * k_sz,
+                out_ids + static_cast<size_t>(q) * k_sz);
         }
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {

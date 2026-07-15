@@ -59,6 +59,15 @@ struct QualityBenchResult {
     std::vector<QualityMetrics> q4_calibrated;
 };
 
+struct MetalBenchResult {
+    bool supported = false;
+    double prepare_ms = 0.0;
+    TimedSearch full_search;
+    TimedSearch topk_search;
+    QualityMetrics full_quality;
+    QualityMetrics topk_quality;
+};
+
 struct Q4CalibrationMode {
     const char * name = "";
     float percentile = 1.0f;
@@ -252,6 +261,77 @@ TimedSearch run_search(
     return result;
 }
 
+TimedSearch run_gpu_search(
+        const ggml_vec_index_t * idx,
+        const std::vector<float> & queries,
+        int n_query,
+        int k,
+        int warmups,
+        int repeats) {
+    TimedSearch result;
+    result.scores.resize(static_cast<size_t>(n_query) * static_cast<size_t>(k));
+    result.ids.resize(static_cast<size_t>(n_query) * static_cast<size_t>(k));
+
+    result.ms = median_time_ms(warmups, repeats, [&]() {
+        CHECK(ggml_vec_index_search_gpu(
+            idx,
+            queries.data(),
+            n_query,
+            k,
+            result.scores.data(),
+            result.ids.data()) == GGML_VEC_INDEX_OK);
+    });
+    return result;
+}
+
+TimedSearch run_gpu_topk_search(
+        const ggml_vec_index_t * idx,
+        const std::vector<float> & queries,
+        int n_query,
+        int k,
+        int warmups,
+        int repeats) {
+    TimedSearch result;
+    result.scores.resize(static_cast<size_t>(n_query) * static_cast<size_t>(k));
+    result.ids.resize(static_cast<size_t>(n_query) * static_cast<size_t>(k));
+
+    result.ms = median_time_ms(warmups, repeats, [&]() {
+        CHECK(ggml_vec_index_search_gpu_topk(
+            idx,
+            queries.data(),
+            n_query,
+            k,
+            result.scores.data(),
+            result.ids.data()) == GGML_VEC_INDEX_OK);
+    });
+    return result;
+}
+
+TimedSearch run_gpu_prepared_filtered_search(
+        const ggml_vec_index_t * idx,
+        const ggml_vec_index_filter_t * filter,
+        const std::vector<float> & queries,
+        int n_query,
+        int k,
+        int warmups,
+        int repeats) {
+    TimedSearch result;
+    result.scores.resize(static_cast<size_t>(n_query) * static_cast<size_t>(k));
+    result.ids.resize(static_cast<size_t>(n_query) * static_cast<size_t>(k));
+
+    result.ms = median_time_ms(warmups, repeats, [&]() {
+        CHECK(ggml_vec_index_search_gpu_prepared_filtered_topk(
+            idx,
+            filter,
+            queries.data(),
+            n_query,
+            k,
+            result.scores.data(),
+            result.ids.data()) == GGML_VEC_INDEX_OK);
+    });
+    return result;
+}
+
 TimedSearch run_ivf_search(
         const ggml_vec_index_t * idx,
         const std::vector<float> & queries,
@@ -266,6 +346,31 @@ TimedSearch run_ivf_search(
 
     result.ms = median_time_ms(warmups, repeats, [&]() {
         CHECK(ggml_vec_index_search_ivf(
+            idx,
+            queries.data(),
+            n_query,
+            k,
+            nprobe,
+            result.scores.data(),
+            result.ids.data()) == GGML_VEC_INDEX_OK);
+    });
+    return result;
+}
+
+TimedSearch run_gpu_ivf_search(
+        const ggml_vec_index_t * idx,
+        const std::vector<float> & queries,
+        int n_query,
+        int k,
+        int nprobe,
+        int warmups,
+        int repeats) {
+    TimedSearch result;
+    result.scores.resize(static_cast<size_t>(n_query) * static_cast<size_t>(k));
+    result.ids.resize(static_cast<size_t>(n_query) * static_cast<size_t>(k));
+
+    result.ms = median_time_ms(warmups, repeats, [&]() {
+        CHECK(ggml_vec_index_search_gpu_ivf_topk(
             idx,
             queries.data(),
             n_query,
@@ -540,6 +645,87 @@ QualityMetrics quality_against(
     return metrics;
 }
 
+QualityMetrics score_parity_against(
+        const TimedSearch & exact,
+        const TimedSearch & candidate,
+        int n_query,
+        int k) {
+    QualityMetrics metrics;
+    int overlap = 0;
+    int drift_count = 0;
+    for (int q = 0; q < n_query; ++q) {
+        std::unordered_map<uint64_t, float> exact_scores;
+        exact_scores.reserve(static_cast<size_t>(k));
+        for (int j = 0; j < k; ++j) {
+            const size_t pos = static_cast<size_t>(q) * static_cast<size_t>(k) +
+                static_cast<size_t>(j);
+            if (exact.ids[pos] != UINT64_MAX) {
+                exact_scores.emplace(exact.ids[pos], exact.scores[pos]);
+            }
+        }
+
+        for (int j = 0; j < k; ++j) {
+            const size_t pos = static_cast<size_t>(q) * static_cast<size_t>(k) +
+                static_cast<size_t>(j);
+            const auto it = exact_scores.find(candidate.ids[pos]);
+            if (it == exact_scores.end()) {
+                continue;
+            }
+            ++overlap;
+            const double drift = std::fabs(
+                static_cast<double>(it->second) - candidate.scores[pos]);
+            metrics.mean_abs_score_drift += drift;
+            metrics.max_abs_score_drift = std::max(metrics.max_abs_score_drift, drift);
+            ++drift_count;
+        }
+    }
+    metrics.recall_at_k = static_cast<double>(overlap) /
+        static_cast<double>(n_query * k);
+    if (drift_count > 0) {
+        metrics.mean_abs_score_drift /= static_cast<double>(drift_count);
+    }
+    return metrics;
+}
+
+MetalBenchResult run_metal_bench(
+        ggml_vec_index_t * idx,
+        const TimedSearch & exact,
+        const std::vector<float> & vectors,
+        const std::vector<float> & queries,
+        const BenchConfig & cfg,
+        bool run_full_search,
+        bool compare_scores_to_exact) {
+    MetalBenchResult result;
+    const int prepare_rc = ggml_vec_index_prepare_gpu(idx);
+    if (prepare_rc == GGML_VEC_INDEX_E_INVALID_ARG) {
+        return result;
+    }
+    CHECK(prepare_rc == GGML_VEC_INDEX_OK);
+    result.supported = true;
+
+    result.prepare_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
+        CHECK(ggml_vec_index_prepare_gpu(idx) == GGML_VEC_INDEX_OK);
+    });
+
+    CHECK(ggml_vec_index_prepare_gpu(idx) == GGML_VEC_INDEX_OK);
+    if (run_full_search) {
+        result.full_search = run_gpu_search(
+            idx, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
+        result.full_quality = quality_against(
+            exact, result.full_search, vectors, queries, cfg.n_query, cfg.k, cfg.dim);
+    }
+    result.topk_search = run_gpu_topk_search(
+        idx, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
+    if (compare_scores_to_exact) {
+        result.topk_quality = score_parity_against(
+            exact, result.topk_search, cfg.n_query, cfg.k);
+    } else {
+        result.topk_quality = quality_against(
+            exact, result.topk_search, vectors, queries, cfg.n_query, cfg.k, cfg.dim);
+    }
+    return result;
+}
+
 QualityBenchResult run_quality_bench(
         const char * name,
         const std::vector<float> & vectors,
@@ -757,16 +943,49 @@ int main() {
 
     const TimedSearch f32_res = run_search(
         f32, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
+    const MetalBenchResult metal_f32 = run_metal_bench(
+        f32, f32_res, vectors, queries, cfg, /*run_full_search=*/true,
+        /*compare_scores_to_exact=*/false);
     const TimedSearch q8_res = run_search(
         q8, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
+    const MetalBenchResult metal_q8 = run_metal_bench(
+        q8, q8_res, vectors, queries, cfg, /*run_full_search=*/false,
+        /*compare_scores_to_exact=*/true);
     const TimedSearch q4_res = run_search(
         q4, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
+    const MetalBenchResult metal_q4 = run_metal_bench(
+        q4, q4_res, vectors, queries, cfg, /*run_full_search=*/false,
+        /*compare_scores_to_exact=*/true);
     const TimedSearch f32_ivf_res = run_ivf_search(
         f32, queries, cfg.n_query, cfg.k, cfg.ivf_nprobe, cfg.warmups, cfg.repeats);
     const TimedSearch q8_ivf_res = run_ivf_search(
         q8, queries, cfg.n_query, cfg.k, cfg.ivf_nprobe, cfg.warmups, cfg.repeats);
     const TimedSearch q4_ivf_res = run_ivf_search(
         q4, queries, cfg.n_query, cfg.k, cfg.ivf_nprobe, cfg.warmups, cfg.repeats);
+    TimedSearch f32_gpu_ivf_res;
+    TimedSearch q8_gpu_ivf_res;
+    TimedSearch q4_gpu_ivf_res;
+    QualityMetrics f32_gpu_ivf_quality;
+    QualityMetrics q8_gpu_ivf_quality;
+    QualityMetrics q4_gpu_ivf_quality;
+    if (metal_f32.supported) {
+        f32_gpu_ivf_res = run_gpu_ivf_search(
+            f32, queries, cfg.n_query, cfg.k, cfg.ivf_nprobe, cfg.warmups, cfg.repeats);
+        f32_gpu_ivf_quality = score_parity_against(
+            f32_ivf_res, f32_gpu_ivf_res, cfg.n_query, cfg.k);
+    }
+    if (metal_q8.supported) {
+        q8_gpu_ivf_res = run_gpu_ivf_search(
+            q8, queries, cfg.n_query, cfg.k, cfg.ivf_nprobe, cfg.warmups, cfg.repeats);
+        q8_gpu_ivf_quality = score_parity_against(
+            q8_ivf_res, q8_gpu_ivf_res, cfg.n_query, cfg.k);
+    }
+    if (metal_q4.supported) {
+        q4_gpu_ivf_res = run_gpu_ivf_search(
+            q4, queries, cfg.n_query, cfg.k, cfg.ivf_nprobe, cfg.warmups, cfg.repeats);
+        q4_gpu_ivf_quality = score_parity_against(
+            q4_ivf_res, q4_gpu_ivf_res, cfg.n_query, cfg.k);
+    }
 
     const std::vector<int> filter_sizes = {
         32,
@@ -779,6 +998,10 @@ int main() {
     std::vector<TimedSearch> q8_filtered;
     std::vector<TimedSearch> f32_prepared_filtered;
     std::vector<TimedSearch> q8_prepared_filtered;
+    std::vector<TimedSearch> q4_prepared_filtered;
+    std::vector<TimedSearch> f32_gpu_filtered;
+    std::vector<TimedSearch> q8_gpu_filtered;
+    std::vector<TimedSearch> q4_gpu_filtered;
     for (int requested : filter_sizes) {
         const int n_allowed = std::min(requested, cfg.n_vec);
         allowlists.push_back(make_allowlist(cfg.n_vec, n_allowed));
@@ -802,8 +1025,11 @@ int main() {
             f32, allowlists.back().data(), static_cast<int>(allowlists.back().size()));
         ggml_vec_index_filter_t * q8_filter = ggml_vec_index_filter_create(
             q8, allowlists.back().data(), static_cast<int>(allowlists.back().size()));
+        ggml_vec_index_filter_t * q4_filter = ggml_vec_index_filter_create(
+            q4, allowlists.back().data(), static_cast<int>(allowlists.back().size()));
         CHECK(f32_filter != nullptr);
         CHECK(q8_filter != nullptr);
+        CHECK(q4_filter != nullptr);
         f32_prepared_filtered.push_back(run_prepared_filtered_search(
             f32,
             f32_filter,
@@ -820,8 +1046,47 @@ int main() {
             cfg.k,
             cfg.warmups,
             cfg.repeats));
+        q4_prepared_filtered.push_back(run_prepared_filtered_search(
+            q4,
+            q4_filter,
+            queries,
+            cfg.n_query,
+            cfg.k,
+            cfg.warmups,
+            cfg.repeats));
+        if (metal_f32.supported) {
+            f32_gpu_filtered.push_back(run_gpu_prepared_filtered_search(
+                f32,
+                f32_filter,
+                queries,
+                cfg.n_query,
+                cfg.k,
+                cfg.warmups,
+                cfg.repeats));
+        }
+        if (metal_q8.supported) {
+            q8_gpu_filtered.push_back(run_gpu_prepared_filtered_search(
+                q8,
+                q8_filter,
+                queries,
+                cfg.n_query,
+                cfg.k,
+                cfg.warmups,
+                cfg.repeats));
+        }
+        if (metal_q4.supported) {
+            q4_gpu_filtered.push_back(run_gpu_prepared_filtered_search(
+                q4,
+                q4_filter,
+                queries,
+                cfg.n_query,
+                cfg.k,
+                cfg.warmups,
+                cfg.repeats));
+        }
         ggml_vec_index_filter_free(f32_filter);
         ggml_vec_index_filter_free(q8_filter);
+        ggml_vec_index_filter_free(q4_filter);
     }
 
     const double f32_ivf_recall_at_k =
@@ -939,6 +1204,50 @@ int main() {
         f32_mmap_load_ms, q8_mmap_load_ms, q4_mmap_load_ms);
     std::printf("  median latency:   f32=%.3f ms q8=%.3f ms q4=%.3f ms q8/f32=%.3f q4/f32=%.3f\n",
         f32_res.ms, q8_res.ms, q4_res.ms, q8_res.ms / f32_res.ms, q4_res.ms / f32_res.ms);
+    if (metal_f32.supported) {
+        std::printf(
+            "  metal f32 full:   prepare=%.3f ms search=%.3f ms cpu/search=%.3f recall=%.4f mean_drift=%.6f max_drift=%.6f\n",
+            metal_f32.prepare_ms,
+            metal_f32.full_search.ms,
+            f32_res.ms / metal_f32.full_search.ms,
+            metal_f32.full_quality.recall_at_k,
+            metal_f32.full_quality.mean_abs_score_drift,
+            metal_f32.full_quality.max_abs_score_drift);
+        std::printf(
+            "  metal f32 topk:   search=%.3f ms cpu/search=%.3f topk/full=%.3f recall=%.4f mean_drift=%.6f max_drift=%.6f\n",
+            metal_f32.topk_search.ms,
+            f32_res.ms / metal_f32.topk_search.ms,
+            metal_f32.topk_search.ms / metal_f32.full_search.ms,
+            metal_f32.topk_quality.recall_at_k,
+            metal_f32.topk_quality.mean_abs_score_drift,
+            metal_f32.topk_quality.max_abs_score_drift);
+    } else {
+        std::printf("  metal f32:        unsupported\n");
+    }
+    if (metal_q8.supported) {
+        std::printf(
+            "  metal q8 topk:    prepare=%.3f ms search=%.3f ms cpu/search=%.3f cpu_recall=%.4f score_mean_diff=%.6f score_max_diff=%.6f\n",
+            metal_q8.prepare_ms,
+            metal_q8.topk_search.ms,
+            q8_res.ms / metal_q8.topk_search.ms,
+            metal_q8.topk_quality.recall_at_k,
+            metal_q8.topk_quality.mean_abs_score_drift,
+            metal_q8.topk_quality.max_abs_score_drift);
+    } else {
+        std::printf("  metal q8 topk:    unsupported\n");
+    }
+    if (metal_q4.supported) {
+        std::printf(
+            "  metal q4 topk:    prepare=%.3f ms search=%.3f ms cpu/search=%.3f cpu_recall=%.4f score_mean_diff=%.6f score_max_diff=%.6f\n",
+            metal_q4.prepare_ms,
+            metal_q4.topk_search.ms,
+            q4_res.ms / metal_q4.topk_search.ms,
+            metal_q4.topk_quality.recall_at_k,
+            metal_q4.topk_quality.mean_abs_score_drift,
+            metal_q4.topk_quality.max_abs_score_drift);
+    } else {
+        std::printf("  metal q4 topk:    unsupported\n");
+    }
     std::printf(
         "  ivf build:        lists=%d iters=%d f32=%.3f ms q8=%.3f ms q4=%.3f ms\n",
         cfg.ivf_lists,
@@ -963,21 +1272,72 @@ int main() {
         q8_ivf_recall_at_k,
         cfg.k,
         q4_ivf_recall_at_k);
+    if (metal_f32.supported || metal_q8.supported || metal_q4.supported) {
+        std::printf("  metal ivf batched:\n");
+        if (metal_f32.supported) {
+            std::printf(
+                "    f32: search=%.3f ms cpu_ivf/gpu_ivf=%.3f cpu_recall=%.4f score_mean_diff=%.6f score_max_diff=%.6f\n",
+                f32_gpu_ivf_res.ms,
+                f32_ivf_res.ms / f32_gpu_ivf_res.ms,
+                f32_gpu_ivf_quality.recall_at_k,
+                f32_gpu_ivf_quality.mean_abs_score_drift,
+                f32_gpu_ivf_quality.max_abs_score_drift);
+        } else {
+            std::printf("    f32: unsupported\n");
+        }
+        if (metal_q8.supported) {
+            std::printf(
+                "    q8:  search=%.3f ms cpu_ivf/gpu_ivf=%.3f cpu_recall=%.4f score_mean_diff=%.6f score_max_diff=%.6f\n",
+                q8_gpu_ivf_res.ms,
+                q8_ivf_res.ms / q8_gpu_ivf_res.ms,
+                q8_gpu_ivf_quality.recall_at_k,
+                q8_gpu_ivf_quality.mean_abs_score_drift,
+                q8_gpu_ivf_quality.max_abs_score_drift);
+        } else {
+            std::printf("    q8:  unsupported\n");
+        }
+        if (metal_q4.supported) {
+            std::printf(
+                "    q4:  search=%.3f ms cpu_ivf/gpu_ivf=%.3f cpu_recall=%.4f score_mean_diff=%.6f score_max_diff=%.6f\n",
+                q4_gpu_ivf_res.ms,
+                q4_ivf_res.ms / q4_gpu_ivf_res.ms,
+                q4_gpu_ivf_quality.recall_at_k,
+                q4_gpu_ivf_quality.mean_abs_score_drift,
+                q4_gpu_ivf_quality.max_abs_score_drift);
+        } else {
+            std::printf("    q4:  unsupported\n");
+        }
+    } else {
+        std::printf("  metal ivf batched: unsupported\n");
+    }
     for (size_t i = 0; i < allowlists.size(); ++i) {
         std::printf(
-            "  filtered latency: allowed=%zu f32=%.3f ms q8=%.3f ms f32/prepared=%.3f ms q8/prepared=%.3f ms\n",
+            "  filtered latency: allowed=%zu f32=%.3f ms q8=%.3f ms f32/prepared=%.3f ms q8/prepared=%.3f ms q4/prepared=%.3f ms\n",
             allowlists[i].size(),
             f32_filtered[i].ms,
             q8_filtered[i].ms,
             f32_prepared_filtered[i].ms,
-            q8_prepared_filtered[i].ms);
+            q8_prepared_filtered[i].ms,
+            q4_prepared_filtered[i].ms);
         std::printf(
-            "  filtered ratio:   allowed=%zu f32/full=%.3f q8/full=%.3f f32/prep_speedup=%.3f q8/prep_speedup=%.3f\n",
+            "  filtered ratio:   allowed=%zu f32/full=%.3f q8/full=%.3f q4_prepared/full=%.3f f32/prep_speedup=%.3f q8/prep_speedup=%.3f\n",
             allowlists[i].size(),
             f32_filtered[i].ms / f32_res.ms,
             q8_filtered[i].ms / q8_res.ms,
+            q4_prepared_filtered[i].ms / q4_res.ms,
             f32_filtered[i].ms / f32_prepared_filtered[i].ms,
             q8_filtered[i].ms / q8_prepared_filtered[i].ms);
+        if (metal_f32.supported && metal_q8.supported && metal_q4.supported) {
+            std::printf(
+                "  metal filtered:   allowed=%zu f32=%.3f ms q8=%.3f ms q4=%.3f ms f32_cpu/gpu=%.3f q8_cpu/gpu=%.3f q4_cpu/gpu=%.3f\n",
+                allowlists[i].size(),
+                f32_gpu_filtered[i].ms,
+                q8_gpu_filtered[i].ms,
+                q4_gpu_filtered[i].ms,
+                f32_prepared_filtered[i].ms / f32_gpu_filtered[i].ms,
+                q8_prepared_filtered[i].ms / q8_gpu_filtered[i].ms,
+                q4_prepared_filtered[i].ms / q4_gpu_filtered[i].ms);
+        }
     }
     std::printf(
         "  delta load f32:    snapshot=%.3f ms replay=%.3f ms compact=%.3f ms post_compact=%.3f ms\n",

@@ -235,6 +235,352 @@ int main() {
             scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
     }
 
+    // Metal GPU search is currently exact f32 flat search when prepared.
+    {
+        auto * gpu = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(gpu != nullptr);
+        CHECK(ggml_vec_index_add(
+            gpu, vecs.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
+
+        const std::vector<float> query = normalize({0.9f, 0.2f, -0.1f, 0.05f});
+        std::array<float, 4> cpu_scores{};
+        std::array<float, 4> gpu_scores{};
+        std::array<uint64_t, 4> cpu_ids{};
+        std::array<uint64_t, 4> gpu_ids{};
+
+        CHECK(ggml_vec_index_search(
+            gpu, query.data(), 1, /*k=*/4,
+            cpu_scores.data(), cpu_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_gpu(
+            gpu, query.data(), 1, /*k=*/4,
+            gpu_scores.data(), gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_search_gpu_topk(
+            gpu, query.data(), 1, /*k=*/4,
+            gpu_scores.data(), gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+
+        const int prepare_rc = ggml_vec_index_prepare_gpu(gpu);
+        CHECK(prepare_rc == GGML_VEC_INDEX_OK ||
+              prepare_rc == GGML_VEC_INDEX_E_INVALID_ARG);
+        if (prepare_rc == GGML_VEC_INDEX_OK) {
+            CHECK(ggml_vec_index_search_gpu(
+                gpu, query.data(), 1, /*k=*/4,
+                gpu_scores.data(), gpu_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 4; ++i) {
+                CHECK(gpu_ids[i] == cpu_ids[i]);
+                CHECK(std::fabs(gpu_scores[i] - cpu_scores[i]) <= 1e-5f);
+            }
+            gpu_scores = {};
+            gpu_ids = {};
+            CHECK(ggml_vec_index_search_gpu_topk(
+                gpu, query.data(), 1, /*k=*/4,
+                gpu_scores.data(), gpu_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 4; ++i) {
+                CHECK(gpu_ids[i] == cpu_ids[i]);
+                CHECK(std::fabs(gpu_scores[i] - cpu_scores[i]) <= 1e-5f);
+            }
+
+            std::array<float, 65> too_many_scores{};
+            std::array<uint64_t, 65> too_many_ids{};
+            CHECK(ggml_vec_index_search_gpu_topk(
+                gpu, query.data(), 1, /*k=*/65,
+                too_many_scores.data(), too_many_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+
+            const uint64_t gpu_new_id = (1ULL << 52) + 3ULL;
+            CHECK(ggml_vec_index_add(gpu, seeds[0].data(), 1, &gpu_new_id)
+                  == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_search_gpu(
+                gpu, query.data(), 1, /*k=*/4,
+                gpu_scores.data(), gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_gpu_topk(
+                gpu, query.data(), 1, /*k=*/4,
+                gpu_scores.data(), gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        }
+        CHECK(ggml_vec_index_prepare_gpu(nullptr) == GGML_VEC_INDEX_E_INVALID_ARG);
+        ggml_vec_index_free(gpu);
+
+        auto * empty_gpu = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(empty_gpu != nullptr);
+        CHECK(ggml_vec_index_build_ivf(empty_gpu, /*n_lists=*/2, /*n_iter=*/1)
+              == GGML_VEC_INDEX_OK);
+        const int empty_prepare_rc = ggml_vec_index_prepare_gpu(empty_gpu);
+        CHECK(empty_prepare_rc == GGML_VEC_INDEX_OK ||
+              empty_prepare_rc == GGML_VEC_INDEX_E_INVALID_ARG);
+        if (empty_prepare_rc == GGML_VEC_INDEX_OK) {
+            CHECK(ggml_vec_index_search_gpu(
+                empty_gpu, query.data(), 1, /*k=*/4,
+                gpu_scores.data(), gpu_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 4; ++i) {
+                CHECK(gpu_scores[i] == -FLT_MAX);
+                CHECK(gpu_ids[i] == UINT64_MAX);
+            }
+            CHECK(ggml_vec_index_search_gpu_topk(
+                empty_gpu, query.data(), 1, /*k=*/4,
+                gpu_scores.data(), gpu_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 4; ++i) {
+                CHECK(gpu_scores[i] == -FLT_MAX);
+                CHECK(gpu_ids[i] == UINT64_MAX);
+            }
+            CHECK(ggml_vec_index_search_gpu_ivf_topk(
+                empty_gpu, query.data(), 1, /*k=*/4, /*nprobe=*/1,
+                gpu_scores.data(), gpu_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 4; ++i) {
+                CHECK(gpu_scores[i] == -FLT_MAX);
+                CHECK(gpu_ids[i] == UINT64_MAX);
+            }
+        }
+        ggml_vec_index_free(empty_gpu);
+
+        auto * q8 = ggml_vec_index_create(kDim, /*bit_width=*/8);
+        CHECK(q8 != nullptr);
+        CHECK(ggml_vec_index_add(
+            q8, vecs.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
+        std::array<float, 4> q8_cpu_scores{};
+        std::array<float, 4> q8_gpu_scores{};
+        std::array<uint64_t, 4> q8_cpu_ids{};
+        std::array<uint64_t, 4> q8_gpu_ids{};
+        CHECK(ggml_vec_index_search(
+            q8, query.data(), 1, /*k=*/4,
+            q8_cpu_scores.data(), q8_cpu_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_gpu(
+            q8, query.data(), 1, /*k=*/4,
+            q8_gpu_scores.data(), q8_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_search_gpu_topk(
+            q8, query.data(), 1, /*k=*/4,
+            q8_gpu_scores.data(), q8_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        const int q8_prepare_rc = ggml_vec_index_prepare_gpu(q8);
+        CHECK(q8_prepare_rc == GGML_VEC_INDEX_OK ||
+              q8_prepare_rc == GGML_VEC_INDEX_E_INVALID_ARG);
+        if (q8_prepare_rc == GGML_VEC_INDEX_OK) {
+            CHECK(ggml_vec_index_search_gpu(
+                q8, query.data(), 1, /*k=*/4,
+                q8_gpu_scores.data(), q8_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_gpu_topk(
+                q8, query.data(), 1, /*k=*/4,
+                q8_gpu_scores.data(), q8_gpu_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 4; ++i) {
+                CHECK(q8_gpu_ids[i] == q8_cpu_ids[i]);
+                CHECK(std::fabs(q8_gpu_scores[i] - q8_cpu_scores[i]) <= 1e-5f);
+            }
+
+            const uint64_t q8_new_id = (1ULL << 52) + 4ULL;
+            CHECK(ggml_vec_index_add(q8, seeds[1].data(), 1, &q8_new_id)
+                  == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_search_gpu_topk(
+                q8, query.data(), 1, /*k=*/4,
+                q8_gpu_scores.data(), q8_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        }
+        ggml_vec_index_free(q8);
+
+        auto * q4 = ggml_vec_index_create(kDim, /*bit_width=*/4);
+        CHECK(q4 != nullptr);
+        CHECK(ggml_vec_index_add(
+            q4, vecs.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
+        std::array<float, 4> q4_cpu_scores{};
+        std::array<float, 4> q4_gpu_scores{};
+        std::array<uint64_t, 4> q4_cpu_ids{};
+        std::array<uint64_t, 4> q4_gpu_ids{};
+        CHECK(ggml_vec_index_search(
+            q4, query.data(), 1, /*k=*/4,
+            q4_cpu_scores.data(), q4_cpu_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_gpu(
+            q4, query.data(), 1, /*k=*/4,
+            q4_gpu_scores.data(), q4_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_search_gpu_topk(
+            q4, query.data(), 1, /*k=*/4,
+            q4_gpu_scores.data(), q4_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        const int q4_prepare_rc = ggml_vec_index_prepare_gpu(q4);
+        CHECK(q4_prepare_rc == GGML_VEC_INDEX_OK ||
+              q4_prepare_rc == GGML_VEC_INDEX_E_INVALID_ARG);
+        if (q4_prepare_rc == GGML_VEC_INDEX_OK) {
+            CHECK(ggml_vec_index_search_gpu(
+                q4, query.data(), 1, /*k=*/4,
+                q4_gpu_scores.data(), q4_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_gpu_topk(
+                q4, query.data(), 1, /*k=*/4,
+                q4_gpu_scores.data(), q4_gpu_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 4; ++i) {
+                CHECK(q4_gpu_ids[i] == q4_cpu_ids[i]);
+                CHECK(std::fabs(q4_gpu_scores[i] - q4_cpu_scores[i]) <= 1e-5f);
+            }
+
+            const uint64_t q4_new_id = (1ULL << 52) + 5ULL;
+            CHECK(ggml_vec_index_add(q4, seeds[2].data(), 1, &q4_new_id)
+                  == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_search_gpu_topk(
+                q4, query.data(), 1, /*k=*/4,
+                q4_gpu_scores.data(), q4_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        }
+        ggml_vec_index_free(q4);
+
+        auto * q4_odd = ggml_vec_index_create(/*dim=*/5, /*bit_width=*/4);
+        CHECK(q4_odd != nullptr);
+        const std::array<float, 15> q4_odd_vecs = {
+             1.00f, -0.50f,  0.25f,  0.75f, -1.00f,
+            -0.25f,  1.25f, -0.50f,  0.50f,  0.20f,
+             0.50f,  0.10f,  1.00f, -0.75f,  0.60f,
+        };
+        const std::array<uint64_t, 3> q4_odd_ids = {
+            (1ULL << 52) + 10ULL,
+            (1ULL << 52) + 11ULL,
+            (1ULL << 52) + 12ULL,
+        };
+        const std::array<float, 5> q4_odd_query = {
+             0.30f, -0.70f, 0.80f, 0.20f, -0.40f,
+        };
+        std::array<float, 3> q4_odd_cpu_scores{};
+        std::array<float, 3> q4_odd_gpu_scores{};
+        std::array<uint64_t, 3> q4_odd_cpu_ids{};
+        std::array<uint64_t, 3> q4_odd_gpu_ids{};
+        CHECK(ggml_vec_index_add(
+            q4_odd, q4_odd_vecs.data(), 3, q4_odd_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(
+            q4_odd, q4_odd_query.data(), 1, /*k=*/3,
+            q4_odd_cpu_scores.data(), q4_odd_cpu_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_gpu_topk(
+            q4_odd, q4_odd_query.data(), 1, /*k=*/3,
+            q4_odd_gpu_scores.data(), q4_odd_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        const int q4_odd_prepare_rc = ggml_vec_index_prepare_gpu(q4_odd);
+        CHECK(q4_odd_prepare_rc == GGML_VEC_INDEX_OK ||
+              q4_odd_prepare_rc == GGML_VEC_INDEX_E_INVALID_ARG);
+        if (q4_odd_prepare_rc == GGML_VEC_INDEX_OK) {
+            CHECK(ggml_vec_index_search_gpu_topk(
+                q4_odd, q4_odd_query.data(), 1, /*k=*/3,
+                q4_odd_gpu_scores.data(), q4_odd_gpu_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 3; ++i) {
+                CHECK(q4_odd_gpu_ids[i] == q4_odd_cpu_ids[i]);
+                CHECK(std::fabs(q4_odd_gpu_scores[i] - q4_odd_cpu_scores[i]) <= 1e-5f);
+            }
+        }
+        ggml_vec_index_free(q4_odd);
+
+        const std::array<uint64_t, 2> gpu_filter_ids = { ids[0], ids[2] };
+        for (int bit_width : { 32, 8, 4 }) {
+            auto * filtered_gpu = ggml_vec_index_create(kDim, bit_width);
+            CHECK(filtered_gpu != nullptr);
+            CHECK(ggml_vec_index_add(
+                filtered_gpu, vecs.data(), static_cast<int>(ids.size()), ids.data())
+                == GGML_VEC_INDEX_OK);
+            ggml_vec_index_filter_t * filter = ggml_vec_index_filter_create(
+                filtered_gpu, gpu_filter_ids.data(), static_cast<int>(gpu_filter_ids.size()));
+            CHECK(filter != nullptr);
+
+            std::array<float, 4> filtered_cpu_scores{};
+            std::array<float, 4> filtered_gpu_scores{};
+            std::array<uint64_t, 4> filtered_cpu_ids{};
+            std::array<uint64_t, 4> filtered_gpu_ids{};
+            CHECK(ggml_vec_index_search_prepared_filtered(
+                filtered_gpu, filter, query.data(), 1, /*k=*/4,
+                filtered_cpu_scores.data(), filtered_cpu_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_search_gpu_prepared_filtered_topk(
+                filtered_gpu, filter, query.data(), 1, /*k=*/4,
+                filtered_gpu_scores.data(), filtered_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+
+            const int filtered_prepare_rc = ggml_vec_index_prepare_gpu(filtered_gpu);
+            CHECK(filtered_prepare_rc == GGML_VEC_INDEX_OK ||
+                  filtered_prepare_rc == GGML_VEC_INDEX_E_INVALID_ARG);
+            if (filtered_prepare_rc == GGML_VEC_INDEX_OK) {
+                CHECK(ggml_vec_index_search_gpu_prepared_filtered_topk(
+                    filtered_gpu, filter, query.data(), 1, /*k=*/4,
+                    filtered_gpu_scores.data(), filtered_gpu_ids.data()) == GGML_VEC_INDEX_OK);
+                for (int i = 0; i < 4; ++i) {
+                    CHECK(filtered_gpu_ids[i] == filtered_cpu_ids[i]);
+                    CHECK(std::fabs(filtered_gpu_scores[i] - filtered_cpu_scores[i]) <= 1e-5f);
+                }
+
+                const uint64_t filtered_new_id =
+                    (1ULL << 52) + 20ULL + static_cast<uint64_t>(bit_width);
+                CHECK(ggml_vec_index_add(filtered_gpu, seeds[3].data(), 1, &filtered_new_id)
+                      == GGML_VEC_INDEX_OK);
+                CHECK(ggml_vec_index_search_gpu_prepared_filtered_topk(
+                    filtered_gpu, filter, query.data(), 1, /*k=*/4,
+                    filtered_gpu_scores.data(), filtered_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+            }
+
+            ggml_vec_index_filter_free(filter);
+            ggml_vec_index_free(filtered_gpu);
+        }
+
+        for (int bit_width : { 32, 8, 4 }) {
+            auto * ivf_gpu = ggml_vec_index_create(kDim, bit_width);
+            CHECK(ivf_gpu != nullptr);
+            CHECK(ggml_vec_index_add(
+                ivf_gpu, vecs.data(), static_cast<int>(ids.size()), ids.data())
+                == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_build_ivf(ivf_gpu, /*n_lists=*/2, /*n_iter=*/2)
+                  == GGML_VEC_INDEX_OK);
+
+            std::array<float, 8> ivf_cpu_scores{};
+            std::array<float, 8> ivf_gpu_scores{};
+            std::array<uint64_t, 8> ivf_cpu_ids{};
+            std::array<uint64_t, 8> ivf_gpu_ids{};
+            const std::vector<float> ivf_queries = {
+                query[0], query[1], query[2], query[3],
+                seeds[1][0], seeds[1][1], seeds[1][2], seeds[1][3],
+            };
+            CHECK(ggml_vec_index_search_ivf(
+                ivf_gpu, ivf_queries.data(), /*n_q=*/2, /*k=*/4, /*nprobe=*/2,
+                ivf_cpu_scores.data(), ivf_cpu_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_search_gpu_ivf_topk(
+                ivf_gpu, ivf_queries.data(), /*n_q=*/2, /*k=*/4, /*nprobe=*/2,
+                ivf_gpu_scores.data(), ivf_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+
+            const int ivf_prepare_rc = ggml_vec_index_prepare_gpu(ivf_gpu);
+            CHECK(ivf_prepare_rc == GGML_VEC_INDEX_OK ||
+                  ivf_prepare_rc == GGML_VEC_INDEX_E_INVALID_ARG);
+            if (ivf_prepare_rc == GGML_VEC_INDEX_OK) {
+                CHECK(ggml_vec_index_search_gpu_ivf_topk(
+                    ivf_gpu, ivf_queries.data(), /*n_q=*/2, /*k=*/4, /*nprobe=*/2,
+                    ivf_gpu_scores.data(), ivf_gpu_ids.data()) == GGML_VEC_INDEX_OK);
+                for (int i = 0; i < 8; ++i) {
+                    CHECK(ivf_gpu_ids[i] == ivf_cpu_ids[i]);
+                    CHECK(std::fabs(ivf_gpu_scores[i] - ivf_cpu_scores[i]) <= 1e-5f);
+                }
+                CHECK(ggml_vec_index_search_ivf(
+                    ivf_gpu, ivf_queries.data(), /*n_q=*/2, /*k=*/4, /*nprobe=*/1,
+                    ivf_cpu_scores.data(), ivf_cpu_ids.data()) == GGML_VEC_INDEX_OK);
+                CHECK(ggml_vec_index_search_gpu_ivf_topk(
+                    ivf_gpu, ivf_queries.data(), /*n_q=*/2, /*k=*/4, /*nprobe=*/1,
+                    ivf_gpu_scores.data(), ivf_gpu_ids.data()) == GGML_VEC_INDEX_OK);
+                for (int i = 0; i < 8; ++i) {
+                    CHECK(ivf_gpu_ids[i] == ivf_cpu_ids[i]);
+                    CHECK(std::fabs(ivf_gpu_scores[i] - ivf_cpu_scores[i]) <= 1e-5f);
+                }
+
+                const uint64_t ivf_new_id =
+                    (1ULL << 52) + 30ULL + static_cast<uint64_t>(bit_width);
+                CHECK(ggml_vec_index_add(ivf_gpu, seeds[0].data(), 1, &ivf_new_id)
+                      == GGML_VEC_INDEX_OK);
+                CHECK(ggml_vec_index_search_gpu_ivf_topk(
+                    ivf_gpu, ivf_queries.data(), /*n_q=*/2, /*k=*/4, /*nprobe=*/2,
+                    ivf_gpu_scores.data(), ivf_gpu_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+            }
+            ggml_vec_index_free(ivf_gpu);
+        }
+
+        auto * empty_filtered_gpu = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(empty_filtered_gpu != nullptr);
+        CHECK(ggml_vec_index_add(
+            empty_filtered_gpu, vecs.data(), static_cast<int>(ids.size()), ids.data())
+            == GGML_VEC_INDEX_OK);
+        ggml_vec_index_filter_t * empty_filter =
+            ggml_vec_index_filter_create(empty_filtered_gpu, nullptr, 0);
+        CHECK(empty_filter != nullptr);
+        const int empty_filter_prepare_rc = ggml_vec_index_prepare_gpu(empty_filtered_gpu);
+        CHECK(empty_filter_prepare_rc == GGML_VEC_INDEX_OK ||
+              empty_filter_prepare_rc == GGML_VEC_INDEX_E_INVALID_ARG);
+        if (empty_filter_prepare_rc == GGML_VEC_INDEX_OK) {
+            CHECK(ggml_vec_index_search_gpu_prepared_filtered_topk(
+                empty_filtered_gpu, empty_filter, query.data(), 1, /*k=*/4,
+                gpu_scores.data(), gpu_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 4; ++i) {
+                CHECK(gpu_scores[i] == -FLT_MAX);
+                CHECK(gpu_ids[i] == UINT64_MAX);
+            }
+        }
+        ggml_vec_index_filter_free(empty_filter);
+        ggml_vec_index_free(empty_filtered_gpu);
+    }
+
     // Duplicate add must fail without mutating state.
     {
         const std::vector<uint64_t> dup_ids = { ids[0] };

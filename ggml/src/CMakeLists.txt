@@ -206,6 +206,7 @@ add_library(ggml-base
             ggml-quants.c
             ggml-quants.h
             ggml-vector-index.cpp
+            ggml-vector-index-metal.h
             gguf.cpp
             uint8-buff-stream.cpp)
 
@@ -238,6 +239,17 @@ endif()
 if (GGML_OPENMP_ENABLED)
     target_compile_definitions(ggml-base PRIVATE GGML_USE_OPENMP)
     target_link_libraries(ggml-base PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+endif()
+
+if (APPLE AND GGML_METAL)
+    find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
+    find_library(METAL_FRAMEWORK Metal REQUIRED)
+    set_source_files_properties(ggml-vector-index-metal.mm PROPERTIES
+        LANGUAGE CXX
+        COMPILE_FLAGS "-x objective-c++")
+    target_sources(ggml-base PRIVATE ggml-vector-index-metal.mm)
+    target_compile_definitions(ggml-base PRIVATE GGML_VEC_INDEX_USE_METAL)
+    target_link_libraries(ggml-base PRIVATE ${FOUNDATION_LIBRARY} ${METAL_FRAMEWORK})
 endif()
 
 add_library(ggml

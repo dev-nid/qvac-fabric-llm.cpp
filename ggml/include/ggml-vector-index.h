@@ -6,7 +6,8 @@
 // under `ggml/src/ggml-vector-index.cpp` supports full f32 storage
 // (`bit_width=32`), production q8 storage (`bit_width=8`), and packed q4
 // storage (`bit_width=4`) with CPU search directly against quantized codes.
-// q8 uses NEON/AVX2 when available; q4 uses NEON when available.
+// q8 uses NEON/AVX2 when available; q4 uses NEON when available. f32, q8, and
+// q4 indexes can use opt-in exact Metal top-k search on supported Apple builds.
 //
 // Threading: read-only APIs on the same handle can run concurrently. Mutations,
 // persistence writes, compaction, and IVF builds are serialized with reads and
@@ -112,6 +113,13 @@ GGML_API int ggml_vec_index_build_ivf(
     int                n_lists,
     int                n_iter);
 
+// Prepares the optional GPU search cache. Currently this uploads f32, q8, or q4
+// flat storage to Metal buffers on supported Apple builds. Successful add/remove
+// and compaction invalidate the cache; call this again before GPU search after
+// those operations. Returns GGML_VEC_INDEX_E_INVALID_ARG for unsupported builds
+// or unsupported index types.
+GGML_API int ggml_vec_index_prepare_gpu(ggml_vec_index_t * idx);
+
 // Top-k search. `queries` is `n_q * dim` row-major. `out_scores` and
 // `out_ids` are caller-allocated buffers of size `n_q * k`. Each row is
 // sorted descending by score (higher = closer / more similar). If the index
@@ -126,6 +134,31 @@ GGML_API int ggml_vec_index_build_ivf(
 // vectors before insert AND before query; the index does NOT normalize
 // internally. All query components must be finite.
 GGML_API int ggml_vec_index_search(
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    float                  * out_scores,
+    uint64_t               * out_ids);
+
+// Exact GPU top-k search. Currently this is implemented only for f32 flat
+// indexes prepared with `ggml_vec_index_prepare_gpu` on Apple Metal builds.
+// Metal computes the dense score matrix; CPU top-k selection preserves the same
+// result ordering contract as `ggml_vec_index_search`. Unsupported builds,
+// unprepared/stale GPU caches, or unsupported index types return
+// GGML_VEC_INDEX_E_INVALID_ARG; callers can fall back to CPU search.
+GGML_API int ggml_vec_index_search_gpu(
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    float                  * out_scores,
+    uint64_t               * out_ids);
+
+// Exact GPU top-k search that reduces GPU copyback by emitting per-block
+// candidate top-k lists and merging them on CPU. Currently supports f32, q8, and
+// q4 flat indexes prepared with `ggml_vec_index_prepare_gpu`, with k <= 64.
+GGML_API int ggml_vec_index_search_gpu_topk(
     const ggml_vec_index_t * idx,
     const float            * queries,
     int                      n_q,
@@ -166,11 +199,36 @@ GGML_API int ggml_vec_index_search_prepared_filtered(
     float                         * out_scores,
     uint64_t                      * out_ids);
 
+// Prepared filtered GPU top-k search. Uses a prepared filter to restrict the
+// searched slots on GPU, then merges per-block candidates on CPU. Currently
+// supports f32, q8, and q4 flat indexes prepared with
+// `ggml_vec_index_prepare_gpu`, with k <= 64.
+GGML_API int ggml_vec_index_search_gpu_prepared_filtered_topk(
+    const ggml_vec_index_t        * idx,
+    const ggml_vec_index_filter_t * filter,
+    const float                   * queries,
+    int                             n_q,
+    int                             k,
+    float                         * out_scores,
+    uint64_t                      * out_ids);
+
 // IVF-flat ANN top-k search. `ggml_vec_index_build_ivf` must have been called
 // after the most recent mutation. `nprobe` controls how many centroid lists are
 // searched; higher values improve recall and lower the latency win. If nprobe
 // is greater than the number of built lists, all lists are searched.
 GGML_API int ggml_vec_index_search_ivf(
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    int                      nprobe,
+    float                  * out_scores,
+    uint64_t               * out_ids);
+
+// IVF-flat ANN GPU top-k search. Uses CPU centroid selection, then scores the
+// selected IVF candidate slots on GPU. Currently supports f32, q8, and q4 flat
+// indexes prepared with `ggml_vec_index_prepare_gpu`, with k <= 64.
+GGML_API int ggml_vec_index_search_gpu_ivf_topk(
     const ggml_vec_index_t * idx,
     const float            * queries,
     int                      n_q,
