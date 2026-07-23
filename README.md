@@ -133,6 +133,10 @@ The following features are developed in qvac-fabric-llm.cpp and are not availabl
 | BitNet inference and training | TQ2_0 quantization on Vulkan, Metal, and CPU for inference and LoRA fine-tuning; extends [microsoft/BitNet](https://github.com/microsoft/BitNet) beyond its CUDA-only GPU support |
 | Mobile GPU optimization | Adreno 800+ quantized inference (Q4_0, Q8), Adreno-specific Vulkan shader variants, VMA integration |
 
+### Experimental Components
+
+- `ggml-vector-index` is a default-off standalone vector search library. See the [Vector Index Guide](docs/vector-index.md) for build, API, persistence, mmap, and benchmark details.
+
 ### Upstream Compatibility
 
 All standard llama.cpp functionality, models, and APIs remain fully compatible.
